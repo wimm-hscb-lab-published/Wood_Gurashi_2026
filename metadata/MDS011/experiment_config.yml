@@ -1,0 +1,17 @@
+# Auto-generated — 2026-03-28
+# Edit freely; this file is never overwritten.
+experiment: "MDS011"
+raw_experiment_name: "MDS011"
+multiplexed: true
+n_samples_multiplexed: 2
+n_cells: "6673"
+whitelist: "chr17:7578406:C/G,chr17:7578479:G/A,chr19:13054564:AGCAGAGGCTTAAGGAGGAGGAAGAAGACAAGAAACGCAAAGAGGAGGAGGAG/A"
+experimental_processing: "Unfractionated_BM_and_CD3_depleted_BM"
+genome_build: "hg19"
+date_added: "2026-03-28"
+
+# ── Custom fields ──
+# diagnosis:
+# sorting_method:
+# treatment:
+# notes:

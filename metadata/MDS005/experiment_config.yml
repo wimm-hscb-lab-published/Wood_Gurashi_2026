@@ -1,0 +1,17 @@
+# Auto-generated — 2026-03-28
+# Edit freely; this file is never overwritten.
+experiment: "MDS005"
+raw_experiment_name: "MDS005"
+multiplexed: true
+n_samples_multiplexed: 2
+n_cells: "1991"
+whitelist: "chr17:7578393:A/C,chr17:7577538:C/A,chr17:7577506:C/A"
+experimental_processing: "Unfractionated_BM"
+genome_build: "hg19"
+date_added: "2026-03-28"
+
+# ── Custom fields ──
+# diagnosis:
+# sorting_method:
+# treatment:
+# notes:

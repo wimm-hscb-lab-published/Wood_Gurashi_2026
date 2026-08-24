@@ -1,0 +1,17 @@
+# Auto-generated — 2026-03-28
+# Edit freely; this file is never overwritten.
+experiment: "MDS008"
+raw_experiment_name: "MDS008"
+multiplexed: true
+n_samples_multiplexed: 2
+n_cells: "3575"
+whitelist: "chr17:7577539:G/A,chr17:7578475:G/T,chr4:106164778:C/T,chr7:148506170:C/A,chr21:44514777:T/G"
+experimental_processing: "Unfractionated_BM"
+genome_build: "hg19"
+date_added: "2026-03-28"
+
+# ── Custom fields ──
+# diagnosis:
+# sorting_method:
+# treatment:
+# notes:

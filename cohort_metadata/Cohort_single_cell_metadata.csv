@@ -1,0 +1,21 @@
+Patient.ID,scDNAseq Classification,TP53 clone evolution,Comutations
+PT01,Bi Allelic,Linear,None
+PT02,Bi Allelic,Linear,None
+PT03,Bi Allelic,Linear,None
+PT04,Mono Allelic,Linear,Co-occuring
+PT05,Bi Allelic,Linear,None
+PT06,Bi Allelic,Parallel,Independent
+PT07,Bi Allelic,Parallel,Co-occuring
+PT08,Bi Allelic,Linear,None
+PT09,Bi Allelic,Linear,None
+PT10,Bi Allelic,Parallel,None
+PT11,Mono Allelic,Linear,None
+PT12,Bi Allelic,Linear,None
+PT13,Bi Allelic,Undetermined,None
+PT14,Bi Allelic,Parallel,Independent
+PT15,Mono Allelic,Linear,None
+PT16,Mono Allelic,Linear,Both
+PT17,Mono Allelic,Parallel,Independent
+PT18,Mono Allelic,Linear,Co-occuring
+PT19,Bi Allelic,Parallel,Independent
+PT20,Mono Allelic,Parallel,Independent

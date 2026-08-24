@@ -1,0 +1,21 @@
+ Patient.ID,IPSS-M,WHO,ICC,CK
+PT01,N/A,Mono Allelic,Multi Hit,Yes
+PT02,Very High,Bi Allelic,Multi Hit,Yes
+PT03,Very High,Bi Allelic,Multi Hit,Yes
+PT04,Very Low,Mono Allelic,Single Hit,No
+PT05,N/A,Bi Allelic,Multi Hit,Yes
+PT06,Very High,Bi Allelic,Multi Hit,Yes
+PT07,N/A,Bi Allelic,Multi Hit,Yes
+PT08,High,Mono Allelic,Multi Hit,Yes
+PT09,Very High,Bi Allelic,Multi Hit,Yes
+PT10,Very High,Bi Allelic,Multi Hit,Yes
+PT11,Very Low,Mono Allelic,Single Hit,No
+PT12,Very High,Bi Allelic,Multi Hit,Yes
+PT13,Very High,Bi Allelic,Multi Hit,Yes
+PT14,Moderate Low,Mono Allelic,Multi Hit,Yes
+PT15,Very Low,Mono Allelic,Single Hit,No
+PT16,Low,Mono Allelic,Single Hit,No
+PT17,Low,Mono Allelic,Single Hit,No
+PT18,Moderate Low,Mono Allelic,Single Hit,No
+PT19,N/A,Mono Allelic,Single Hit,No
+PT20,N/A,Mono Allelic,Single Hit,No

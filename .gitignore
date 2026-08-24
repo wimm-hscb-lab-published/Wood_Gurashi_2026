@@ -1,0 +1,79 @@
+# ── Large binary data ──
+*.bam
+*.bam.bai
+*.bam.csi
+*.fastq.gz
+*.fq.gz
+*.h5
+*.h5ad
+*.rds
+*.hdf5
+*.tar.gz
+*.sra
+*.png
+*.pdf
+
+# ── Entire directories ──
+raw_data/
+docs/
+logs/
+omnipathr-log/
+processed_data/submission/
+processed_data/h5/External/
+results/huntress/
+results/general/
+results/summaries/
+results/per_sample/
+results/demultiplexing/
+results/figures/
+scripts/general/
+scripts/templates/
+notebooks/01_preprocessing/.ipynb_checkpoints/
+notebooks/02_protein_filtering/.ipynb_checkpoints/
+notebooks/03_sample_analysis/.ipynb_checkpoints/
+resources/
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+
+# ── R ──
+.Rhistory
+.RData
+.Rproj.user/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Logs ──
+logs/
+
+# ── Editors ──
+.vscode/
+.idea/
+*.swp
+*~
+
+# - Files -
+Initialise_project.sh
+Jupyter_Launcher.sh
+Clear_donors_result_folders.sh
+Create_project_directories.sh
+project.conf
+notebooks/01_preprocessing/01_Preprocessing_External.ipynb
+notebooks/01_preprocessing/01_Preprocessing_MDS012.ipynb
+notebooks/03_sample_analysis/03_Sample_Analysis_MDS007_PT686_AKW.ipynb
+notebooks/02_protein_filtering/02_Protein_Filtering_MDS012.ipynb
+notebooks/03_sample_analysis/03_Sample_Analysis_MDS002_Donor_A-S241T.ipynb
+notebooks/03_sample_analysis/03_Sample_Analysis_MDS012_Donor_A.ipynb
+notebooks/03_sample_analysis/03_Sample_Analysis_MDS012_Donor_A_AKW.ipynb
+notebooks/03_sample_analysis/03_Sample_Analysis_MDS012_Donor_B.ipynb
+notebooks/03_sample_analysis/03_Sample_Analysis_MDS012_Donor_B_AKW-TP53_only.ipynb
+notebooks/03_sample_analysis/03_Sample_Analysis_MDS012_Donor_B_AKW.ipynb
+notebooks/03_sample_analysis/whitelist_pct_genotyped_pct_mutant_table.csv
+metadata/MDS012/experiment_config.yml
+scripts/manuscript/Figure_SX2.sh

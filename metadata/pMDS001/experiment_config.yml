@@ -1,0 +1,17 @@
+# Auto-generated — 2026-04-02
+# Edit freely; this file is never overwritten.
+experiment: "pMDS001"
+raw_experiment_name: "pMDS001"
+multiplexed: false
+n_samples_multiplexed: 1
+n_cells: "2466"
+whitelist: "chr17:7579350:A/C,chrX:39933338:C/T,chr17:7577538:C/T,chr17:7577539:G/A"
+experimental_processing: "Unfractionated_BM"
+genome_build: "hg19"
+date_added: "2026-04-02"
+
+# ── Custom fields ──
+# diagnosis:
+# sorting_method:
+# treatment:
+# notes:

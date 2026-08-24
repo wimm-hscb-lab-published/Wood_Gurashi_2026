@@ -1,0 +1,4465 @@
+---
+title: "01_XeniumInput_Processing"
+output: html_document
+date: "2024-07-17"
+---
+
+## - Setting work directories
+  
+Defining work directory within rmarkdown chunk
+
+```{r setup, include=TRUE}
+local_wd_folder = dirname(dirname(dirname(rstudioapi::getSourceEditorContext()$path)))
+knitr::opts_knit$set(root.dir = local_wd_folder)
+```
+
+```{r}
+setwd(local_wd_folder)
+```
+
+## - Setting seed
+
+This step ensures reproducibility in randomized processes
+
+```{r}
+set.seed(seed = 123, kind = "Mersenne-Twister", normal.kind = "Inversion")
+```
+
+## - Options
+
+```{r}
+options(Seurat.object.assay.version = 'v3')
+options(future.globals.maxSize= 891289600*200)
+```
+
+## - Loading packages
+
+```{r}
+library(Seurat)
+library(future)
+plan("multisession", workers = 10)
+library(ggplot2)
+library(dplyr)
+library(harmony)
+```
+
+## - Loading palettes
+
+```{r}
+# Load additional colour palette packages
+library(unikn, quietly = TRUE)
+library(RColorBrewer, quietly = TRUE)
+library(yarrr, quietly = TRUE)
+library(scales, quietly = TRUE)
+library(ggsci, quietly = TRUE)
+
+# Define a set of custom color palettes from the unikn package
+mix_1 <- usecol(pal = c(Karpfenblau, "white", Peach), n = 15)
+mix_2 <- usecol(pal = c(rev(pal_seeblau), "white", pal_pinky))
+mix_3 <- usecol(pal = c(rev(pal_bordeaux), "white", pal_petrol), n = 15)
+
+# Display the custom palettes
+seecol(list(mix_1, mix_2, mix_3), col_brd = "white", lwd_brd = 4, title = "Comparing palettes mixed from unikn colors", pal_names = c("mix_1", "mix_2", "mix_3"))
+
+# Define a second set of custom palettes from the RColorBrewer and yarrr packages
+brew_mix <- usecol(c(rev(brewer.pal(n = 4, name = "Reds")), "white", brewer.pal(n = 4, name = "Blues")), n = 13)
+brew_ext <- usecol(brewer.pal(n = 11, name = "Spectral"), n = 12)
+yarrr_mix <- usecol(c(piratepal("nemo"), piratepal("bugs")))
+yarrr_mod <- usecol(c(piratepal("ipod")), n = 9)
+
+gradient_exp <- rev(c('#710D10', '#A21317', brew_mix[1:8], '#E9EBEF'))
+
+# Display the second set of custom palettes
+seecol(pal = list(brew_mix, brew_ext, yarrr_mix, yarrr_mod), col_brd = "white", lwd_brd = 2, title = "Using usecol() and seecol() to mix and modify palettes", pal_names = c("brew_mix", "brew_ext", "yarrr_mix", "yarrr_mod"))
+
+# Define additional custom palettes from the scales package
+natjournals_palette <- pal_npg("nrc")(10)
+```
+
+# 2. Loading DNA matrices
+
+```{r}
+read_dna_data <- function(experiment, donor) {
+    read.csv(
+        file.path(
+            local_wd_folder,
+            "results",
+            "per_sample",
+            experiment,
+            donor,
+            "dna_cnv",
+            'matrices',
+            "All_aberrancies.csv"
+        ),
+        header = TRUE,
+        row.names = "NGT"
+    )
+}
+
+DNA_PT_ID01 <- read_dna_data("MDS001", "Donor_C")
+DNA_PT_ID02 <- read_dna_data("MDS001", "Donor_B")
+DNA_PT_ID03 <- read_dna_data("MDS001", "Donor_A")
+DNA_PT_ID04 <- read_dna_data("MDS003", "Donor_B")
+DNA_PT_ID05 <- read_dna_data("MDS003", "Donor_A")
+DNA_PT_ID06 <- read_dna_data("MDS002", "Donor_A")
+DNA_PT_ID07 <- read_dna_data("MDS002", "Donor_C")
+DNA_PT_ID08 <- read_dna_data("MDS002", "Donor_B")
+DNA_PT_ID09 <- read_dna_data("MDS005", "Donor_B")
+DNA_PT_ID10 <- read_dna_data("MDS005", "Donor_A")
+DNA_PT_ID11 <- read_dna_data("MDS006", "Donor_A")
+DNA_PT_ID12 <- read_dna_data("MDS006", "Donor_B")
+DNA_PT_ID13 <- read_dna_data("MDS007", "Donor_A")
+DNA_PT_ID14 <- read_dna_data("MDS008", "Donor_A")
+DNA_PT_ID15 <- read_dna_data("MDS009", "Donor_B")
+DNA_PT_ID16 <- read_dna_data("MDS009", "Donor_A")
+DNA_PT_ID17 <- read_dna_data("MDS010", "Donor_A")
+DNA_PT_ID18 <- read_dna_data("MDS010", "Donor_B")
+DNA_PT_ID15_FU <- read_dna_data("MDS011", "Donor_A")
+DNA_PT_ID19 <- read_dna_data("MDS011", "Donor_B")
+DNA_PT_ID20 <- read_dna_data("pMDS001", "Donor_A")
+DNA_PT_ID20_FU <- read_dna_data("pMDS002", "Donor_A")
+```
+
+```{r}
+rename_dna_cell_barcodes <- function(
+    dna_df,
+    sample_id,
+    suffix
+) {
+    barcode <- rownames(dna_df)
+
+    if (is.null(barcode)) {
+        stop("DNA data frame has no row names.")
+    }
+
+    # Handles both raw barcodes and the previously added PT_IDxx.<barcode>_PTxx form.
+    barcode <- sub("^PT_ID[0-9]+(?:_FU)?\\.", "", barcode)
+    barcode <- sub("^PT[0-9]+(?:_FU)?\\.PT[0-9]+(?:_FU)?_", "", barcode)
+    barcode <- sub("_(PT[0-9]+(?:FU)?)$", "", barcode)
+
+    new_barcodes <- paste0(
+        sample_id,
+        ".",
+        sample_id,
+        "_",
+        barcode,
+        "_",
+        suffix
+    )
+
+    if (anyDuplicated(new_barcodes)) {
+        stop("Duplicate DNA barcodes detected after renaming.")
+    }
+
+    rownames(dna_df) <- new_barcodes
+
+    dna_df
+}
+
+DNA_PT_ID01 <- rename_dna_cell_barcodes(DNA_PT_ID01, "PT01", "PT01")
+DNA_PT_ID02 <- rename_dna_cell_barcodes(DNA_PT_ID02, "PT02", "PT02")
+DNA_PT_ID03 <- rename_dna_cell_barcodes(DNA_PT_ID03, "PT03", "PT03")
+DNA_PT_ID04 <- rename_dna_cell_barcodes(DNA_PT_ID04, "PT04", "PT04")
+DNA_PT_ID05 <- rename_dna_cell_barcodes(DNA_PT_ID05, "PT05", "PT05")
+DNA_PT_ID06 <- rename_dna_cell_barcodes(DNA_PT_ID06, "PT06", "PT06")
+DNA_PT_ID07 <- rename_dna_cell_barcodes(DNA_PT_ID07, "PT07", "PT07")
+DNA_PT_ID08 <- rename_dna_cell_barcodes(DNA_PT_ID08, "PT08", "PT08")
+DNA_PT_ID09 <- rename_dna_cell_barcodes(DNA_PT_ID09, "PT09", "PT09")
+DNA_PT_ID10 <- rename_dna_cell_barcodes(DNA_PT_ID10, "PT10", "PT10")
+DNA_PT_ID11 <- rename_dna_cell_barcodes(DNA_PT_ID11, "PT11", "PT11")
+DNA_PT_ID12 <- rename_dna_cell_barcodes(DNA_PT_ID12, "PT12", "PT12")
+DNA_PT_ID13 <- rename_dna_cell_barcodes(DNA_PT_ID13, "PT13", "PT13")
+DNA_PT_ID14 <- rename_dna_cell_barcodes(DNA_PT_ID14, "PT14", "PT14")
+DNA_PT_ID15 <- rename_dna_cell_barcodes(DNA_PT_ID15, "PT15", "PT15")
+DNA_PT_ID16 <- rename_dna_cell_barcodes(DNA_PT_ID16, "PT16", "PT16")
+DNA_PT_ID17 <- rename_dna_cell_barcodes(DNA_PT_ID17, "PT17", "PT17")
+DNA_PT_ID18 <- rename_dna_cell_barcodes(DNA_PT_ID18, "PT18", "PT18")
+DNA_PT_ID15_FU <- rename_dna_cell_barcodes(DNA_PT_ID15_FU, "PT15_FU", "PT15FU")
+DNA_PT_ID19 <- rename_dna_cell_barcodes(DNA_PT_ID19, "PT19", "PT19")
+DNA_PT_ID20 <- rename_dna_cell_barcodes(DNA_PT_ID20, "PT20", "PT20")
+DNA_PT_ID20_FU <- rename_dna_cell_barcodes(DNA_PT_ID20_FU, "PT20_FU", "PT20FU")
+
+head(rownames(DNA_PT_ID01))
+# PT01.PT01_AACAATGCACCGTACGGA_PT01
+```
+
+```{r}
+dna_samples <- list(
+    DNA_PT_ID01 = DNA_PT_ID01,
+    DNA_PT_ID02 = DNA_PT_ID02,
+    DNA_PT_ID03 = DNA_PT_ID03,
+    DNA_PT_ID04 = DNA_PT_ID04,
+    DNA_PT_ID05 = DNA_PT_ID05,
+    DNA_PT_ID06 = DNA_PT_ID06,
+    DNA_PT_ID07 = DNA_PT_ID07,
+    DNA_PT_ID08 = DNA_PT_ID08,
+    DNA_PT_ID09 = DNA_PT_ID09,
+    DNA_PT_ID10 = DNA_PT_ID10,
+    DNA_PT_ID11 = DNA_PT_ID11,
+    DNA_PT_ID12 = DNA_PT_ID12,
+    DNA_PT_ID13 = DNA_PT_ID13,
+    DNA_PT_ID14 = DNA_PT_ID14,
+    DNA_PT_ID15 = DNA_PT_ID15,
+    DNA_PT_ID16 = DNA_PT_ID16,
+    DNA_PT_ID17 = DNA_PT_ID17,
+    DNA_PT_ID18 = DNA_PT_ID18,
+    DNA_PT_ID15_FU = DNA_PT_ID15_FU,
+    DNA_PT_ID19 = DNA_PT_ID19,
+    DNA_PT_ID20 = DNA_PT_ID20,
+    DNA_PT_ID20_FU = DNA_PT_ID20_FU
+)
+
+# Union of every aberrancy / variant column across samples.
+all_dna_columns <- unique(
+    unlist(
+        lapply(dna_samples, colnames),
+        use.names = FALSE
+    )
+)
+
+# Keep "label" as the first column.
+all_dna_columns <- c(
+    "label",
+    setdiff(all_dna_columns, "label")
+)
+
+dna_samples_aligned <- lapply(
+    dna_samples,
+    function(df) {
+        missing_columns <- setdiff(
+            all_dna_columns,
+            colnames(df)
+        )
+
+        for (column_name in missing_columns) {
+            df[[column_name]] <- NA
+        }
+
+        df[, all_dna_columns, drop = FALSE]
+    }
+)
+
+# Verify that cell barcodes remain unique after merging.
+all_cell_barcodes <- unlist(
+    lapply(dna_samples_aligned, rownames),
+    use.names = FALSE
+)
+
+if (anyDuplicated(all_cell_barcodes)) {
+    stop(
+        "Duplicated DNA cell barcodes detected after alignment: ",
+        paste(
+            unique(all_cell_barcodes[duplicated(all_cell_barcodes)]),
+            collapse = ", "
+        )
+    )
+}
+
+# unname() prevents DNA_PT_IDxx from being added as a row-name prefix.
+DNA_combined <- do.call(
+    rbind,
+    unname(dna_samples_aligned)
+)
+
+NON_WT_cells <- rownames(DNA_combined)[
+    !is.na(DNA_combined$label) &
+        DNA_combined$label != "WT"
+]
+```
+
+# 3. Loading protein matrices
+
+```{r}
+read_protein_counts <- function(experiment, donor) {
+    read.csv(
+        file.path(
+            local_wd_folder,
+            "results",
+            "per_sample",
+            experiment,
+            donor,
+            "protein",
+            'matrices',
+            "protein_read_counts",
+            "Filtered",
+            "raw_read_counts_all_cells.csv"
+        ),
+        header = TRUE,
+        row.names = "read_counts"
+    )
+}
+
+PT_ID01 <- read_protein_counts("MDS001", "Donor_C")
+PT_ID02 <- read_protein_counts("MDS001", "Donor_B")
+PT_ID03 <- read_protein_counts("MDS001", "Donor_A")
+PT_ID04 <- read_protein_counts("MDS003", "Donor_B")
+PT_ID05 <- read_protein_counts("MDS003", "Donor_A")
+PT_ID06 <- read_protein_counts("MDS002", "Donor_A")
+PT_ID07 <- read_protein_counts("MDS002", "Donor_C")
+PT_ID08 <- read_protein_counts("MDS002", "Donor_B")
+PT_ID09  <- read_protein_counts("MDS005", "Donor_B")
+PT_ID10 <- read_protein_counts("MDS005", "Donor_A")
+PT_ID11 <- read_protein_counts("MDS006", "Donor_A")
+PT_ID12 <- read_protein_counts("MDS006", "Donor_B")
+PT_ID13 <- read_protein_counts("MDS007", "Donor_A")
+PT_ID14 <- read_protein_counts("MDS008", "Donor_A")
+PT_ID15 <- read_protein_counts("MDS009", "Donor_B")
+PT_ID16 <- read_protein_counts("MDS009", "Donor_A")
+PT_ID17 <- read_protein_counts("MDS010", "Donor_A")
+PT_ID18 <- read_protein_counts("MDS010", "Donor_B")
+PT_ID15_FU <- read_protein_counts("MDS011", "Donor_A")
+PT_ID19 <- read_protein_counts("MDS011", "Donor_B")
+PT_ID20 <- read_protein_counts("pMDS001", "Donor_A")
+PT_ID20_FU <- read_protein_counts("pMDS002", "Donor_A")
+```
+
+```{r}
+PT_ID01$Donor <- "PT01"
+PT_ID01$Sample <- "PT01"
+PT_ID01$Timepoint <- "Baseline"
+
+PT_ID02$Donor <- "PT02"
+PT_ID02$Sample <- "PT02"
+PT_ID02$Timepoint <- "Baseline"
+
+PT_ID03$Donor <- "PT03"
+PT_ID03$Sample <- "PT03"
+PT_ID03$Timepoint <- "Baseline"
+
+PT_ID04$Donor <- "PT04"
+PT_ID04$Sample <- "PT04"
+PT_ID04$Timepoint <- "Baseline"
+
+PT_ID05$Donor <- "PT05"
+PT_ID05$Sample <- "PT05"
+PT_ID05$Timepoint <- "Baseline"
+
+PT_ID06$Donor <- "PT06"
+PT_ID06$Sample <- "PT06"
+PT_ID06$Timepoint <- "Baseline"
+
+PT_ID07$Donor <- "PT07"
+PT_ID07$Sample <- "PT07"
+PT_ID07$Timepoint <- "Baseline"
+
+PT_ID08$Donor <- "PT08"
+PT_ID08$Sample <- "PT08"
+PT_ID08$Timepoint <- "Baseline"
+
+PT_ID09$Donor <- "PT09"
+PT_ID09$Sample <- "PT09"
+PT_ID09$Timepoint <- "Baseline"
+
+PT_ID10$Donor <- "PT10"
+PT_ID10$Sample <- "PT10"
+PT_ID10$Timepoint <- "Baseline"
+
+PT_ID11$Donor <- "PT11"
+PT_ID11$Sample <- "PT11"
+PT_ID11$Timepoint <- "Baseline"
+
+PT_ID12$Donor <- "PT12"
+PT_ID12$Sample <- "PT12"
+PT_ID12$Timepoint <- "Baseline"
+
+PT_ID13$Donor <- "PT13"
+PT_ID13$Sample <- "PT13"
+PT_ID13$Timepoint <- "Baseline"
+
+PT_ID14$Donor <- "PT14"
+PT_ID14$Sample <- "PT14"
+PT_ID14$Timepoint <- "Baseline"
+
+PT_ID15$Donor <- "PT15"
+PT_ID15$Sample <- "PT15"
+PT_ID15$Timepoint <- "Baseline"
+
+PT_ID16$Donor <- "PT16"
+PT_ID16$Sample <- "PT16"
+PT_ID16$Timepoint <- "Baseline"
+
+PT_ID17$Donor <- "PT17"
+PT_ID17$Sample <- "PT17"
+PT_ID17$Timepoint <- "Baseline"
+
+PT_ID18$Donor <- "PT18"
+PT_ID18$Sample <- "PT18"
+PT_ID18$Timepoint <- "Baseline"
+
+PT_ID15_FU$Donor <- "PT15"
+PT_ID15_FU$Sample <- "PT15_FU"
+PT_ID15_FU$Timepoint <- "Follow-up"
+
+PT_ID19$Donor <- "PT19"
+PT_ID19$Sample <- "PT19"
+PT_ID19$Timepoint <- "Baseline"
+
+PT_ID20$Donor <- "PT20"
+PT_ID20$Sample <- "PT20"
+PT_ID20$Timepoint <- "Baseline"
+
+PT_ID20_FU$Donor <- "PT20"
+PT_ID20_FU$Sample <- "PT20_FU"
+PT_ID20_FU$Timepoint <- "Follow-up"
+```
+
+```{r}
+PT_ID01$Condition <- "MDS"
+PT_ID02$Condition <- "MDS"
+PT_ID03$Condition <- "MDS"
+
+PT_ID04$Condition <- "MDS"
+PT_ID05$Condition <- "MDS"
+PT_ID06$Condition <- "MDS"
+
+PT_ID07$Condition <- "MDS"
+PT_ID08$Condition <- "MDS"
+
+PT_ID09$Condition  <- "MDS"
+PT_ID10$Condition <- "MDS"
+
+PT_ID11$Condition <- "MDS"
+PT_ID12$Condition <- "MDS"
+
+PT_ID13$Condition <- "MDS"
+PT_ID14$Condition <- "MDS"
+
+PT_ID15$Condition <- "MDS"
+PT_ID16$Condition <- "MDS"
+
+PT_ID17$Condition <- "MDS"
+PT_ID18$Condition <- "MDS"
+
+PT_ID15_FU$Condition <- "MDS"
+PT_ID19$Condition    <- "MPN"
+
+PT_ID20$Condition    <- "MDS"
+PT_ID20_FU$Condition <- "MDS"
+```
+
+```{r}
+PT_ID01$Diagnosis <- "AML-MRC"
+PT_ID02$Diagnosis <- "MDS-biTP53"
+PT_ID03$Diagnosis <- "MDS-biTP53"
+
+PT_ID04$Diagnosis <- "MDS-LB"
+PT_ID05$Diagnosis <- "AML-MRC"
+PT_ID06$Diagnosis <- "MDS-biTP53"
+
+PT_ID07$Diagnosis <- "AML-MRC"
+PT_ID08$Diagnosis <- "MDS-IB2"
+
+PT_ID09$Diagnosis  <- "MDS-biTP53"
+PT_ID10$Diagnosis <- "MDS-biTP53"
+
+PT_ID11$Diagnosis <- "MDS with isolated del(5q)"
+PT_ID12$Diagnosis <- "MDS-biTP53"
+
+PT_ID13$Diagnosis <- "MDS-IB1"
+PT_ID14$Diagnosis <- "MDS-LB"
+
+PT_ID15$Diagnosis <- "MDS-LB"
+PT_ID16$Diagnosis <- "MDS with isolated del(5q)"
+
+PT_ID17$Diagnosis <- "MDS-LB"
+PT_ID18$Diagnosis <- "MDS-LB"
+
+PT_ID15_FU$Diagnosis <- "MDS-LB"
+PT_ID19$Diagnosis    <- "ET"
+
+PT_ID20$Diagnosis    <- "MDS"
+PT_ID20_FU$Diagnosis <- "MDS"
+```
+
+```{r}
+rownames(PT_ID01) <- paste0(rownames(PT_ID01), '_PT01')
+rownames(PT_ID02) <- paste0(rownames(PT_ID02), '_PT02')
+rownames(PT_ID03) <- paste0(rownames(PT_ID03), '_PT03')
+rownames(PT_ID04) <- paste0(rownames(PT_ID04), '_PT04')
+rownames(PT_ID05) <- paste0(rownames(PT_ID05), '_PT05')
+rownames(PT_ID06) <- paste0(rownames(PT_ID06), '_PT06')
+rownames(PT_ID07) <- paste0(rownames(PT_ID07), '_PT07')
+rownames(PT_ID08) <- paste0(rownames(PT_ID08), '_PT08')
+rownames(PT_ID09) <- paste0(rownames(PT_ID09), '_PT09')
+rownames(PT_ID10) <- paste0(rownames(PT_ID10), '_PT10')
+rownames(PT_ID11) <- paste0(rownames(PT_ID11), '_PT11')
+rownames(PT_ID12) <- paste0(rownames(PT_ID12), '_PT12')
+rownames(PT_ID13) <- paste0(rownames(PT_ID13), '_PT13')
+rownames(PT_ID14) <- paste0(rownames(PT_ID14), '_PT14')
+rownames(PT_ID15) <- paste0(rownames(PT_ID15), '_PT15')
+rownames(PT_ID16) <- paste0(rownames(PT_ID16), '_PT16')
+rownames(PT_ID17) <- paste0(rownames(PT_ID17), '_PT17')
+rownames(PT_ID18) <- paste0(rownames(PT_ID18), '_PT18')
+rownames(PT_ID15_FU) <- paste0(rownames(PT_ID15_FU), '_PT15FU')
+rownames(PT_ID19) <- paste0(rownames(PT_ID19), '_PT19')
+rownames(PT_ID20) <- paste0(rownames(PT_ID20), '_PT20')
+rownames(PT_ID20_FU) <- paste0(rownames(PT_ID20_FU), '_PT20FU')
+```
+
+```{r}
+# For all PT samples, rename 'label' and add missing annotation columns
+pt_samples <- list(PT_ID01, PT_ID02, PT_ID03, PT_ID04, PT_ID05, PT_ID06, 
+                   PT_ID07, PT_ID08, PT_ID09, PT_ID10, PT_ID11, PT_ID12, 
+                   PT_ID13, PT_ID14, PT_ID15, PT_ID16, PT_ID17, PT_ID18, 
+                   PT_ID15_FU, PT_ID19, PT_ID20, PT_ID20_FU)
+
+pt_names <- c("PT_ID01", "PT_ID02", "PT_ID03", "PT_ID04", "PT_ID05", "PT_ID06",
+              "PT_ID07", "PT_ID08", "PT_ID09", "PT_ID10", "PT_ID11", "PT_ID12",
+              "PT_ID13", "PT_ID14", "PT_ID15", "PT_ID16", "PT_ID17", "PT_ID18",
+              "PT_ID15_FU", "PT_ID19", "PT_ID20", "PT_ID20_FU")
+
+for (i in seq_along(pt_samples)) {
+  if ("label" %in% colnames(pt_samples[[i]])) {
+    pt_samples[[i]] <- pt_samples[[i]] %>%
+      dplyr::rename(Final_annotation = label)
+  }
+  if (!"Averaged.Simplified.Celltype" %in% colnames(pt_samples[[i]])) {
+    pt_samples[[i]]$Averaged.Simplified.Celltype <- NA
+  }
+  if (!"Averaged.Detailed.Celltype" %in% colnames(pt_samples[[i]])) {
+    pt_samples[[i]]$Averaged.Detailed.Celltype <- NA
+  }
+  assign(pt_names[i], pt_samples[[i]])
+}
+```
+
+```{r}
+# Rebuild the list after all metadata/annotation edits.
+pt_samples <- list(
+    PT_ID01 = PT_ID01,
+    PT_ID02 = PT_ID02,
+    PT_ID03 = PT_ID03,
+    PT_ID04 = PT_ID04,
+    PT_ID05 = PT_ID05,
+    PT_ID06 = PT_ID06,
+    PT_ID07 = PT_ID07,
+    PT_ID08 = PT_ID08,
+    PT_ID09 = PT_ID09,
+    PT_ID10 = PT_ID10,
+    PT_ID11 = PT_ID11,
+    PT_ID12 = PT_ID12,
+    PT_ID13 = PT_ID13,
+    PT_ID14 = PT_ID14,
+    PT_ID15 = PT_ID15,
+    PT_ID16 = PT_ID16,
+    PT_ID17 = PT_ID17,
+    PT_ID18 = PT_ID18,
+    PT_ID15_FU = PT_ID15_FU,
+    PT_ID19 = PT_ID19,
+    PT_ID20 = PT_ID20,
+    PT_ID20_FU = PT_ID20_FU
+)
+
+# Use the union of all protein and metadata columns.
+all_columns <- unique(unlist(lapply(pt_samples, colnames)))
+
+pt_samples_aligned <- lapply(
+    pt_samples,
+    function(df) {
+        missing_columns <- setdiff(all_columns, colnames(df))
+
+        for (column_name in missing_columns) {
+            df[[column_name]] <- NA
+        }
+
+        df[, all_columns, drop = FALSE]
+    }
+)
+
+Merged_protein_count_mat <- do.call(rbind, pt_samples_aligned)
+
+cat("Merged dimensions:", dim(Merged_protein_count_mat), "\n")
+cat(
+    "Samples:",
+    paste(sort(unique(Merged_protein_count_mat$Sample)), collapse = ", "),
+    "\n"
+)
+```
+
+```{r}
+Base_embedding <- Seurat::CreateSeuratObject(
+  counts = t(Merged_protein_count_mat %>% 
+               dplyr::select(-Sample, -Donor, -Timepoint, -Condition, -Diagnosis, -Final_annotation,
+                             -Averaged.Simplified.Celltype,
+                             -Averaged.Detailed.Celltype)),
+  assay = 'ADT',
+  project = 'TP53'
+)
+
+Base_embedding$Sample <- Merged_protein_count_mat$Sample
+Base_embedding$Donor <- Merged_protein_count_mat$Donor
+Base_embedding$Timepoint <- Merged_protein_count_mat$Timepoint
+Base_embedding$Condition <- Merged_protein_count_mat$Condition
+Base_embedding$Final_annotation <- Merged_protein_count_mat$Final_annotation
+Base_embedding$Averaged_Simplified_Celltype <- Merged_protein_count_mat$Averaged.Simplified.Celltype
+Base_embedding$Averaged_Detailed_Celltype <- Merged_protein_count_mat$Averaged.Detailed.Celltype
+```
+
+```{r}
+Raw_Base_embedding <- Base_embedding
+```
+
+```{r}
+library(Seurat)
+library(cluster)
+library(dplyr)
+
+all_donors <- sort(unique(as.character(Base_embedding$Donor)))
+all_donors <- all_donors[!is.na(all_donors) & nzchar(all_donors)]
+
+sample_objects <- list()
+silhouette_scores <- list()
+
+for (donor_id in all_donors) {
+    message("Processing donor: ", donor_id)
+
+    donor_cells <- colnames(Base_embedding)[
+        as.character(Base_embedding$Donor) == donor_id
+    ]
+
+    obj <- subset(Base_embedding, cells = donor_cells)
+
+    if (ncol(obj) < 50) {
+        message("  Skipping ", donor_id, " — too few cells (", ncol(obj), ")")
+        next
+    }
+
+    sample_ids <- sort(unique(na.omit(as.character(obj$Sample))))
+    timepoints <- sort(unique(na.omit(as.character(obj$Timepoint))))
+
+    DefaultAssay(obj) <- "ADT"
+
+    obj <- NormalizeData(
+        obj,
+        normalization.method = "CLR",
+        margin = 2,
+        verbose = FALSE
+    )
+
+    obj <- ScaleData(obj, verbose = FALSE)
+
+    obj <- RunPCA(
+        obj,
+        features = rownames(obj[["ADT"]]),
+        verbose = FALSE
+    )
+
+    n_dims <- min(10, ncol(Embeddings(obj, "pca")))
+
+    obj <- RunUMAP(
+        obj,
+        dims = seq_len(n_dims),
+        min.dist = 0.1,
+        spread = 2,
+        n.neighbors = min(50, ncol(obj) - 1),
+        seed.use = 42,
+        verbose = FALSE
+    )
+
+    sample_objects[[donor_id]] <- obj
+
+    annotations <- as.character(obj$Final_annotation)
+
+    valid <- !is.na(annotations) & nzchar(annotations)
+    annotation_counts <- table(annotations[valid])
+
+    retained_annotations <- names(annotation_counts[annotation_counts >= 2])
+
+    valid <- valid & annotations %in% retained_annotations
+
+    n_valid_cells <- sum(valid)
+    n_celltypes <- length(unique(annotations[valid]))
+
+    if (n_valid_cells >= 20 && n_celltypes >= 2) {
+        pca_embed <- Embeddings(obj, "pca")[
+            valid,
+            seq_len(n_dims),
+            drop = FALSE
+        ]
+
+        sil <- silhouette(
+            as.integer(factor(annotations[valid])),
+            dist(pca_embed)
+        )
+
+        mean_silhouette <- mean(sil[, "sil_width"], na.rm = TRUE)
+    } else {
+        mean_silhouette <- NA_real_
+    }
+
+    silhouette_scores[[donor_id]] <- data.frame(
+        Donor = donor_id,
+        Samples = paste(sample_ids, collapse = ";"),
+        Timepoints = paste(timepoints, collapse = ";"),
+        mean_silhouette = mean_silhouette,
+        n_cells_total = ncol(obj),
+        n_cells_annotated = n_valid_cells,
+        n_celltypes = n_celltypes,
+        stringsAsFactors = FALSE
+    )
+}
+
+sil_df <- bind_rows(silhouette_scores) %>%
+    arrange(desc(mean_silhouette))
+
+print(sil_df)
+```
+
+```{r}
+# Visualise all UMAPs in a grid
+library(ggplot2)
+library(patchwork)
+
+plot_list <- list()
+for (s in names(sample_objects)) {
+  plot_list[[s]] <- DimPlot(sample_objects[[s]], group.by = 'Final_annotation', 
+                            pt.size = 0.5) +
+    ggtitle(paste0(s, " (sil: ", 
+                   round(sil_df$mean_silhouette[sil_df$Sample == s], 3), ")")) +
+    NoLegend() +
+    theme(plot.title = element_text(size = 10))
+}
+
+wrap_plots(plot_list, ncol = 5)
+```
+
+```{r}
+good_samples <- sil_df %>% 
+  filter(mean_silhouette > 0) %>% 
+  pull(Donor)
+
+print(good_samples)
+```
+
+
+```{r}
+good_samples <- c("PT17", "PT16", "PT10", "PT08", "PT02", "PT09", "PT11", "PT04", "PT07", "PT06")
+```
+
+```{r}
+Base_embedding <- subset(Base_embedding, cells = WhichCells(Base_embedding, expression = Sample %in% good_samples))
+```
+
+# 4. Processing base map
+
+```{r}
+Base_embedding <- NormalizeData(Base_embedding, normalization.method = 'CLR', margin = 2)
+Base_embedding <- ScaleData(Base_embedding)
+```
+
+```{r}
+set.seed(123)
+Base_embedding <- RunPCA(Base_embedding, features = rownames(Base_embedding@assays$ADT))
+
+ElbowPlot(Base_embedding)
+```
+
+```{r}
+set.seed(123)
+Base_embedding <- RunHarmony(Base_embedding, 
+                             group.by.vars = c('Sample'), dims.use=1:15)
+```
+
+```{r}
+set.seed(123)
+Base_embedding <- RunUMAP(object = Base_embedding, dims = 1:15, min.dist = 0.20, spread = 0.5, 
+                          reduction = 'harmony', n.neighbors = 50, seed.use = 42, return.model = TRUE)
+DimPlot(Base_embedding, group.by = 'Final_annotation', label = T, pt.size = 1.4)
+```
+
+```{r}
+set.seed(123)
+Base_embedding <- FindNeighbors(Base_embedding, reduction = 'harmony', dims = 1:15)
+
+set.seed(123)
+Base_embedding <- FindClusters(Base_embedding, algorithm = 4, resolution = 1)
+```
+
+```{r}
+DimPlot(Base_embedding, group.by = 'seurat_clusters', label = T, pt.size = 1.4)
+```
+
+```{r}
+Idents(Base_embedding) <- Base_embedding$seurat_clusters
+
+DEG <- FindAllMarkers(Base_embedding, assay = 'ADT', max.cells.per.ident = 1000)
+
+DEG$pct.1_v_pct.2 <- DEG$pct.1 - DEG$pct.2
+
+top20_pctdiff_by_cluster <- DEG %>%
+  dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2)) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_head(n = 20) %>%
+  dplyr::ungroup() %>%
+  split(.$cluster)
+
+top20_pctdiff_by_cluster
+```
+
+```{r}
+feature_col <- intersect(c("gene", "feature"), colnames(DEG))[1]
+
+if (length(feature_col) == 0 || is.na(feature_col)) {
+    stop("Could not identify the ADT feature-name column in DEG.")
+}
+
+marker_candidates <- DEG %>%
+    dplyr::mutate(
+        feature_name = as.character(.data[[feature_col]]),
+        cluster = as.character(cluster)
+    ) %>%
+    dplyr::filter(
+        !is.na(feature_name),
+        nzchar(feature_name),
+        !is.na(pct.1_v_pct.2)
+    ) %>%
+    dplyr::arrange(
+        cluster,
+        dplyr::desc(pct.1_v_pct.2)
+    )
+
+cluster_order <- unique(marker_candidates$cluster)
+
+used_features <- character()
+top5_features_by_cluster <- list()
+top5_marker_table <- list()
+
+for (cluster_id in cluster_order) {
+    cluster_markers <- marker_candidates %>%
+        dplyr::filter(cluster == cluster_id) %>%
+        dplyr::filter(!duplicated(feature_name)) %>%
+        dplyr::filter(!feature_name %in% used_features)
+
+    selected_markers <- head(cluster_markers, 5)
+
+    if (nrow(selected_markers) == 0) {
+        next
+    }
+
+    top5_features_by_cluster[[paste0("Cluster ", cluster_id)]] <-
+        selected_markers$feature_name
+
+    top5_marker_table[[cluster_id]] <- selected_markers
+
+    used_features <- c(
+        used_features,
+        selected_markers$feature_name
+    )
+}
+
+top5_pctdiff_by_cluster <- dplyr::bind_rows(top5_marker_table)
+
+Idents(Base_embedding) <- Base_embedding$seurat_clusters
+
+top5_dotplot <- DotPlot(
+    Base_embedding,
+    features = top5_features_by_cluster,
+    assay = "ADT"
+) +
+    RotatedAxis() +
+    ggtitle("Top 5 unique ADT markers per cluster") +
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 8)
+    )
+
+print(top5_dotplot)
+
+top5_pctdiff_by_cluster
+```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% 9),'Celltype'] <- 'HSPC'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% c(2,5)),'Celltype'] <- 'CD4+ T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% c(1,11)),'Celltype'] <- 'CD8+ T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% c(12)),'Celltype'] <- 'Dendritic cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% c(14)),'Celltype'] <- 'EoBaMa cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% c(13)),'Celltype'] <- 'B cell precursor'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% c(10)),'Celltype'] <- 'B cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% c(8,15)),'Celltype'] <- 'Mono/Macrophage'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% 6),'Celltype'] <- 'Erythroblast'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% 7),'Celltype'] <- 'Monocyte'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% 3),'Celltype'] <- 'NK cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% 4),'Celltype'] <- 'Low res'
+```
+
+## - Low res removal
+
+We remove these cells and instead project them on top of good quality protein embedding
+
+```{r}
+low_res_cells <- WhichCells(Base_embedding, expression = Celltype %in% "Low res")
+high_res_cells <- WhichCells(Base_embedding, expression = Celltype %in% setdiff(unique(Base_embedding$Celltype), "Low res"))
+
+Base_embedding <- subset(Base_embedding, cells = high_res_cells)
+```
+
+```{r}
+Base_embedding <- NormalizeData(Base_embedding, normalization.method = 'CLR', margin = 2)
+Base_embedding <- ScaleData(Base_embedding)
+```
+
+```{r}
+set.seed(123)
+Base_embedding <- RunPCA(Base_embedding, features = rownames(Base_embedding@assays$ADT))
+
+ElbowPlot(Base_embedding)
+```
+
+```{r}
+set.seed(123)
+Base_embedding <- RunHarmony(Base_embedding, 
+                             group.by.vars = c('Sample'), dims.use=1:15)
+```
+
+```{r}
+set.seed(123)
+Base_embedding <- RunUMAP(object = Base_embedding, dims = 1:15, min.dist = 0.45, spread = 0.5, 
+                          reduction = 'harmony', n.neighbors = 50, seed.use = 42, return.model = TRUE)
+DimPlot(Base_embedding, group.by = 'Celltype', label = T, pt.size = 1.4)
+```
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(purrr)
+library(networkD3)
+
+set.seed(123)
+
+Base_embedding <- FindNeighbors(
+    Base_embedding,
+    reduction = "harmony",
+    dims = 1:15,
+    k.param = 30,
+    graph.name = c("harmony_nn", "harmony_snn")
+)
+
+resolutions <- seq(0.5, 1.5, by = 0.25)
+resolutions <- round(resolutions, 2)
+
+# Fixed IDs used everywhere: 0.50, 0.75, 1.00, 1.25, 1.50
+resolution_ids <- sprintf("%.2f", resolutions)
+cluster_cols <- paste0("cluster_res_", resolution_ids)
+
+for (i in seq_along(resolutions)) {
+    set.seed(123)
+
+    Base_embedding <- FindClusters(
+        Base_embedding,
+        graph.name = "harmony_snn",
+        algorithm = 4,
+        resolution = resolutions[i],
+        random.seed = 123,
+        cluster.name = cluster_cols[i],
+        verbose = FALSE
+    )
+}
+```
+
+```{r}
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+
+# Matches the fixed names created in the clustering loop:
+# cluster_res_0.50, cluster_res_0.75, ..., cluster_res_1.50
+resolutions <- seq(0.5, 1.5, by = 0.25)
+cluster_cols <- paste0("cluster_res_", sprintf("%.2f", resolutions))
+
+# Retain only clustering columns actually present in metadata.
+cluster_cols <- cluster_cols[
+    cluster_cols %in% colnames(Base_embedding[[]])
+]
+
+resolution_labels <- sub(
+    "cluster_res_",
+    "Resolution ",
+    cluster_cols
+)
+
+resolution_plots <- lapply(
+    seq_along(cluster_cols),
+    function(i) {
+        DimPlot(
+            Base_embedding,
+            group.by = cluster_cols[i],
+            label = TRUE,
+            repel = TRUE,
+            pt.size = 1.4
+        ) +
+            ggtitle(resolution_labels[i]) +
+            theme(
+                plot.title = element_text(hjust = 0.5),
+                legend.position = "none"
+            )
+    }
+)
+
+names(resolution_plots) <- cluster_cols
+
+wrap_plots(
+    resolution_plots,
+    ncol = 3
+) +
+    plot_annotation(
+        title = "Harmony UMAP across clustering resolutions"
+    )
+```
+
+```{r}
+Idents(Base_embedding) <- Base_embedding$cluster_res_1.00
+
+DEG <- FindAllMarkers(Base_embedding, assay = 'ADT', max.cells.per.ident = 1000)
+
+DEG$pct.1_v_pct.2 <- DEG$pct.1 - DEG$pct.2
+
+top20_pctdiff_by_cluster <- DEG %>%
+  dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2)) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_head(n = 20) %>%
+  dplyr::ungroup() %>%
+  split(.$cluster)
+
+top20_pctdiff_by_cluster
+```
+
+```{r}
+feature_col <- intersect(c("gene", "feature"), colnames(DEG))[1]
+
+if (length(feature_col) == 0 || is.na(feature_col)) {
+    stop("Could not identify the ADT feature-name column in DEG.")
+}
+
+marker_candidates <- DEG %>%
+    dplyr::mutate(
+        feature_name = as.character(.data[[feature_col]]),
+        cluster = as.character(cluster)
+    ) %>%
+    dplyr::filter(
+        !is.na(feature_name),
+        nzchar(feature_name),
+        !is.na(pct.1_v_pct.2)
+    ) %>%
+    dplyr::arrange(
+        cluster,
+        dplyr::desc(pct.1_v_pct.2)
+    )
+
+cluster_order <- unique(marker_candidates$cluster)
+
+used_features <- character()
+top5_features_by_cluster <- list()
+top5_marker_table <- list()
+
+for (cluster_id in cluster_order) {
+    cluster_markers <- marker_candidates %>%
+        dplyr::filter(cluster == cluster_id) %>%
+        dplyr::filter(!duplicated(feature_name)) %>%
+        dplyr::filter(!feature_name %in% used_features)
+
+    selected_markers <- head(cluster_markers, 5)
+
+    if (nrow(selected_markers) == 0) {
+        next
+    }
+
+    top5_features_by_cluster[[paste0("Cluster ", cluster_id)]] <-
+        selected_markers$feature_name
+
+    top5_marker_table[[cluster_id]] <- selected_markers
+
+    used_features <- c(
+        used_features,
+        selected_markers$feature_name
+    )
+}
+
+top5_pctdiff_by_cluster <- dplyr::bind_rows(top5_marker_table)
+
+Idents(Base_embedding) <- Base_embedding$seurat_clusters
+
+top5_dotplot <- DotPlot(
+    Base_embedding,
+    features = top5_features_by_cluster,
+    assay = "ADT"
+) +
+    RotatedAxis() +
+    ggtitle("Top 5 unique ADT markers per cluster") +
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 8)
+    )
+
+print(top5_dotplot)
+
+top5_pctdiff_by_cluster
+```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% 7),'Celltype'] <- 'HSPC'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% c(2,5)),'Celltype'] <- 'CD4+ T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% c(1,10)),'Celltype'] <- 'CD8+ T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% c(11)),'Celltype'] <- 'cDC'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% c(8)),'Celltype'] <- 'B cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% c(4)),'Celltype'] <- 'Mono/Macrophage'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% 6),'Celltype'] <- 'Erythroblast'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% 9),'Celltype'] <- 'Monocyte'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% 3),'Celltype'] <- 'NK cell'
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.50 %in% 15),'Celltype'] <- 'pDC'
+```
+
+# 5. Subclustering
+
+```{r}
+Base_embedding$Celltype_revised <- Base_embedding$Celltype
+```
+
+```{r}
+library(Seurat)
+library(harmony)
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+run_adt_subclustering <- function(
+    main_obj,
+    celltype_label,
+    n_dims = 10,
+    n_neighbors = 15,
+    resolution = 1
+) {
+    DefaultAssay(main_obj) <- "ADT"
+
+    selected_cells <- colnames(main_obj)[
+        as.character(main_obj$Celltype) == celltype_label
+    ]
+
+    if (length(selected_cells) < 30) {
+        stop(
+            "Only ", length(selected_cells),
+            " cells found for Celltype == '", celltype_label, "'."
+        )
+    }
+
+    obj <- subset(main_obj, cells = selected_cells)
+    DefaultAssay(obj) <- "ADT"
+
+    obj <- NormalizeData(
+        obj,
+        normalization.method = "CLR",
+        margin = 2,
+        verbose = FALSE
+    )
+
+    obj <- ScaleData(
+        obj,
+        verbose = FALSE
+    )
+
+    set.seed(123)
+
+    obj <- RunPCA(
+        obj,
+        features = rownames(obj[["ADT"]]),
+        verbose = FALSE
+    )
+
+    n_pca_dims <- min(
+        n_dims,
+        ncol(Embeddings(obj, "pca"))
+    )
+
+    if (n_pca_dims < 2) {
+        stop("Too few PCA dimensions available for subclustering.")
+    }
+
+    sample_count <- length(
+        unique(na.omit(as.character(obj$Sample)))
+    )
+
+    if (sample_count > 1) {
+        set.seed(123)
+
+        obj <- RunHarmony(
+            obj,
+            group.by.vars = "Sample",
+            reduction = "pca",
+            dims.use = seq_len(n_pca_dims),
+            verbose = FALSE
+        )
+
+        reduction_use <- "harmony"
+        dims_use <- seq_len(
+            min(
+                n_pca_dims,
+                ncol(Embeddings(obj, "harmony"))
+            )
+        )
+    } else {
+        reduction_use <- "pca"
+        dims_use <- seq_len(n_pca_dims)
+    }
+
+    set.seed(123)
+
+    obj <- RunUMAP(
+        obj,
+        reduction = reduction_use,
+        dims = dims_use,
+        min.dist = 0.20,
+        spread = 1.5,
+        n.neighbors = min(n_neighbors, ncol(obj) - 1),
+        seed.use = 42,
+        return.model = TRUE,
+        verbose = FALSE
+    )
+
+    set.seed(123)
+
+    obj <- FindNeighbors(
+        obj,
+        reduction = reduction_use,
+        dims = dims_use,
+        k.param = min(n_neighbors, ncol(obj) - 1),
+        verbose = FALSE
+    )
+
+    set.seed(123)
+
+    obj <- FindClusters(
+        obj,
+        algorithm = 4,
+        resolution = resolution,
+        random.seed = 123,
+        verbose = FALSE
+    )
+
+    return(obj)
+}
+
+
+get_adt_marker_outputs <- function(
+    obj,
+    n_top = 5,
+    max_cells_per_ident = 1000
+) {
+    DefaultAssay(obj) <- "ADT"
+    Idents(obj) <- obj$seurat_clusters
+
+    deg <- FindAllMarkers(
+        obj,
+        assay = "ADT",
+        max.cells.per.ident = max_cells_per_ident,
+        verbose = FALSE
+    )
+
+    if (nrow(deg) == 0) {
+        stop("FindAllMarkers returned no ADT markers.")
+    }
+
+    deg$pct.1_v_pct.2 <- deg$pct.1 - deg$pct.2
+
+    feature_col <- intersect(c("gene", "feature"), colnames(deg))[1]
+
+    if (length(feature_col) == 0 || is.na(feature_col)) {
+        stop("Could not identify the ADT feature-name column in marker results.")
+    }
+
+    top20 <- deg %>%
+        arrange(cluster, desc(pct.1_v_pct.2)) %>%
+        group_by(cluster) %>%
+        slice_head(n = 20) %>%
+        ungroup() %>%
+        split(.$cluster)
+
+    marker_candidates <- deg %>%
+        mutate(
+            feature_name = as.character(.data[[feature_col]]),
+            cluster = as.character(cluster)
+        ) %>%
+        filter(
+            !is.na(feature_name),
+            nzchar(feature_name),
+            !is.na(pct.1_v_pct.2)
+        ) %>%
+        arrange(cluster, desc(pct.1_v_pct.2))
+
+    cluster_order <- sort(unique(marker_candidates$cluster))
+
+    used_features <- character()
+    top_features_by_cluster <- list()
+    top_marker_list <- list()
+
+    for (cluster_id in cluster_order) {
+        selected_markers <- marker_candidates %>%
+            filter(cluster == cluster_id) %>%
+            distinct(feature_name, .keep_all = TRUE) %>%
+            filter(!feature_name %in% used_features) %>%
+            slice_head(n = n_top)
+
+        if (nrow(selected_markers) == 0) {
+            next
+        }
+
+        top_features_by_cluster[[paste0("Cluster ", cluster_id)]] <-
+            selected_markers$feature_name
+
+        top_marker_list[[cluster_id]] <- selected_markers
+
+        used_features <- c(
+            used_features,
+            selected_markers$feature_name
+        )
+    }
+
+    top_markers <- bind_rows(top_marker_list)
+
+    top_dotplot <- DotPlot(
+        obj,
+        features = top_features_by_cluster,
+        assay = "ADT"
+    ) +
+        RotatedAxis() +
+        ggtitle("Top unique ADT markers per subcluster") +
+        theme(
+            plot.title = element_text(hjust = 0.5),
+            axis.text.x = element_text(size = 8)
+        )
+
+    list(
+        DEG = deg,
+        top20 = top20,
+        top_markers = top_markers,
+        dotplot = top_dotplot
+    )
+}
+
+
+project_subclusters_to_main <- function(
+    main_obj,
+    subset_obj,
+    population_name,
+    reduction = "umap"
+) {
+    subset_cells <- intersect(
+        colnames(subset_obj),
+        colnames(main_obj)
+    )
+
+    if (length(subset_cells) == 0) {
+        stop("No subset cells were found in the main object.")
+    }
+
+    refined_clusters <- as.character(
+        subset_obj[[]][
+            subset_cells,
+            "seurat_clusters",
+            drop = TRUE
+        ]
+    )
+
+    metadata_col <- paste0(
+        gsub("[^A-Za-z0-9]+", "_", population_name),
+        "_subcluster_main"
+    )
+
+    main_obj[[metadata_col]] <- "Other cells"
+
+    main_obj@meta.data[
+        subset_cells,
+        metadata_col
+    ] <- paste0(population_name, "_", refined_clusters)
+
+    subcluster_labels <- sort(
+        unique(
+            main_obj@meta.data[
+                subset_cells,
+                metadata_col
+            ]
+        )
+    )
+
+    main_obj@meta.data[[metadata_col]] <- factor(
+        main_obj@meta.data[[metadata_col]],
+        levels = c("Other cells", subcluster_labels)
+    )
+
+    plot_cols <- c(
+        "Other cells" = "grey85",
+        setNames(
+            hue_pal()(length(subcluster_labels)),
+            subcluster_labels
+        )
+    )
+
+    p <- DimPlot(
+        main_obj,
+        reduction = reduction,
+        group.by = metadata_col,
+        cols = plot_cols,
+        order = subcluster_labels,
+        shuffle = TRUE,
+        seed = 123,
+        pt.size = 1.2,
+        label = FALSE
+    ) +
+        ggtitle(
+            paste0(
+                population_name,
+                " subclusters projected onto the main UMAP"
+            )
+        ) +
+        theme(
+            plot.title = element_text(hjust = 0.5)
+        )
+
+    p <- LabelClusters(
+        plot = p,
+        id = metadata_col,
+        clusters = subcluster_labels,
+        repel = TRUE,
+        box = TRUE,
+        size = 4
+    )
+
+    list(
+        object = main_obj,
+        plot = p,
+        metadata_column = metadata_col
+    )
+}
+```
+
+## - pDC
+
+```{r}
+# pDC subclustering — same parameters as HSPCs
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_pDCs <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype %in% "pDC"
+    )
+)
+
+Base_embedding_pDCs <- NormalizeData(
+    Base_embedding_pDCs,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_pDCs <- ScaleData(Base_embedding_pDCs)
+
+set.seed(123)
+
+Base_embedding_pDCs <- RunPCA(
+    Base_embedding_pDCs,
+    features = rownames(Base_embedding_pDCs@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_pDCs <- RunHarmony(
+    Base_embedding_pDCs,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_pDCs <- RunUMAP(
+    object = Base_embedding_pDCs,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_pDCs <- FindNeighbors(
+    Base_embedding_pDCs,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_pDCs <- FindClusters(
+    Base_embedding_pDCs,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_pDCs,
+    group.by = "Final_annotation",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_pDCs,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+# Project pDC subclusters back onto the main UMAP
+
+pDC_cells <- intersect(
+    colnames(Base_embedding_pDCs),
+    colnames(Base_embedding)
+)
+
+# Store pDC subcluster identity in the main object.
+Base_embedding$pDC_subcluster <- "Other cells"
+
+Base_embedding@meta.data[
+    pDC_cells,
+    "pDC_subcluster"
+] <- paste0(
+    "pDC_",
+    as.character(
+        Base_embedding_pDCs$seurat_clusters[
+            match(pDC_cells, colnames(Base_embedding_pDCs))
+        ]
+    )
+)
+
+pDC_levels <- sort(
+    unique(
+        Base_embedding$pDC_subcluster[
+            Base_embedding$pDC_subcluster != "Other cells"
+        ]
+    )
+)
+
+Base_embedding$pDC_subcluster <- factor(
+    Base_embedding$pDC_subcluster,
+    levels = c("Other cells", pDC_levels)
+)
+
+pDC_colors <- c(
+    "Other cells" = "grey85",
+    setNames(
+        scales::hue_pal()(length(pDC_levels)),
+        pDC_levels
+    )
+)
+
+p_pDC_main <- DimPlot(
+    Base_embedding,
+    reduction = "umap",
+    group.by = "pDC_subcluster",
+    cols = pDC_colors,
+    order = pDC_levels,
+    shuffle = TRUE,
+    seed = 123,
+    pt.size = 1.2,
+    label = FALSE
+) +
+    ggtitle("pDC subclusters on the main UMAP") +
+    theme(
+        plot.title = element_text(hjust = 0.5)
+    )
+
+p_pDC_main <- LabelClusters(
+    plot = p_pDC_main,
+    id = "pDC_subcluster",
+    clusters = pDC_levels,
+    repel = TRUE,
+    box = TRUE,
+    size = 4
+)
+
+print(p_pDC_main)
+
+# Optional: focus on the local pDC region while retaining the main UMAP coordinates.
+p_pDC_main +
+    coord_cartesian(
+        xlim = range(
+            Embeddings(Base_embedding, "umap")[pDC_cells, 1]
+        ) + c(-1, 1),
+        ylim = range(
+            Embeddings(Base_embedding, "umap")[pDC_cells, 2]
+        ) + c(-1, 1)
+    )
+```
+
+
+```{r}
+# pDC differential expression and top-marker dot plot
+
+DefaultAssay(Base_embedding_pDCs) <- "ADT"
+Idents(Base_embedding_pDCs) <- Base_embedding_pDCs$seurat_clusters
+
+DEG_pDC <- FindAllMarkers(
+    Base_embedding_pDCs,
+    assay = "ADT",
+    max.cells.per.ident = 1000
+)
+
+DEG_pDC$pct.1_v_pct.2 <- DEG_pDC$pct.1 - DEG_pDC$pct.2
+
+top20_pctdiff_by_cluster_pDC <- DEG_pDC %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2)) %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::slice_head(n = 20) %>%
+    dplyr::ungroup() %>%
+    split(.$cluster)
+
+feature_col <- intersect(c("gene", "feature"), colnames(DEG_pDC))[1]
+
+marker_candidates_pDC <- DEG_pDC %>%
+    dplyr::mutate(
+        feature_name = as.character(.data[[feature_col]]),
+        cluster = as.character(cluster)
+    ) %>%
+    dplyr::filter(
+        !is.na(feature_name),
+        nzchar(feature_name),
+        !is.na(pct.1_v_pct.2)
+    ) %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2))
+
+used_features <- character()
+top5_features_by_cluster_pDC <- list()
+top5_marker_table_pDC <- list()
+
+for (cluster_id in sort(unique(marker_candidates_pDC$cluster))) {
+    selected_markers <- marker_candidates_pDC %>%
+        dplyr::filter(cluster == cluster_id) %>%
+        dplyr::distinct(feature_name, .keep_all = TRUE) %>%
+        dplyr::filter(!feature_name %in% used_features) %>%
+        dplyr::slice_head(n = 5)
+
+    if (nrow(selected_markers) == 0) next
+
+    top5_features_by_cluster_pDC[[paste0("pDC cluster ", cluster_id)]] <-
+        selected_markers$feature_name
+
+    top5_marker_table_pDC[[cluster_id]] <- selected_markers
+    used_features <- c(used_features, selected_markers$feature_name)
+}
+
+top5_pctdiff_by_cluster_pDC <- dplyr::bind_rows(top5_marker_table_pDC)
+
+pDC_top5_dotplot <- DotPlot(
+    Base_embedding_pDCs,
+    features = top5_features_by_cluster_pDC,
+    assay = "ADT"
+) +
+    RotatedAxis() +
+    ggtitle("Top 5 unique ADT markers per pDC subcluster") +
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 8)
+    )
+
+print(pDC_top5_dotplot)
+
+top20_pctdiff_by_cluster_pDC
+top5_pctdiff_by_cluster_pDC
+```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding_pDCs, expression = seurat_clusters %in% c(4)),'Celltype_revised'] <- 'NK cell'
+Base_embedding@meta.data[WhichCells(Base_embedding_pDCs, expression = seurat_clusters %in% c(3)),'Celltype_revised'] <- 'NK cell'
+Base_embedding@meta.data[WhichCells(Base_embedding_pDCs, expression = seurat_clusters %in% c(2)),'Celltype_revised'] <- 'pDC'
+Base_embedding@meta.data[WhichCells(Base_embedding_pDCs, expression = seurat_clusters %in% c(1)),'Celltype_revised'] <- 'pDC'
+```
+
+## - Monocytes
+
+```{r}
+# Monocyte subclustering — same parameters as HSPCs
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_Monocytes <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype %in% "Monocyte"
+    )
+)
+
+Base_embedding_Monocytes <- NormalizeData(
+    Base_embedding_Monocytes,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_Monocytes <- ScaleData(Base_embedding_Monocytes)
+
+set.seed(123)
+
+Base_embedding_Monocytes <- RunPCA(
+    Base_embedding_Monocytes,
+    features = rownames(Base_embedding_Monocytes@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_Monocytes <- RunHarmony(
+    Base_embedding_Monocytes,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_Monocytes <- RunUMAP(
+    object = Base_embedding_Monocytes,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_Monocytes <- FindNeighbors(
+    Base_embedding_Monocytes,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_Monocytes <- FindClusters(
+    Base_embedding_Monocytes,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_Monocytes,
+    group.by = "Final_annotation",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_Monocytes,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+Base_embedding@meta.data[colnames(Base_embedding_Monocytes),'Celltype_revised'] <- 'CD14+ monocyte'
+Base_embedding@meta.data[WhichCells(Base_embedding_Monocytes, expression = seurat_clusters %in% c(3,6,8,5)),'Celltype_revised'] <- 'CD16+ monocyte'
+```
+
+## - Mono/Mac
+
+```{r}
+# pDC subclustering — same parameters as HSPCs
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_Mono_Macs <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype %in% "Mono/Macrophage"
+    )
+)
+
+Base_embedding_Mono_Macs <- NormalizeData(
+    Base_embedding_Mono_Macs,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_Mono_Macs <- ScaleData(Base_embedding_Mono_Macs)
+
+set.seed(123)
+
+Base_embedding_Mono_Macs <- RunPCA(
+    Base_embedding_Mono_Macs,
+    features = rownames(Base_embedding_Mono_Macs@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Macs <- RunHarmony(
+    Base_embedding_Mono_Macs,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Macs <- RunUMAP(
+    object = Base_embedding_Mono_Macs,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Macs <- FindNeighbors(
+    Base_embedding_Mono_Macs,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Macs <- FindClusters(
+    Base_embedding_Mono_Macs,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_Mono_Macs,
+    group.by = "Final_annotation",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_Mono_Macs,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Macs, expression = seurat_clusters %in% c(3)),'Celltype_revised'] <- 'Other T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Macs, expression = seurat_clusters %in% c(1)),'Celltype_revised'] <- 'Other T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Macs, expression = seurat_clusters %in% c(6)),'Celltype_revised'] <- 'B cell'
+Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Macs, expression = seurat_clusters %in% c(4)),'Celltype_revised'] <- 'Mono/Macrophage'
+```
+
+# 6. Re-assignment of noisy cells
+
+```{r}
+# ---- 1. Compute silhouette on Harmony space ----
+library(cluster)
+library(FNN)
+
+harmony_embed <- Embeddings(Base_embedding, 'harmony')[, 1:15]
+umap_embed <- Embeddings(Base_embedding, 'umap')
+
+labels <- as.integer(factor(Base_embedding$Celltype_revised))
+dist_mat <- dist(harmony_embed)
+sil <- silhouette(labels, dist_mat)
+
+Base_embedding$silhouette_score <- sil[, 3]
+
+# ---- 2. Identify outliers per cell type (below Q1 - 1.5*IQR) ----
+celltypes <- unique(Base_embedding$Celltype_revised)
+low_conf_idx <- c()
+
+for (ct in celltypes) {
+  ct_idx <- which(Base_embedding$Celltype_revised == ct)
+  ct_scores <- Base_embedding$silhouette_score[ct_idx]
+  
+  q1 <- quantile(ct_scores, 0.25)
+  iqr <- IQR(ct_scores)
+  lower_bound <- q1 - 1.5 * iqr
+  
+  outliers <- ct_idx[ct_scores < lower_bound]
+  low_conf_idx <- c(low_conf_idx, outliers)
+  
+  message(ct, ": ", length(outliers), " outliers out of ", length(ct_idx), 
+          " (threshold: ", round(lower_bound, 3), ")")
+}
+
+high_conf_idx <- setdiff(seq_len(ncol(Base_embedding)), low_conf_idx)
+
+# ---- 3. Reassign outliers using KNN in UMAP space ----
+set.seed(123)
+knn_result <- get.knnx(umap_embed[high_conf_idx, , drop = FALSE], 
+                        umap_embed[low_conf_idx, , drop = FALSE], k = 15)
+
+new_labels <- apply(knn_result$nn.index, 1, function(nn) {
+  neighbour_labels <- Base_embedding$Celltype_revised[high_conf_idx[nn]]
+  names(sort(table(neighbour_labels), decreasing = TRUE))[1]
+})
+
+Base_embedding$Celltype_revised_refined <- Base_embedding$Celltype_revised
+Base_embedding$Celltype_revised_refined[low_conf_idx] <- new_labels
+
+# ---- 4. Per-celltype refinement using UMAP space ----
+celltypes_refined <- unique(Base_embedding$Celltype_revised_refined)
+
+for (ct in celltypes_refined) {
+  ct_idx <- which(Base_embedding$Celltype_revised_refined == ct)
+  
+  if (length(ct_idx) < 10) next
+  
+  ct_embed <- umap_embed[ct_idx, ]
+  ct_labels <- Base_embedding$Celltype_revised_refined[ct_idx]
+  
+  if (length(unique(ct_labels)) < 2) {
+    centroid <- colMeans(ct_embed)
+    dists <- sqrt(rowSums(sweep(ct_embed, 2, centroid)^2))
+    q1 <- quantile(dists, 0.25)
+    q3 <- quantile(dists, 0.75)
+    iqr <- q3 - q1
+    upper_bound <- q3 + 1.5 * iqr
+    
+    ct_outliers_local <- which(dists > upper_bound)
+    
+    if (length(ct_outliers_local) > 0) {
+      ct_outliers_global <- ct_idx[ct_outliers_local]
+      ct_high_conf_global <- setdiff(seq_len(ncol(Base_embedding)), ct_outliers_global)
+      ct_high_conf_global <- ct_high_conf_global[Base_embedding$silhouette_score[ct_high_conf_global] >= 0]
+      
+      if (length(ct_high_conf_global) > 15) {
+        set.seed(123)
+        knn_fix <- get.knnx(umap_embed[ct_high_conf_global, , drop = FALSE],
+                            umap_embed[ct_outliers_global, , drop = FALSE], k = 15)
+        
+        fix_labels <- apply(knn_fix$nn.index, 1, function(nn) {
+          neighbour_labels <- Base_embedding$Celltype_revised_refined[ct_high_conf_global[nn]]
+          names(sort(table(neighbour_labels), decreasing = TRUE))[1]
+        })
+        
+        Base_embedding$Celltype_revised_refined[ct_outliers_global] <- fix_labels
+      }
+    }
+  }
+}
+
+# ---- 5. Visualise ----
+DimPlot(Base_embedding, group.by = 'Celltype_revised', label = TRUE, pt.size = 1.4) + ggtitle('Original')
+DimPlot(Base_embedding, group.by = 'Celltype_revised_refined', label = TRUE, pt.size = 1.4) + ggtitle('Refined')
+
+# Summary of changes
+table(Original = Base_embedding$Celltype_revised, Refined = Base_embedding$Celltype_revised_refined)
+```
+
+## - Other T fix
+
+```{r}
+# pDC subclustering — same parameters as HSPCs
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_Other_Ts <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype_revised_refined %in% "Other T cell"
+    )
+)
+
+Base_embedding_Other_Ts <- NormalizeData(
+    Base_embedding_Other_Ts,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_Other_Ts <- ScaleData(Base_embedding_Other_Ts)
+
+set.seed(123)
+
+Base_embedding_Other_Ts <- RunPCA(
+    Base_embedding_Other_Ts,
+    features = rownames(Base_embedding_Other_Ts@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_Other_Ts <- RunHarmony(
+    Base_embedding_Other_Ts,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_Other_Ts <- RunUMAP(
+    object = Base_embedding_Other_Ts,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_Other_Ts <- FindNeighbors(
+    Base_embedding_Other_Ts,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_Other_Ts <- FindClusters(
+    Base_embedding_Other_Ts,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_Other_Ts,
+    group.by = "Final_annotation",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_Other_Ts,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+# Project Other_T subclusters back onto the main UMAP
+
+Other_T_cells <- intersect(
+    colnames(Base_embedding_Other_Ts),
+    colnames(Base_embedding)
+)
+
+# Store Other_T subcluster identity in the main object.
+Base_embedding$Other_T_subcluster <- "Other cells"
+
+Base_embedding@meta.data[
+    Other_T_cells,
+    "Other_T_subcluster"
+] <- paste0(
+    "Other_T_",
+    as.character(
+        Base_embedding_Other_Ts$seurat_clusters[
+            match(Other_T_cells, colnames(Base_embedding_Other_Ts))
+        ]
+    )
+)
+
+Other_T_levels <- sort(
+    unique(
+        Base_embedding$Other_T_subcluster[
+            Base_embedding$Other_T_subcluster != "Other cells"
+        ]
+    )
+)
+
+Base_embedding$Other_T_subcluster <- factor(
+    Base_embedding$Other_T_subcluster,
+    levels = c("Other cells", Other_T_levels)
+)
+
+Other_T_colors <- c(
+    "Other cells" = "grey85",
+    setNames(
+        scales::hue_pal()(length(Other_T_levels)),
+        Other_T_levels
+    )
+)
+
+p_Other_T_main <- DimPlot(
+    Base_embedding,
+    reduction = "umap",
+    group.by = "Other_T_subcluster",
+    cols = Other_T_colors,
+    order = Other_T_levels,
+    shuffle = TRUE,
+    seed = 123,
+    pt.size = 1.2,
+    label = FALSE
+) +
+    ggtitle("Other_T subclusters on the main UMAP") +
+    theme(
+        plot.title = element_text(hjust = 0.5)
+    )
+
+p_Other_T_main <- LabelClusters(
+    plot = p_Other_T_main,
+    id = "Other_T_subcluster",
+    clusters = Other_T_levels,
+    repel = TRUE,
+    box = TRUE,
+    size = 4
+)
+
+print(p_Other_T_main)
+
+# Optional: focus on the local Other_T region while retaining the main UMAP coordinates.
+p_Other_T_main +
+    coord_cartesian(
+        xlim = range(
+            Embeddings(Base_embedding, "umap")[Other_T_cells, 1]
+        ) + c(-1, 1),
+        ylim = range(
+            Embeddings(Base_embedding, "umap")[Other_T_cells, 2]
+        ) + c(-1, 1)
+    )
+```
+
+
+```{r}
+# Other_T differential expression and top-marker dot plot
+
+DefaultAssay(Base_embedding_Other_Ts) <- "ADT"
+Idents(Base_embedding_Other_Ts) <- Base_embedding_Other_Ts$seurat_clusters
+
+DEG_Other_T <- FindAllMarkers(
+    Base_embedding_Other_Ts,
+    assay = "ADT",
+    max.cells.per.ident = 1000
+)
+
+DEG_Other_T$pct.1_v_pct.2 <- DEG_Other_T$pct.1 - DEG_Other_T$pct.2
+
+top20_pctdiff_by_cluster_Other_T <- DEG_Other_T %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2)) %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::slice_head(n = 20) %>%
+    dplyr::ungroup() %>%
+    split(.$cluster)
+
+feature_col <- intersect(c("gene", "feature"), colnames(DEG_Other_T))[1]
+
+marker_candidates_Other_T <- DEG_Other_T %>%
+    dplyr::mutate(
+        feature_name = as.character(.data[[feature_col]]),
+        cluster = as.character(cluster)
+    ) %>%
+    dplyr::filter(
+        !is.na(feature_name),
+        nzchar(feature_name),
+        !is.na(pct.1_v_pct.2)
+    ) %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2))
+
+used_features <- character()
+top5_features_by_cluster_Other_T <- list()
+top5_marker_table_Other_T <- list()
+
+for (cluster_id in sort(unique(marker_candidates_Other_T$cluster))) {
+    selected_markers <- marker_candidates_Other_T %>%
+        dplyr::filter(cluster == cluster_id) %>%
+        dplyr::distinct(feature_name, .keep_all = TRUE) %>%
+        dplyr::filter(!feature_name %in% used_features) %>%
+        dplyr::slice_head(n = 5)
+
+    if (nrow(selected_markers) == 0) next
+
+    top5_features_by_cluster_Other_T[[paste0("Other_T cluster ", cluster_id)]] <-
+        selected_markers$feature_name
+
+    top5_marker_table_Other_T[[cluster_id]] <- selected_markers
+    used_features <- c(used_features, selected_markers$feature_name)
+}
+
+top5_pctdiff_by_cluster_Other_T <- dplyr::bind_rows(top5_marker_table_Other_T)
+
+Other_T_top5_dotplot <- DotPlot(
+    Base_embedding_Other_Ts,
+    features = top5_features_by_cluster_Other_T,
+    assay = "ADT"
+) +
+    RotatedAxis() +
+    ggtitle("Top 5 unique ADT markers per Other_T subcluster") +
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 8)
+    )
+
+print(Other_T_top5_dotplot)
+
+top20_pctdiff_by_cluster_Other_T
+top5_pctdiff_by_cluster_Other_T
+```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding_Other_Ts, expression = seurat_clusters %in% c(1)),'Celltype_revised_refined'] <- 'Mono/Macrophage'
+Base_embedding@meta.data[WhichCells(Base_embedding_Other_Ts, expression = seurat_clusters %in% c(4)),'Celltype_revised_refined'] <- 'Mono/Macrophage'
+```
+
+## - Mono Mac fix
+
+```{r}
+# pDC subclustering — same parameters as HSPCs
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_Mono_Mac <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype_revised_refined %in% "Mono/Macrophage"
+    )
+)
+
+Base_embedding_Mono_Mac <- NormalizeData(
+    Base_embedding_Mono_Mac,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_Mono_Mac <- ScaleData(Base_embedding_Mono_Mac)
+
+set.seed(123)
+
+Base_embedding_Mono_Mac <- RunPCA(
+    Base_embedding_Mono_Mac,
+    features = rownames(Base_embedding_Mono_Mac@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Mac <- RunHarmony(
+    Base_embedding_Mono_Mac,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Mac <- RunUMAP(
+    object = Base_embedding_Mono_Mac,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Mac <- FindNeighbors(
+    Base_embedding_Mono_Mac,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_Mono_Mac <- FindClusters(
+    Base_embedding_Mono_Mac,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_Mono_Mac,
+    group.by = "Final_annotation",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_Mono_Mac,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+# Project Other_T subclusters back onto the main UMAP
+
+Mono_Mac_cells <- intersect(
+    colnames(Base_embedding_Mono_Mac),
+    colnames(Base_embedding)
+)
+
+# Store Mono_Mac subcluster identity in the main object.
+Base_embedding$Mono_Mac_subcluster <- "Other cells"
+
+Base_embedding@meta.data[
+    Mono_Mac_cells,
+    "Mono_Mac_subcluster"
+] <- paste0(
+    "Mono_Mac_",
+    as.character(
+        Base_embedding_Mono_Mac$seurat_clusters[
+            match(Mono_Mac_cells, colnames(Base_embedding_Mono_Mac))
+        ]
+    )
+)
+
+Mono_Mac_levels <- sort(
+    unique(
+        Base_embedding$Mono_Mac_subcluster[
+            Base_embedding$Mono_Mac_subcluster != "Other cells"
+        ]
+    )
+)
+
+Base_embedding$Mono_Mac_subcluster <- factor(
+    Base_embedding$Mono_Mac_subcluster,
+    levels = c("Other cells", Mono_Mac_levels)
+)
+
+Mono_Mac_colors <- c(
+    "Other cells" = "grey85",
+    setNames(
+        scales::hue_pal()(length(Mono_Mac_levels)),
+        Mono_Mac_levels
+    )
+)
+
+p_Mono_Mac_main <- DimPlot(
+    Base_embedding,
+    reduction = "umap",
+    group.by = "Mono_Mac_subcluster",
+    cols = Mono_Mac_colors,
+    order = Mono_Mac_levels,
+    shuffle = TRUE,
+    seed = 123,
+    pt.size = 1.2,
+    label = FALSE
+) +
+    ggtitle("Mono_Mac subclusters on the main UMAP") +
+    theme(
+        plot.title = element_text(hjust = 0.5)
+    )
+
+p_Mono_Mac_main <- LabelClusters(
+    plot = p_Mono_Mac_main,
+    id = "Mono_Mac_subcluster",
+    clusters = Mono_Mac_levels,
+    repel = TRUE,
+    box = TRUE,
+    size = 4
+)
+
+print(p_Mono_Mac_main)
+
+# Optional: focus on the local Mono_Mac region while retaining the main UMAP coordinates.
+p_Mono_Mac_main +
+    coord_cartesian(
+        xlim = range(
+            Embeddings(Base_embedding, "umap")[Mono_Mac_cells, 1]
+        ) + c(-1, 1),
+        ylim = range(
+            Embeddings(Base_embedding, "umap")[Mono_Mac_cells, 2]
+        ) + c(-1, 1)
+    )
+```
+
+
+```{r}
+# Mono_Mac differential expression and top-marker dot plot
+
+DefaultAssay(Base_embedding_Mono_Mac) <- "ADT"
+Idents(Base_embedding_Mono_Mac) <- Base_embedding_Mono_Mac$seurat_clusters
+
+DEG_Mono_Mac <- FindAllMarkers(
+    Base_embedding_Mono_Mac,
+    assay = "ADT",
+    max.cells.per.ident = 1000
+)
+
+DEG_Mono_Mac$pct.1_v_pct.2 <- DEG_Mono_Mac$pct.1 - DEG_Mono_Mac$pct.2
+
+top20_pctdiff_by_cluster_Mono_Mac <- DEG_Mono_Mac %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2)) %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::slice_head(n = 20) %>%
+    dplyr::ungroup() %>%
+    split(.$cluster)
+
+feature_col <- intersect(c("gene", "feature"), colnames(DEG_Mono_Mac))[1]
+
+marker_candidates_Mono_Mac <- DEG_Mono_Mac %>%
+    dplyr::mutate(
+        feature_name = as.character(.data[[feature_col]]),
+        cluster = as.character(cluster)
+    ) %>%
+    dplyr::filter(
+        !is.na(feature_name),
+        nzchar(feature_name),
+        !is.na(pct.1_v_pct.2)
+    ) %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2))
+
+used_features <- character()
+top5_features_by_cluster_Mono_Mac <- list()
+top5_marker_table_Mono_Mac <- list()
+
+for (cluster_id in sort(unique(marker_candidates_Mono_Mac$cluster))) {
+    selected_markers <- marker_candidates_Mono_Mac %>%
+        dplyr::filter(cluster == cluster_id) %>%
+        dplyr::distinct(feature_name, .keep_all = TRUE) %>%
+        dplyr::filter(!feature_name %in% used_features) %>%
+        dplyr::slice_head(n = 5)
+
+    if (nrow(selected_markers) == 0) next
+
+    top5_features_by_cluster_Mono_Mac[[paste0("Mono_Mac cluster ", cluster_id)]] <-
+        selected_markers$feature_name
+
+    top5_marker_table_Mono_Mac[[cluster_id]] <- selected_markers
+    used_features <- c(used_features, selected_markers$feature_name)
+}
+
+top5_pctdiff_by_cluster_Mono_Mac <- dplyr::bind_rows(top5_marker_table_Mono_Mac)
+
+Mono_Mac_top5_dotplot <- DotPlot(
+    Base_embedding_Mono_Mac,
+    features = top5_features_by_cluster_Mono_Mac,
+    assay = "ADT"
+) +
+    RotatedAxis() +
+    ggtitle("Top 5 unique ADT markers per Mono_Mac subcluster") +
+    theme(
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 8)
+    )
+
+print(Mono_Mac_top5_dotplot)
+
+top20_pctdiff_by_cluster_Mono_Mac
+top5_pctdiff_by_cluster_Mono_Mac
+```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Mac, expression = seurat_clusters %in% c(1)),'Celltype_revised_refined'] <- 'Other T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Mac, expression = seurat_clusters %in% c(5)),'Celltype_revised_refined'] <- 'Other T cell'
+```
+
+## - Inspection
+
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(Embeddings(Base_embedding, "umap"))
+umap_df$Celltype <- Base_embedding$Celltype_revised_refined
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#FFBE7D",
+    "CD16+ monocyte"      = "#F28E2B",
+    
+    "CD4+ T cell" = "#79706E",
+    "CD8+ T cell" = "#499894",
+    
+    "cDC"                 = "#D7B5A6",
+    "pDC"                 = "#9D7660",
+    
+    "NK cell" = "#59A14F",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#A0CBE8",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+ggplot(umap_df, aes(x = umap_1, y = umap_2, fill = Celltype)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.3, alpha=0.9, color = "black") +
+    scale_fill_manual(values = color_map) +
+    theme_void() +
+    ggtitle("High quality protein embedding") +
+    theme(
+        plot.title   = element_text(size = 14, face = "bold"),
+        legend.text  = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+library(ggplot2)
+library(patchwork)
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#FFBE7D",
+    "CD16+ monocyte"      = "#F28E2B",
+    
+    "CD4+ T cell" = "#79706E",
+    "CD8+ T cell" = "#499894",
+    
+    "cDC"                 = "#D7B5A6",
+    "pDC"                 = "#9D7660",
+    
+    "NK cell" = "#59A14F",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#A0CBE8",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+celltypes <- sort(unique(umap_df$Celltype))
+
+plot_list <- list()
+for (ct in celltypes) {
+  color <- color_map[ct]
+  if (is.na(color)) color <- "#333333"  # fallback for unmapped types
+
+  bg <- umap_df[umap_df$Celltype != ct, ]
+  fg <- umap_df[umap_df$Celltype == ct, ]
+
+  p <- ggplot() +
+    geom_point(data = bg, aes(x = umap_1, y = umap_2),
+               color = "grey85", size = 0.5) +
+    geom_point(data = fg, aes(x = umap_1, y = umap_2),
+               shape = 21, size = 1.6, stroke = 0.3,
+               color = "black", fill = color) +
+    ggtitle(paste0(ct, " (n=", nrow(fg), ")")) +
+    theme_void() +
+    theme(plot.title = element_text(size = 8, face = "bold"),
+          legend.position = "none")
+
+  plot_list[[ct]] <- p
+}
+
+wrap_plots(plot_list, ncol = 5)
+```
+
+# 7. Projection of lower quality samples
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+
+# ------------------------------------------------------------------------------
+# 0. Repair sample-level metadata from the terminal barcode suffix.
+# Barcode examples:
+# PT_ID15_FU.AAC..._PT15FU  -> Sample = PT15_FU, Donor = PT15
+# PT_ID20_FU.AAC..._PT20FU  -> Sample = PT20_FU, Donor = PT20
+# ------------------------------------------------------------------------------
+extract_terminal_suffix <- function(cell_names) {
+    suffix <- sub(
+        "^.*_(PT[0-9]+(?:_?FU)?)$",
+        "\\1",
+        cell_names,
+        perl = TRUE
+    )
+
+    valid <- grepl(
+        "^.*_(PT[0-9]+(?:_?FU)?)$",
+        cell_names,
+        perl = TRUE
+    )
+
+    suffix[!valid] <- NA_character_
+
+    suffix
+}
+
+suffix_to_sample <- function(suffix) {
+    ifelse(
+        grepl("_FU$", suffix),
+        suffix,
+        sub("FU$", "_FU", suffix)
+    )
+}
+
+repair_library_metadata <- function(obj) {
+    suffix <- extract_terminal_suffix(colnames(obj))
+
+    if (anyNA(suffix)) {
+        stop(
+            "Could not parse terminal sample suffix from ",
+            sum(is.na(suffix)),
+            " cell barcodes."
+        )
+    }
+
+    sample_id <- suffix_to_sample(suffix)
+
+    obj$Sample <- sample_id
+    obj$Donor <- sub("_FU$", "", sample_id)
+    obj$Timepoint <- ifelse(
+        grepl("_FU$", sample_id),
+        "Follow-up",
+        "Baseline"
+    )
+
+    obj
+}
+
+Raw_Base_embedding <- repair_library_metadata(Raw_Base_embedding)
+Base_embedding <- repair_library_metadata(Base_embedding)
+
+# ------------------------------------------------------------------------------
+# 1. Identify reference and query libraries
+# ------------------------------------------------------------------------------
+library_id_col <- "Sample"
+
+ref_libraries <- sort(unique(
+    as.character(Base_embedding[[library_id_col, drop = TRUE]])
+))
+
+all_libraries <- sort(unique(
+    as.character(Raw_Base_embedding[[library_id_col, drop = TRUE]])
+))
+
+ref_libraries <- ref_libraries[
+    !is.na(ref_libraries) & nzchar(ref_libraries)
+]
+
+all_libraries <- all_libraries[
+    !is.na(all_libraries) & nzchar(all_libraries)
+]
+
+query_libraries <- setdiff(
+    all_libraries,
+    ref_libraries
+)
+
+cat("Reference libraries:\n")
+print(ref_libraries)
+
+cat("\nQuery libraries:\n")
+print(query_libraries)
+
+cat("\nFollow-up libraries in Raw_Base_embedding:\n")
+print(
+    intersect(
+        c("PT15_FU", "PT20_FU"),
+        all_libraries
+    )
+)
+
+if (length(query_libraries) == 0) {
+    stop(
+        "No query libraries were found. ",
+        "PT15_FU/PT20_FU may already be part of the reference."
+    )
+}
+
+# ------------------------------------------------------------------------------
+# 2. Build query_dfs directly from Raw_Base_embedding
+# ------------------------------------------------------------------------------
+metadata_cols <- c(
+    "Donor",
+    "Sample",
+    "Condition",
+    "Timepoint",
+    "Final_annotation",
+    "Averaged.Simplified.Celltype",
+    "Averaged.Detailed.Celltype",
+    "Celltype",
+    "Celltype_revised_refined"
+)
+
+DefaultAssay(Raw_Base_embedding) <- "ADT"
+DefaultAssay(Base_embedding) <- "ADT"
+
+raw_meta <- Raw_Base_embedding[[]]
+
+for (col_name in setdiff(metadata_cols, colnames(raw_meta))) {
+    raw_meta[[col_name]] <- NA_character_
+}
+
+raw_counts <- GetAssayData(
+    Raw_Base_embedding,
+    assay = "ADT",
+    slot = "counts"
+)
+
+query_dfs <- setNames(
+    vector("list", length(query_libraries)),
+    query_libraries
+)
+
+for (sample_id in query_libraries) {
+    query_cells <- colnames(Raw_Base_embedding)[
+        as.character(
+            Raw_Base_embedding[[library_id_col, drop = TRUE]]
+        ) == sample_id
+    ]
+
+    if (length(query_cells) == 0) {
+        next
+    }
+
+    query_meta <- raw_meta[
+        query_cells,
+        metadata_cols,
+        drop = FALSE
+    ]
+
+    # Enforce corrected sample-level metadata.
+    query_meta$Sample <- sample_id
+    query_meta$Donor <- sub("_FU$", "", sample_id)
+    query_meta$Timepoint <- ifelse(
+        grepl("_FU$", sample_id),
+        "Follow-up",
+        "Baseline"
+    )
+
+    query_count_df <- as.data.frame(
+        t(as.matrix(raw_counts[, query_cells, drop = FALSE])),
+        check.names = FALSE
+    )
+
+    rownames(query_count_df) <- query_cells
+    rownames(query_meta) <- query_cells
+
+    query_dfs[[sample_id]] <- cbind(
+        query_meta,
+        query_count_df
+    )
+}
+
+query_dfs <- Filter(
+    Negate(is.null),
+    query_dfs
+)
+
+if (length(query_dfs) == 0) {
+    stop("No query cells were recovered from Raw_Base_embedding.")
+}
+
+query_summary <- data.frame(
+    Sample = names(query_dfs),
+    n_cells = vapply(query_dfs, nrow, integer(1)),
+    stringsAsFactors = FALSE
+)
+
+print(query_summary, row.names = FALSE)
+
+# Preserve the original cell names; do not prepend sample IDs.
+all_query_cells <- unlist(
+    lapply(query_dfs, rownames),
+    use.names = FALSE
+)
+
+if (anyDuplicated(all_query_cells)) {
+    stop("Duplicated cell barcodes detected across query libraries.")
+}
+
+# ------------------------------------------------------------------------------
+# 3. Identify shared ADT features
+# ------------------------------------------------------------------------------
+query_feature_sets <- lapply(
+    query_dfs,
+    function(df) {
+        setdiff(
+            colnames(df),
+            metadata_cols
+        )
+    }
+)
+
+shared_query_features <- Reduce(
+    intersect,
+    query_feature_sets
+)
+
+shared_features <- intersect(
+    shared_query_features,
+    rownames(Base_embedding[["ADT"]])
+)
+
+if (length(shared_features) < 2) {
+    stop(
+        "Fewer than two ADT features are shared across all query libraries ",
+        "and the reference."
+    )
+}
+
+message(
+    "Using ", length(shared_features),
+    " ADT features shared across all query libraries and the reference."
+)
+
+# ------------------------------------------------------------------------------
+# 4. Align query data frames and build query Seurat object
+# ------------------------------------------------------------------------------
+query_dfs_aligned <- lapply(
+    names(query_dfs),
+    function(sample_id) {
+        df <- query_dfs[[sample_id]]
+
+        for (col_name in setdiff(metadata_cols, colnames(df))) {
+            df[[col_name]] <- NA_character_
+        }
+
+        df$Sample <- sample_id
+        df$Donor <- sub("_FU$", "", sample_id)
+        df$Timepoint <- ifelse(
+            grepl("_FU$", sample_id),
+            "Follow-up",
+            "Baseline"
+        )
+
+        df <- df[
+            ,
+            c(metadata_cols, shared_features),
+            drop = FALSE
+        ]
+
+        if (anyDuplicated(rownames(df))) {
+            stop(
+                "Duplicate cell names detected within query library: ",
+                sample_id
+            )
+        }
+
+        df
+    }
+)
+
+names(query_dfs_aligned) <- names(query_dfs)
+
+query_merged <- do.call(
+    rbind,
+    unname(query_dfs_aligned)
+)
+
+if (anyDuplicated(rownames(query_merged))) {
+    stop("Duplicate cell names created while merging query data frames.")
+}
+
+query_counts <- as.matrix(
+    query_merged[, shared_features, drop = FALSE]
+)
+
+storage.mode(query_counts) <- "numeric"
+
+if (anyNA(query_counts) || any(!is.finite(query_counts))) {
+    stop(
+        "The aligned query count matrix contains missing or non-numeric ADT values."
+    )
+}
+
+query_meta <- query_merged[
+    ,
+    metadata_cols,
+    drop = FALSE
+]
+
+stopifnot(
+    identical(
+        rownames(query_counts),
+        rownames(query_meta)
+    )
+)
+
+query_obj <- CreateSeuratObject(
+    counts = t(query_counts),
+    assay = "ADT",
+    project = "TP53",
+    meta.data = query_meta
+)
+
+DefaultAssay(query_obj) <- "ADT"
+
+stopifnot(
+    identical(
+        colnames(query_obj),
+        rownames(query_meta)
+    )
+)
+
+print(
+    table(
+        query_obj$Sample,
+        query_obj$Timepoint,
+        useNA = "ifany"
+    )
+)
+
+# ------------------------------------------------------------------------------
+# 5. Process query and project onto the reference UMAP
+# ------------------------------------------------------------------------------
+query_obj <- NormalizeData(
+    query_obj,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+query_obj <- ScaleData(query_obj)
+
+shared_features <- intersect(
+    rownames(Base_embedding[["ADT"]]),
+    rownames(query_obj[["ADT"]])
+)
+
+if (!"pca" %in% Reductions(Base_embedding)) {
+    stop("Base_embedding must contain a PCA reduction.")
+}
+
+if (!"umap" %in% Reductions(Base_embedding)) {
+    stop("Base_embedding must contain a UMAP reduction model.")
+}
+
+anchor_dims <- seq_len(
+    min(
+        15,
+        ncol(Embeddings(Base_embedding, "pca"))
+    )
+)
+
+anchors <- FindTransferAnchors(
+    reference = Base_embedding,
+    query = query_obj,
+    reference.assay = "ADT",
+    query.assay = "ADT",
+    normalization.method = "LogNormalize",
+    reference.reduction = "pca",
+    features = shared_features,
+    dims = anchor_dims
+)
+
+query_obj <- MapQuery(
+    anchorset = anchors,
+    reference = Base_embedding,
+    query = query_obj,
+    refdata = list(
+        Celltype_revised_refined = "Celltype_revised_refined"
+    ),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+)
+
+query_obj$Celltype_revised_refined <- query_obj$predicted.Celltype_revised_refined
+
+# ------------------------------------------------------------------------------
+# 6. Visualise reference and projected query
+# ------------------------------------------------------------------------------
+reference_labels <- sort(
+    unique(
+        na.omit(
+            as.character(Base_embedding$Celltype_revised_refined)
+        )
+    )
+)
+
+tableau20 <- ggthemes_data[["tableau"]]$
+    `color-palettes`$
+    regular$
+    `Classic 20`$
+    value
+
+color_map <- setNames(
+    tableau20[
+        (seq_along(reference_labels) - 1) %% length(tableau20) + 1
+    ],
+    reference_labels
+)
+
+reference_umap <- as.data.frame(
+    Embeddings(Base_embedding, "umap")
+)
+
+colnames(reference_umap) <- c("UMAP_1", "UMAP_2")
+
+reference_umap$Celltype <- as.character(
+    Base_embedding$Celltype_revised_refined
+)
+
+query_umap <- as.data.frame(
+    Embeddings(query_obj, "ref.umap")
+)
+
+colnames(query_umap) <- c("UMAP_1", "UMAP_2")
+
+query_umap$Celltype <- as.character(
+    query_obj$predicted.Celltype_revised_refined
+)
+
+p1 <- ggplot(
+    reference_umap,
+    aes(x = UMAP_1, y = UMAP_2, fill = Celltype)
+) +
+    geom_point(
+        shape = 21,
+        size = 1.6,
+        stroke = 0.3,
+        color = "black"
+    ) +
+    scale_fill_manual(
+        values = color_map,
+        na.value = "grey80"
+    ) +
+    theme_void() +
+    ggtitle("Reference") +
+    theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    NoLegend()
+
+p2 <- ggplot(
+    query_umap,
+    aes(x = UMAP_1, y = UMAP_2, fill = Celltype)
+) +
+    geom_point(
+        shape = 21,
+        size = 1.6,
+        stroke = 0.3,
+        color = "black"
+    ) +
+    scale_fill_manual(
+        values = color_map,
+        na.value = "grey80"
+    ) +
+    theme_void() +
+    ggtitle("Query projected") +
+    theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    NoLegend()
+
+p1 + p2
+
+# ------------------------------------------------------------------------------
+# 7. Check prediction confidence
+# ------------------------------------------------------------------------------
+confidence_feature <- if (
+    "prediction.score.max" %in% colnames(query_obj[[]])
+) {
+    "prediction.score.max"
+} else {
+    grep(
+        "^prediction.score",
+        colnames(query_obj[[]]),
+        value = TRUE
+    )[1]
+}
+
+if (!is.na(confidence_feature)) {
+    FeaturePlot(
+        query_obj,
+        features = confidence_feature,
+        reduction = "ref.umap"
+    ) +
+        ggtitle("Prediction confidence")
+}
+
+# Confirm FU samples survived into the projected query.
+table(
+    query_obj$Sample,
+    query_obj$Timepoint,
+    useNA = "ifany"
+)
+```
+
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(Embeddings(Base_embedding, "umap"))
+umap_df$Celltype <- Base_embedding$Celltype_revised_refined
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#F28E2B",
+    "CD16+ monocyte"      = "#FFBE7D",
+    
+    "Mono/Macrophage"      = "#BAB0AC",
+    
+    "CD4+ T cell" = "#9D7660",
+    "CD8+ T cell" = "#8CD17D",
+    
+    "cDC"                 = "#F1CE63",
+    "pDC"                 = "#86BCB6",
+    
+    "NK cell" = "#FABFD2",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#4E79A7",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+ggplot(umap_df, aes(x = umap_1, y = umap_2, fill = Celltype)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.3, alpha=0.9, color = "black") +
+    scale_fill_manual(values = color_map) +
+    theme_void() +
+    ggtitle("High quality protein embedding") +
+    theme(
+        plot.title   = element_text(size = 14, face = "bold"),
+        legend.text  = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(Embeddings(query_obj, "ref.umap"))
+umap_df$Celltype <- query_obj$predicted.Celltype_revised_refined
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#F28E2B",
+    "CD16+ monocyte"      = "#FFBE7D",
+    
+    "Mono/Macrophage"      = "#BAB0AC",
+    
+    "CD4+ T cell" = "#9D7660",
+    "CD8+ T cell" = "#8CD17D",
+    
+    "cDC"                 = "#F1CE63",
+    "pDC"                 = "#86BCB6",
+    
+    "NK cell" = "#FABFD2",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#4E79A7",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+ggplot(umap_df, aes(x = refUMAP_1, y = refUMAP_2, fill = Celltype)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.3, alpha=0.9, color = "black") +
+    scale_fill_manual(values = color_map) +
+    theme_void() +
+    ggtitle("Lower quality data projected") +
+    theme(
+        plot.title   = element_text(size = 14, face = "bold"),
+        legend.text  = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+# Get UMAP coordinates
+ref_umap <- Embeddings(Base_embedding, 'umap')
+query_umap <- Embeddings(query_obj, 'ref.umap')
+
+# For each query cell, find nearest reference neighbours
+knn_result <- get.knnx(ref_umap, query_umap, k = 15)
+
+# Compute mean distance to k nearest neighbours
+mean_dists <- rowMeans(knn_result$nn.dist)
+
+# Relaxed threshold — use median + 5*IQR instead of Q3 + 1.5*IQR
+median_dist <- median(mean_dists)
+iqr <- IQR(mean_dists)
+dist_threshold <- median_dist + 5 * iqr
+
+message("Distance threshold: ", round(dist_threshold, 3))
+message("Cells within threshold: ", sum(mean_dists <= dist_threshold), " / ", length(mean_dists))
+
+# Majority vote from reference neighbours
+knn_labels <- apply(knn_result$nn.index, 1, function(nn) {
+  neighbour_labels <- Base_embedding$Celltype_revised_refined[nn]
+  names(sort(table(neighbour_labels), decreasing = TRUE))[1]
+})
+
+# Only assign if within distance threshold, otherwise keep predicted label
+query_obj$Celltype_revised_refined <- ifelse(
+  mean_dists <= dist_threshold,
+  knn_labels,
+  query_obj$predicted.Celltype_revised_refined
+)
+
+# Flag scattered cells
+query_obj$projection_confident <- mean_dists <= dist_threshold
+```
+
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(Embeddings(query_obj, "ref.umap"))
+umap_df$Celltype <- query_obj$Celltype_revised_refined
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#F28E2B",
+    "CD16+ monocyte"      = "#FFBE7D",
+    
+    "Mono/Macrophage"      = "#BAB0AC",
+    
+    "CD4+ T cell" = "#9D7660",
+    "CD8+ T cell" = "#8CD17D",
+    
+    "cDC"                 = "#F1CE63",
+    "pDC"                 = "#86BCB6",
+    
+    "NK cell" = "#FABFD2",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#4E79A7",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+ggplot(umap_df, aes(x = refUMAP_1, y = refUMAP_2, fill = Celltype)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.3, alpha=0.9, color = "black") +
+    scale_fill_manual(values = color_map) +
+    theme_void() +
+    ggtitle("KNN-refined labels") +
+    theme(
+        plot.title   = element_text(size = 14, face = "bold"),
+        legend.text  = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+DimPlot(query_obj, group.by = 'projection_confident', reduction = 'ref.umap', 
+              pt.size = 2.5) + ggtitle('Projection confidence') + theme_void() +
+  scale_color_manual(values = c('TRUE' = 'steelblue', 'FALSE' = 'red'))
+
+table(query_obj$Celltype_revised_refined, query_obj$projection_confident)
+```
+
+```{r}
+hist(mean_dists, breaks = 50, main = 'Mean distance to 15 nearest reference cells')
+abline(v = dist_threshold, col = 'red', lwd = 2)
+```
+
+```{r}
+cells_to_keep <- colnames(query_obj)[grep(FALSE, query_obj$projection_confident)][grep(TRUE, colnames(query_obj)[grep(FALSE, query_obj$projection_confident)] %in% NON_WT_cells)]
+
+query_obj_subset <- subset(query_obj, cells = c(cells_to_keep, 
+                                                colnames(query_obj)[grep(TRUE, query_obj$projection_confident)]))
+```
+
+```{r}
+# ---- 1. Extract UMAP coordinates before merging ----
+ref_umap <- Embeddings(Base_embedding, 'umap')
+query_umap <- Embeddings(query_obj_subset, 'ref.umap')
+
+# Make sure column names match
+colnames(query_umap) <- colnames(ref_umap)
+
+# Combine into one matrix
+combined_umap <- rbind(ref_umap, query_umap)
+
+# ---- 2. Merge objects ----
+combined <- merge(Base_embedding, query_obj_subset)
+
+# ---- 3. Re-run PCA and Harmony ----
+combined <- NormalizeData(combined, normalization.method = 'CLR', margin = 2)
+combined <- ScaleData(combined)
+combined <- RunPCA(combined, features = rownames(combined@assays$ADT))
+combined <- RunHarmony(combined, group.by.vars = c('Sample'), dims.use = 1:15)
+
+# ---- 4. Re-inject the saved UMAP coordinates ----
+# Reorder to match combined object cell order
+combined_umap <- combined_umap[colnames(combined), ]
+
+combined[['umap']] <- CreateDimReducObject(
+  embeddings = combined_umap,
+  key = 'umap_',
+  assay = 'ADT'
+)
+
+# ---- 5. Visualise ----
+combined$source <- ifelse(colnames(combined) %in% colnames(Base_embedding), 'Reference', 'Query')
+
+p1 <- DimPlot(combined, group.by = 'Celltype_revised_refined', label = TRUE, pt.size = 0.8) +
+  ggtitle('Cell types') + NoLegend()
+
+p2 <- DimPlot(combined, group.by = 'source', pt.size = 0.8) +
+  ggtitle('Reference vs Query') +
+  scale_color_manual(values = c('Reference' = 'steelblue', 'Query' = 'tomato'))
+
+p3 <- DimPlot(combined, group.by = 'Sample', pt.size = 0.8) +
+  ggtitle('Sample')
+
+p1 + p2 + p3
+
+# ---- 6. Check ----
+table(combined$Sample)
+table(combined$Celltype_revised_refined, combined$source)
+```
+
+```{r}
+combined_lower_quality_pts <- combined
+```
+
+
+# 8. Projection of lower quality data
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(patchwork)
+
+# ---- 1. Build the low-resolution query from cell barcodes ----
+
+DefaultAssay(Base_embedding) <- "ADT"
+DefaultAssay(Raw_Base_embedding) <- "ADT"
+
+low_res_cells <- unique(as.character(low_res_cells))
+
+cells_found_in_raw <- intersect(
+    low_res_cells,
+    colnames(Raw_Base_embedding)
+)
+
+cells_missing_from_raw <- setdiff(
+    low_res_cells,
+    colnames(Raw_Base_embedding)
+)
+
+cells_already_in_reference <- intersect(
+    cells_found_in_raw,
+    colnames(Base_embedding)
+)
+
+query_cells <- setdiff(
+    cells_found_in_raw,
+    colnames(Base_embedding)
+)
+
+message("Low-resolution barcodes supplied: ", length(low_res_cells))
+message("Found in Raw_Base_embedding: ", length(cells_found_in_raw))
+message("Already in reference, not re-projected: ", length(cells_already_in_reference))
+message("Query cells to project: ", length(query_cells))
+message("Barcodes missing from Raw_Base_embedding: ", length(cells_missing_from_raw))
+
+if (length(query_cells) < 10) {
+    stop(
+        "Fewer than 10 low-resolution cells remain for projection. ",
+        "Check that low_res_cells matches colnames(Raw_Base_embedding)."
+    )
+}
+
+query_obj <- subset(
+    Raw_Base_embedding,
+    cells = query_cells
+)
+
+DefaultAssay(query_obj) <- "ADT"
+
+# Metadata from Raw_Base_embedding is retained automatically.
+query_obj$projection_group <- "Low-resolution projected"
+
+# ---- 2. Restrict to ADTs shared between reference and query ----
+
+shared_features <- intersect(
+    rownames(Base_embedding[["ADT"]]),
+    rownames(query_obj[["ADT"]])
+)
+
+if (length(shared_features) < 2) {
+    stop("Fewer than two ADT features are shared between query and reference.")
+}
+
+message(
+    "Shared ADT features used for mapping: ",
+    length(shared_features)
+)
+
+# ---- 3. Process query ADT counts ----
+
+query_obj <- NormalizeData(
+    query_obj,
+    normalization.method = "CLR",
+    margin = 2,
+    verbose = FALSE
+)
+
+query_obj <- ScaleData(
+    query_obj,
+    features = shared_features,
+    verbose = FALSE
+)
+
+# ---- 4. Find anchors and project onto the reference UMAP ----
+
+n_dims <- min(
+    15,
+    ncol(Embeddings(Base_embedding, "pca")),
+    ncol(Embeddings(Base_embedding, "harmony")),
+    length(shared_features)
+)
+
+if (n_dims < 2) {
+    stop("Fewer than two usable dimensions are available for mapping.")
+}
+
+anchors <- FindTransferAnchors(
+    reference = Base_embedding,
+    query = query_obj,
+    reference.assay = "ADT",
+    query.assay = "ADT",
+    normalization.method = "LogNormalize",
+    reference.reduction = "pca",
+    features = shared_features,
+    dims = seq_len(n_dims)
+)
+
+query_obj <- MapQuery(
+    anchorset = anchors,
+    reference = Base_embedding,
+    query = query_obj,
+    refdata = list(
+        Celltype_revised_refined = "Celltype_revised_refined"
+    ),
+    reference.reduction = "harmony",
+    reduction.model = "umap"
+)
+
+query_obj$Celltype_revised_refined <-
+    query_obj$predicted.Celltype_revised_refined
+```
+
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(Embeddings(Base_embedding, "umap"))
+umap_df$Celltype <- Base_embedding$Celltype_revised_refined
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#F28E2B",
+    "CD16+ monocyte"      = "#FFBE7D",
+    
+    "Mono/Macrophage"      = "#BAB0AC",
+    
+    "CD4+ T cell" = "#9D7660",
+    "CD8+ T cell" = "#8CD17D",
+    
+    "cDC"                 = "#F1CE63",
+    "pDC"                 = "#86BCB6",
+    
+    "NK cell" = "#FABFD2",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#4E79A7",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+ggplot(umap_df, aes(x = umap_1, y = umap_2, fill = Celltype)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.3, alpha=0.9, color = "black") +
+    scale_fill_manual(values = color_map) +
+    theme_void() +
+    ggtitle("High quality protein embedding") +
+    theme(
+        plot.title   = element_text(size = 14, face = "bold"),
+        legend.text  = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(Embeddings(query_obj, "ref.umap"))
+umap_df$Celltype <- query_obj$predicted.Celltype_revised_refined
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#F28E2B",
+    "CD16+ monocyte"      = "#FFBE7D",
+    
+    "Mono/Macrophage"      = "#BAB0AC",
+    
+    "CD4+ T cell" = "#9D7660",
+    "CD8+ T cell" = "#8CD17D",
+    
+    "cDC"                 = "#F1CE63",
+    "pDC"                 = "#86BCB6",
+    
+    "NK cell" = "#FABFD2",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#4E79A7",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+ggplot(umap_df, aes(x = refUMAP_1, y = refUMAP_2, fill = Celltype)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.3, alpha=0.9, color = "black") +
+    scale_fill_manual(values = color_map) +
+    theme_void() +
+    ggtitle("Lower quality data projected") +
+    theme(
+        plot.title   = element_text(size = 14, face = "bold"),
+        legend.text  = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+# Get UMAP coordinates
+ref_umap <- Embeddings(Base_embedding, 'umap')
+query_umap <- Embeddings(query_obj, 'ref.umap')
+
+# For each query cell, find nearest reference neighbours
+knn_result <- get.knnx(ref_umap, query_umap, k = 15)
+
+# Compute mean distance to k nearest neighbours
+mean_dists <- rowMeans(knn_result$nn.dist)
+
+# Relaxed threshold — use median + 5*IQR instead of Q3 + 1.5*IQR
+median_dist <- median(mean_dists)
+iqr <- IQR(mean_dists)
+dist_threshold <- median_dist + 5 * iqr
+
+message("Distance threshold: ", round(dist_threshold, 3))
+message("Cells within threshold: ", sum(mean_dists <= dist_threshold), " / ", length(mean_dists))
+
+# Majority vote from reference neighbours
+knn_labels <- apply(knn_result$nn.index, 1, function(nn) {
+  neighbour_labels <- Base_embedding$Celltype_revised_refined[nn]
+  names(sort(table(neighbour_labels), decreasing = TRUE))[1]
+})
+
+# Only assign if within distance threshold, otherwise keep predicted label
+query_obj$Celltype_revised_refined <- ifelse(
+  mean_dists <= dist_threshold,
+  knn_labels,
+  query_obj$predicted.Celltype_revised_refined
+)
+
+# Flag scattered cells
+query_obj$projection_confident <- mean_dists <= dist_threshold
+```
+
+```{r}
+library(ggplot2)
+
+umap_df <- as.data.frame(Embeddings(query_obj, "ref.umap"))
+umap_df$Celltype <- query_obj$Celltype_revised_refined
+
+color_map <- c(
+    "B cell"   = "#B07AA1",
+    
+    "CD14+ monocyte"      = "#F28E2B",
+    "CD16+ monocyte"      = "#FFBE7D",
+    
+    "Mono/Macrophage"      = "#BAB0AC",
+    
+    "CD4+ T cell" = "#9D7660",
+    "CD8+ T cell" = "#8CD17D",
+    
+    "cDC"                 = "#F1CE63",
+    "pDC"                 = "#86BCB6",
+    
+    "NK cell" = "#FABFD2",
+    "Erythroblast"       = "#E15759",
+    "HSPC"         = "#4E79A7",
+    
+    "Other T cell"          = "#5A5A5A"
+)
+
+ggplot(umap_df, aes(x = refUMAP_1, y = refUMAP_2, fill = Celltype)) +
+    geom_point(shape = 21, size = 2.5, stroke = 0.3, alpha=0.9, color = "black") +
+    scale_fill_manual(values = color_map) +
+    theme_void() +
+    ggtitle("KNN-refined labels") +
+    theme(
+        plot.title   = element_text(size = 14, face = "bold"),
+        legend.text  = element_text(size = 8),
+        legend.title = element_blank()
+    ) +
+    guides(fill = guide_legend(override.aes = list(size = 3)))
+```
+
+```{r}
+DimPlot(query_obj, group.by = 'projection_confident', reduction = 'ref.umap', 
+              pt.size = 2.5) + ggtitle('Projection confidence') + theme_void() +
+  scale_color_manual(values = c('TRUE' = 'steelblue', 'FALSE' = 'red'))
+
+table(query_obj$Celltype_revised_refined, query_obj$projection_confident)
+```
+
+```{r}
+hist(mean_dists, breaks = 50, main = 'Mean distance to 15 nearest reference cells')
+abline(v = dist_threshold, col = 'red', lwd = 2)
+```
+
+```{r}
+cells_to_keep <- colnames(query_obj)[grep(FALSE, query_obj$projection_confident)][grep(TRUE, colnames(query_obj)[grep(FALSE, query_obj$projection_confident)] %in% NON_WT_cells)]
+
+query_obj_subset <- subset(query_obj, cells = c(cells_to_keep, 
+                                                colnames(query_obj)[grep(TRUE, query_obj$projection_confident)]))
+```
+
+```{r}
+# ---- 1. Extract UMAP coordinates before merging ----
+ref_umap <- Embeddings(Base_embedding, 'umap')
+query_umap <- Embeddings(query_obj_subset, 'ref.umap')
+
+# Make sure column names match
+colnames(query_umap) <- colnames(ref_umap)
+
+# Combine into one matrix
+combined_umap <- rbind(ref_umap, query_umap)
+
+# ---- 2. Merge objects ----
+combined <- merge(Base_embedding, query_obj_subset)
+
+# ---- 3. Re-run PCA and Harmony ----
+combined <- NormalizeData(combined, normalization.method = 'CLR', margin = 2)
+combined <- ScaleData(combined)
+combined <- RunPCA(combined, features = rownames(combined@assays$ADT))
+combined <- RunHarmony(combined, group.by.vars = c('Sample'), dims.use = 1:15)
+
+# ---- 4. Re-inject the saved UMAP coordinates ----
+# Reorder to match combined object cell order
+combined_umap <- combined_umap[colnames(combined), ]
+
+combined[['umap']] <- CreateDimReducObject(
+  embeddings = combined_umap,
+  key = 'umap_',
+  assay = 'ADT'
+)
+
+# ---- 5. Visualise ----
+combined$source <- ifelse(colnames(combined) %in% colnames(Base_embedding), 'Reference', 'Query')
+
+p1 <- DimPlot(combined, group.by = 'Celltype_revised_refined', label = TRUE, pt.size = 0.8) +
+  ggtitle('Cell types') + NoLegend()
+
+p2 <- DimPlot(combined, group.by = 'source', pt.size = 0.8) +
+  ggtitle('Reference vs Query') +
+  scale_color_manual(values = c('Reference' = 'steelblue', 'Query' = 'tomato'))
+
+p3 <- DimPlot(combined, group.by = 'Sample', pt.size = 0.8) +
+  ggtitle('Sample')
+
+p1 + p2 + p3
+
+# ---- 6. Check ----
+table(combined$Sample)
+table(combined$Celltype_revised_refined, combined$source)
+```
+
+```{r}
+combined_lower_quality_cell_cluster <- combined
+```
+
+# 9. Final merge
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+
+# Reference manifold and projected low-quality query cells.
+reference_obj <- combined_lower_quality_pts
+query_obj <- combined_lower_quality_cell_cluster
+
+DefaultAssay(reference_obj) <- "ADT"
+DefaultAssay(query_obj) <- "ADT"
+
+# Use the query reduction created by MapQuery when available.
+reference_reduction <- "umap"
+query_reduction <- if ("ref.umap" %in% Reductions(query_obj)) {
+    "ref.umap"
+} else {
+    "umap"
+}
+
+# ---- 1. Keep reference cells once; append only query-exclusive cells ----
+
+reference_cells <- colnames(reference_obj)
+query_cells <- colnames(query_obj)
+
+overlap_cells <- intersect(reference_cells, query_cells)
+query_only_cells <- setdiff(query_cells, reference_cells)
+
+message("Reference cells: ", length(reference_cells))
+message("Query cells supplied: ", length(query_cells))
+message("Overlapping cells retained from reference only: ", length(overlap_cells))
+message("Query-exclusive cells appended: ", length(query_only_cells))
+
+if (length(query_only_cells) == 0) {
+    stop("All query cells already exist in the reference object; nothing new to append.")
+}
+
+query_obj_unique <- subset(
+    query_obj,
+    cells = query_only_cells
+)
+
+# Ensure query labels are available in the merged object.
+if (
+    !"Celltype_revised_refined" %in% colnames(query_obj_unique[[]]) &&
+    "predicted.Celltype_revised_refined" %in% colnames(query_obj_unique[[]])
+) {
+    query_obj_unique$Celltype_revised_refined <-
+        query_obj_unique$predicted.Celltype_revised_refined
+}
+
+# ---- 2. Extract only non-overlapping query UMAP coordinates ----
+
+ref_umap <- Embeddings(reference_obj, reference_reduction)
+
+query_umap <- Embeddings(
+    query_obj_unique,
+    query_reduction
+)
+
+colnames(query_umap) <- colnames(ref_umap)
+
+combined_umap <- rbind(
+    ref_umap,
+    query_umap
+)
+
+if (anyDuplicated(rownames(combined_umap))) {
+    stop("Duplicate cell barcodes remain in the combined UMAP coordinates.")
+}
+
+# ---- 3. Merge expression and metadata without duplicate cells ----
+
+combined <- merge(
+    x = reference_obj,
+    y = query_obj_unique,
+    merge.data = TRUE
+)
+
+DefaultAssay(combined) <- "ADT"
+
+# Match UMAP rows exactly to the merged Seurat object cell order.
+combined_umap <- combined_umap[
+    colnames(combined),
+    ,
+    drop = FALSE
+]
+
+if (anyNA(combined_umap)) {
+    stop("Missing UMAP coordinates detected after merging.")
+}
+
+# Replace the merged object's UMAP with the saved reference + projected-query coordinates.
+combined[["umap"]] <- CreateDimReducObject(
+    embeddings = combined_umap,
+    key = "UMAP_",
+    assay = "ADT"
+)
+
+# Mark provenance.
+combined$source <- ifelse(
+    colnames(combined) %in% query_only_cells,
+    "Projected low-quality query",
+    "Reference"
+)
+
+# ---- 4. Visualise ----
+
+p1 <- DimPlot(
+    combined,
+    reduction = "umap",
+    group.by = "Celltype_revised_refined",
+    label = TRUE,
+    repel = TRUE,
+    pt.size = 0.8
+) +
+    ggtitle("Cell types") +
+    NoLegend()
+
+p2 <- DimPlot(
+    combined,
+    reduction = "umap",
+    group.by = "source",
+    pt.size = 0.8,
+    cols = c(
+        "Reference" = "grey75",
+        "Projected low-quality query" = "tomato"
+    )
+) +
+    ggtitle("Reference and projected low-quality cells")
+
+p3 <- DimPlot(
+    combined,
+    reduction = "umap",
+    group.by = "Sample",
+    pt.size = 0.8
+) +
+    ggtitle("Sample")
+
+p1 + p2 + p3
+
+# ---- 5. Checks ----
+
+table(combined$source)
+
+table(
+    combined$Celltype_revised_refined,
+    combined$source,
+    useNA = "ifany"
+)
+
+length(intersect(
+    colnames(reference_obj),
+    colnames(query_obj_unique)
+))
+```
+
+# 10. Viz
+
+## - Panel D
+
+```{r}
+library(ggplot2)
+library(colorspace)
+
+umap_df <- as.data.frame(Embeddings(combined, "umap"))
+
+color_map <- c(
+    "B cell"            = "#B07AA1",
+    "CD14+ monocyte"    = "#F28E2B",
+    "CD16+ monocyte"    = "#FFBE7D",
+    "Mono/Macrophage"   = "#BAB0AC",
+    "CD4+ T cell"       = "#9D7660",
+    "CD8+ T cell"       = "#8CD17D",
+    "cDC"               = "#F1CE63",
+    "pDC"               = "#86BCB6",
+    "NK cell"           = "#FABFD2",
+    "Erythroblast"      = "#E15759",
+    "HSPC"              = "#4E79A7",
+    "Other T cell"      = "#5A5A5A"
+)
+
+color_map_light <- lighten(color_map, amount = 0.4)
+names(color_map_light) <- names(color_map)
+
+# Factor with explicit levels => legend follows color_map order (not alphabetical),
+# and any label missing from color_map surfaces immediately rather than plotting grey.
+umap_df$Celltype <- factor(combined$Celltype_revised_refined, levels = names(color_map))
+stopifnot(!anyNA(umap_df$Celltype))   # fail loudly if a label has no colour
+
+# Shuffle row order so no single celltype is systematically drawn on top.
+# In a single geom_point layer, z-order follows row order.
+set.seed(123)
+umap_df <- umap_df[sample(nrow(umap_df)), , drop = FALSE]
+
+p <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(
+        aes(fill = Celltype, color = Celltype),
+        shape  = 21,
+        size   = 1,
+        stroke = 0.05,
+        alpha  = 0.85
+    ) +
+    scale_fill_manual(values  = color_map) +
+    scale_color_manual(values = color_map_light) +
+    theme_void(base_size = 12) +
+    theme(
+        plot.margin       = margin(10, 10, 10, 10),
+        legend.position   = "bottom",
+        legend.text       = element_text(size = 9),
+        legend.title      = element_blank(),
+        legend.key.size   = unit(0.9, "lines"),
+        legend.margin     = margin(t = 6)
+    ) +
+    guides(fill = guide_legend(
+        ncol         = 4,
+        override.aes = list(size = 4, stroke = 0.3, alpha = 1)
+    ))
+
+p_no_legend <- p + theme(legend.position = "none")
+
+save_dir <- "/project/meadlab/shared/02__Projects/02b__Tapestri/results/figures"
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(file.path(save_dir, "Fig_1D.pdf"),
+    plot = p, width = 6.25, height = 5.75, device = cairo_pdf)
+ggsave(file.path(save_dir, "Fig_1D.png"),
+    plot = p, width = 6.25, height = 5.75, dpi = 300)
+
+save_dir <- "/project/meadlab/shared/02__Projects/02b__Tapestri/results/figures/Additional"
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(file.path(save_dir, "UMAP_celltypes_merged_labels_no_legend.pdf"),
+    plot = p_no_legend, width = 5.5, height = 4.5, device = cairo_pdf)
+ggsave(file.path(save_dir, "UMAP_celltypes_merged_labels_no_legend.png"),
+    plot = p_no_legend, width = 5.5, height = 4.5, dpi = 300)
+```
+
+## - Fig S2
+
+```{r}
+# ---- packages ----
+suppressPackageStartupMessages({
+    library(Seurat)
+    library(ggplot2)
+    library(dplyr)
+    library(ggdendro)
+    library(scales)
+    library(grid)
+    library(gtable)
+    library(RColorBrewer)
+})
+
+# ---- setup ----
+DefaultAssay(combined) <- "ADT"
+
+genes_use    <- rownames(combined[["ADT"]])
+gradient_exp <- rev(brewer.pal(9, "RdBu"))
+pad          <- 0.6
+
+color_map <- c(
+    "B cell"          = "#B07AA1",
+    "CD14+ monocyte"  = "#F28E2B",
+    "CD16+ monocyte"  = "#FFBE7D",
+    "Mono/Macrophage" = "#BAB0AC",
+    "CD4+ T cell"     = "#9D7660",
+    "CD8+ T cell"     = "#8CD17D",
+    "cDC"             = "#F1CE63",
+    "pDC"             = "#86BCB6",
+    "NK cell"         = "#FABFD2",
+    "Erythroblast"    = "#E15759",
+    "HSPC"            = "#4E79A7",
+    "Other T cell"    = "#5A5A5A"
+)
+
+# -------------------------------------------------
+# Build DotPlot data
+# -------------------------------------------------
+dp_raw <- DotPlot(
+    combined,
+    assay     = "ADT",
+    group.by  = "Celltype_revised_refined",
+    scale.by  = "radius",
+    dot.scale = 12,
+    features  = genes_use
+)$data %>%
+    mutate(
+        features.plot = trimws(as.character(features.plot)),
+        id            = trimws(as.character(id))
+    )
+
+celltypes_dp <- sort(unique(dp_raw$id))
+celltypes_dp <- celltypes_dp[
+    !is.na(celltypes_dp) &
+        celltypes_dp != ""
+]
+
+genes_dp <- intersect(
+    genes_use,
+    sort(unique(dp_raw$features.plot))
+)
+
+# -------------------------------------------------
+# Average expression and clustering
+# -------------------------------------------------
+avg_mat <- AverageExpression(
+    combined,
+    assays   = "ADT",
+    features = genes_dp,
+    group.by = "Celltype_revised_refined",
+    slot     = "data",
+    verbose  = FALSE
+)$ADT
+
+colnames(avg_mat) <- trimws(colnames(avg_mat))
+rownames(avg_mat) <- trimws(rownames(avg_mat))
+
+avg_mat <- avg_mat[
+    genes_dp,
+    celltypes_dp,
+    drop = FALSE
+]
+
+avg_scaled <- t(scale(t(avg_mat)))
+avg_scaled[is.na(avg_scaled)] <- 0
+
+hc_genes <- hclust(
+    dist(avg_scaled),
+    method = "ward.D2"
+)
+
+d_genes <- as.dendrogram(hc_genes)
+
+hc_ct <- hclust(
+    dist(t(avg_scaled)),
+    method = "ward.D2"
+)
+
+d_ct <- as.dendrogram(hc_ct)
+
+# -------------------------------------------------
+# Leaf positions
+# -------------------------------------------------
+dd_g <- ggdendro::dendro_data(
+    d_genes,
+    type = "rectangle"
+)
+
+dd_c <- ggdendro::dendro_data(
+    d_ct,
+    type = "rectangle"
+)
+
+gene_leaves <- dd_g$labels %>%
+    mutate(label = trimws(as.character(label))) %>%
+    arrange(x)
+
+gene_order <- gene_leaves$label
+gene_pos <- setNames(
+    gene_leaves$x,
+    gene_leaves$label
+)
+
+n_genes <- length(gene_order)
+
+ct_leaves <- dd_c$labels %>%
+    mutate(label = trimws(as.character(label))) %>%
+    arrange(x)
+
+celltype_order <- ct_leaves$label
+ct_pos <- setNames(
+    ct_leaves$x,
+    ct_leaves$label
+)
+
+n_ct <- length(celltype_order)
+
+# -------------------------------------------------
+# Dot plot data
+# -------------------------------------------------
+dp <- dp_raw %>%
+    filter(
+        features.plot %in% gene_order,
+        id %in% celltype_order
+    ) %>%
+    mutate(
+        x = ct_pos[id],
+        y = gene_pos[features.plot]
+    ) %>%
+    filter(
+        !is.na(x),
+        !is.na(y)
+    )
+
+vlines <- data.frame(
+    xv = head(sort(ct_pos), -1) +
+        diff(sort(ct_pos)) / 2
+)
+
+hlines <- data.frame(
+    yv = head(sort(gene_pos), -1) +
+        diff(sort(gene_pos)) / 2
+)
+
+x_lim <- c(
+    min(ct_pos) - pad,
+    max(ct_pos) + pad
+)
+
+y_lim <- c(
+    min(gene_pos) - pad,
+    max(gene_pos) + pad
+)
+
+# -------------------------------------------------
+# Main dot plot
+# Solid shape 16 has no border/stroke in PDF.
+# -------------------------------------------------
+DotP <- ggplot(dp, aes(x = x, y = y)) +
+    geom_vline(
+        data = vlines,
+        aes(xintercept = xv),
+        inherit.aes = FALSE,
+        linetype = "dashed",
+        colour = "grey70",
+        linewidth = 0.3
+    ) +
+    geom_hline(
+        data = hlines,
+        aes(yintercept = yv),
+        inherit.aes = FALSE,
+        linetype = "dashed",
+        colour = "grey70",
+        linewidth = 0.3
+    ) +
+    geom_point(
+        aes(
+            size = pct.exp,
+            colour = avg.exp.scaled
+        ),
+        shape = 16,
+        alpha = 1,
+        na.rm = TRUE
+    ) +
+    scale_colour_gradientn(
+        colours = gradient_exp
+    ) +
+    scale_size(
+        limits = c(0, 100),
+        range = c(0.5, 6),
+        breaks = c(0, 25, 50, 75, 100),
+        labels = function(z) paste0(z, "%")
+    ) +
+    scale_x_continuous(
+        breaks = ct_pos,
+        labels = names(ct_pos),
+        limits = x_lim,
+        expand = c(0, 0)
+    ) +
+    scale_y_continuous(
+        breaks = gene_pos,
+        labels = names(gene_pos),
+        limits = y_lim,
+        expand = c(0, 0)
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_bw(
+        base_size = 12,
+        base_line_size = 0.2
+    ) +
+    theme(
+        text = element_text(family = "sans"),
+        plot.margin = margin(2, 2, 2, 2),
+        axis.title = element_blank(),
+        axis.text.x = element_text(
+            angle = 45,
+            hjust = 1,
+            vjust = 1,
+            size = 10,
+            family = "sans"
+        ),
+        axis.text.y = element_text(
+            size = 10,
+            family = "sans"
+        ),
+        axis.line = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "bottom",
+        legend.justification = "center",
+        legend.direction = "horizontal",
+        legend.box = "horizontal",
+        legend.box.just = "top",
+        legend.spacing.x = unit(1.5, "cm"),
+        legend.box.spacing = unit(0.2, "cm"),
+        legend.margin = margin(t = 5, b = 5, l = 0, r = 0),
+        legend.text = element_text(
+            size = 9,
+            family = "sans"
+        ),
+        legend.title = element_text(
+            size = 10,
+            family = "sans"
+        ),
+        legend.key.size = unit(0.4, "cm"),
+        legend.key.spacing.x = unit(0.1, "cm")
+    ) +
+    guides(
+        colour = guide_colorbar(
+            title = "Scaled Expression",
+            title.position = "top",
+            title.hjust = 0.5,
+            barwidth = unit(4, "cm"),
+            barheight = unit(0.35, "cm"),
+            ticks.linewidth = 0.3,
+            frame.colour = "black",
+            frame.linewidth = 0.3,
+            order = 2
+        ),
+        size = guide_legend(
+            title = "Percent Expressing",
+            title.position = "top",
+            title.hjust = 0.5,
+            nrow = 1,
+            byrow = TRUE,
+            override.aes = list(
+                shape = 16,
+                colour = "grey70"
+            ),
+            order = 1
+        )
+    )
+
+# -------------------------------------------------
+# Convert to gtable
+# -------------------------------------------------
+g_dot <- ggplotGrob(DotP)
+
+panel_idx <- which(g_dot$layout$name == "panel")
+
+panel_t <- g_dot$layout$t[panel_idx]
+panel_b <- g_dot$layout$b[panel_idx]
+panel_l <- g_dot$layout$l[panel_idx]
+panel_r <- g_dot$layout$r[panel_idx]
+
+# -------------------------------------------------
+# Celltype color strip
+# -------------------------------------------------
+axisb_idx <- which(g_dot$layout$name == "axis-b")
+axisb_row <- g_dot$layout$t[axisb_idx]
+
+strip_rects <- lapply(
+    celltype_order,
+    function(ct) {
+        x0 <- rescale(
+            ct_pos[ct] - 0.5,
+            from = x_lim
+        )
+
+        x1 <- rescale(
+            ct_pos[ct] + 0.5,
+            from = x_lim
+        )
+
+        rectGrob(
+            x = unit(x0, "npc"),
+            y = unit(0, "npc"),
+            width = unit(x1 - x0, "npc"),
+            height = unit(1, "npc"),
+            just = c("left", "bottom"),
+            gp = gpar(
+                fill = color_map[ct],
+                col = NA
+            )
+        )
+    }
+)
+
+strip_grob <- gTree(
+    children = do.call(gList, strip_rects)
+)
+
+g_dot <- gtable_add_rows(
+    g_dot,
+    heights = unit(0.12, "in"),
+    pos = axisb_row - 1
+)
+
+g_dot <- gtable_add_grob(
+    g_dot,
+    strip_grob,
+    t = axisb_row,
+    b = axisb_row,
+    l = panel_l,
+    r = panel_r,
+    name = "color_strip"
+)
+
+# -------------------------------------------------
+# Top dendrogram: cell types
+# -------------------------------------------------
+dend_top_grob <- gTree(
+    children = gList(
+        segmentsGrob(
+            x0 = unit(
+                rescale(
+                    dd_c$segments$x,
+                    from = x_lim
+                ),
+                "npc"
+            ),
+            y0 = unit(
+                rescale(
+                    dd_c$segments$y,
+                    from = c(
+                        0,
+                        max(dd_c$segments$y)
+                    )
+                ),
+                "npc"
+            ),
+            x1 = unit(
+                rescale(
+                    dd_c$segments$xend,
+                    from = x_lim
+                ),
+                "npc"
+            ),
+            y1 = unit(
+                rescale(
+                    dd_c$segments$yend,
+                    from = c(
+                        0,
+                        max(dd_c$segments$y)
+                    )
+                ),
+                "npc"
+            ),
+            gp = gpar(lwd = 0.8)
+        )
+    )
+)
+
+# -------------------------------------------------
+# Right dendrogram: markers
+# -------------------------------------------------
+dend_right_grob <- gTree(
+    children = gList(
+        segmentsGrob(
+            x0 = unit(
+                rescale(
+                    dd_g$segments$y,
+                    from = c(
+                        0,
+                        max(dd_g$segments$y)
+                    )
+                ),
+                "npc"
+            ),
+            y0 = unit(
+                rescale(
+                    dd_g$segments$x,
+                    from = y_lim
+                ),
+                "npc"
+            ),
+            x1 = unit(
+                rescale(
+                    dd_g$segments$yend,
+                    from = c(
+                        0,
+                        max(dd_g$segments$y)
+                    )
+                ),
+                "npc"
+            ),
+            y1 = unit(
+                rescale(
+                    dd_g$segments$xend,
+                    from = y_lim
+                ),
+                "npc"
+            ),
+            gp = gpar(lwd = 0.8)
+        )
+    )
+)
+
+# -------------------------------------------------
+# Add dendrograms to gtable
+# -------------------------------------------------
+g_combined <- gtable_add_rows(
+    g_dot,
+    heights = unit(0.1, "in"),
+    pos = 0
+)
+
+g_combined <- gtable_add_rows(
+    g_combined,
+    heights = unit(1.5, "in"),
+    pos = 0
+)
+
+g_combined <- gtable_add_rows(
+    g_combined,
+    heights = unit(0.1, "in"),
+    pos = 0
+)
+
+g_combined <- gtable_add_grob(
+    g_combined,
+    dend_top_grob,
+    t = 2,
+    b = 2,
+    l = panel_l,
+    r = panel_r,
+    name = "dend_top"
+)
+
+g_combined <- gtable_add_cols(
+    g_combined,
+    widths = unit(0.1, "in"),
+    pos = -1
+)
+
+g_combined <- gtable_add_cols(
+    g_combined,
+    widths = unit(0.8, "in"),
+    pos = -1
+)
+
+g_combined <- gtable_add_cols(
+    g_combined,
+    widths = unit(0.1, "in"),
+    pos = -1
+)
+
+g_combined <- gtable_add_grob(
+    g_combined,
+    dend_right_grob,
+    t = panel_t + 3,
+    b = panel_b + 3,
+    l = ncol(g_combined) - 1,
+    r = ncol(g_combined) - 1,
+    name = "dend_right"
+)
+
+# -------------------------------------------------
+# Preview
+# -------------------------------------------------
+plot_w <- max(8, n_ct * 0.35 + 4)
+plot_h <- max(12, n_genes * 0.35 + 4)
+
+grid.newpage()
+grid.draw(g_combined)
+
+# -------------------------------------------------
+# Save
+# -------------------------------------------------
+save_dir <- "/project/meadlab/shared/02__Projects/02b__Tapestri/results/figures"
+
+dir.create(
+    save_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+)
+
+cairo_pdf(
+    filename = file.path(
+        save_dir,
+        "Fig_S2.pdf"
+    ),
+    width = plot_w,
+    height = plot_h
+)
+
+grid.newpage()
+grid.draw(g_combined)
+dev.off()
+
+png(
+    filename = file.path(
+        save_dir,
+        "Fig_S2.png"
+    ),
+    width = plot_w,
+    height = plot_h,
+    units = "in",
+    res = 300,
+    type = "cairo"
+)
+
+grid.newpage()
+grid.draw(g_combined)
+dev.off()
+```
+
+# 11. Saving results
+
+```{r}
+OUT_MERGED <- file.path(local_wd_folder, 'results/integrated/Protein_base_embedding.rds')
+qs::qsave(combined, OUT_MERGED)
+OUT_MERGED
+```

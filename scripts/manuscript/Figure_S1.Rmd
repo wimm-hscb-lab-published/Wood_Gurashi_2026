@@ -1,7 +1,9 @@
 ---
-title: "01_XeniumInput_Processing"
-output: html_document
-date: "2024-07-17"
+title: "Figure S1"
+output: 
+  rmdformats::robobook:
+    lightbox: true
+    fig_caption: true
 ---
 
 ## - Setting work directories

@@ -745,9 +745,9 @@ def find_germline_variants(
     if blacklist_paths is None:
         blacklist_paths = [
             "/project/meadlab/shared/02__Projects/"
-            "02__TP53_MDS_Tapestri/Resources/Blacklist/hg19-blacklist.v2.bed",
+            "resources/blacklists/hg19-blacklist.v2.bed",
             "/project/meadlab/shared/02__Projects/"
-            "02__TP53_MDS_Tapestri/Resources/Blacklist/"
+            "resources/blacklists/"
             "hg19_blacklist_MergedList_Anshul Kundaje_Stanford.csv",
         ]
 

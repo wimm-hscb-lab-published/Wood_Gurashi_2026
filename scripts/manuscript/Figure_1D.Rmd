@@ -1,7 +1,9 @@
 ---
-title: "01_XeniumInput_Processing"
-output: html_document
-date: "2024-07-17"
+title: "Figure 1D"
+output: 
+  rmdformats::robobook:
+    lightbox: true
+    fig_caption: true
 ---
 
 ## - Setting work directories
@@ -883,6 +885,161 @@ Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters
 Base_embedding@meta.data[WhichCells(Base_embedding, expression = seurat_clusters %in% 4),'Celltype'] <- 'Low res'
 ```
 
+```{r}
+# ============================================================
+# Subcluster Erythroblast
+# ============================================================
+# Follows the same recipe used for the base map (PCA on ADT -> Harmony by
+# Sample -> UMAP -> Louvain/Leiden clustering -> marker DEGs), but restricted
+# to cells already called 'Erythroblast'. Re-running PCA on the subset rather
+# than reusing the whole-object embedding is deliberate: within-erythroblast
+# variance is a small fraction of the full dataset's variance, so it would be
+# invisible in the first few global PCs.
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+erythroblast_cells <- WhichCells(Base_embedding, expression = Celltype == 'Erythroblast')
+cat("Erythroblast cells:", length(erythroblast_cells), "\n")
+
+Erythroblast_sub <- subset(Base_embedding, cells = erythroblast_cells)
+
+# ---- Re-normalize and re-embed on the subset ---------------------------------
+DefaultAssay(Erythroblast_sub) <- "ADT"
+
+Erythroblast_sub <- NormalizeData(
+    Erythroblast_sub, normalization.method = 'CLR', margin = 2, verbose = FALSE
+)
+Erythroblast_sub <- ScaleData(Erythroblast_sub, verbose = FALSE)
+
+set.seed(123)
+Erythroblast_sub <- RunPCA(
+    Erythroblast_sub, features = rownames(Erythroblast_sub@assays$ADT), verbose = FALSE
+)
+
+print(ElbowPlot(Erythroblast_sub))
+
+# ---- Harmony, only if the subset spans more than one sample -----------------
+n_samples <- length(unique(na.omit(as.character(Erythroblast_sub$Sample))))
+reduction_for_umap <- "pca"
+
+if (n_samples > 1) {
+    set.seed(123)
+    Erythroblast_sub <- RunHarmony(
+        Erythroblast_sub, group.by.vars = 'Sample', dims.use = 1:15, verbose = FALSE
+    )
+    reduction_for_umap <- "harmony"
+} else {
+    message("Only one sample present in the Erythroblast subset — skipping Harmony")
+}
+
+n_dims <- min(15, ncol(Embeddings(Erythroblast_sub, reduction_for_umap)))
+
+set.seed(123)
+Erythroblast_sub <- RunUMAP(
+    Erythroblast_sub,
+    dims        = 1:n_dims,
+    min.dist    = 0.20,
+    spread      = 0.5,
+    reduction   = reduction_for_umap,
+    n.neighbors = min(50, ncol(Erythroblast_sub) - 1),
+    seed.use    = 42,
+    verbose     = FALSE
+)
+
+set.seed(123)
+Erythroblast_sub <- FindNeighbors(
+    Erythroblast_sub, reduction = reduction_for_umap, dims = 1:n_dims, verbose = FALSE
+)
+
+set.seed(123)
+Erythroblast_sub <- FindClusters(
+    Erythroblast_sub, algorithm = 4, resolution = 1, verbose = FALSE
+)
+
+p_sub_clusters <- DimPlot(
+    Erythroblast_sub, group.by = 'seurat_clusters', label = TRUE, pt.size = 1.4
+) + ggtitle("Erythroblast subclusters")
+
+p_sub_sample <- DimPlot(
+    Erythroblast_sub, group.by = 'Sample', pt.size = 1.4
+) + ggtitle("By sample")
+
+print(p_sub_clusters | p_sub_sample)
+
+cat("\nCells per subcluster:\n")
+print(table(Erythroblast_sub$seurat_clusters))
+
+cat("\nSubcluster composition by sample:\n")
+print(table(Erythroblast_sub$seurat_clusters, Erythroblast_sub$Sample))
+
+# ---- Marker DEGs per subcluster ----------------------------------------------
+Idents(Erythroblast_sub) <- Erythroblast_sub$seurat_clusters
+
+DEG_erythroblast <- FindAllMarkers(
+    Erythroblast_sub, assay = 'ADT', max.cells.per.ident = 1000
+)
+
+DEG_erythroblast$pct.1_v_pct.2 <- DEG_erythroblast$pct.1 - DEG_erythroblast$pct.2
+
+feature_col <- intersect(c("gene", "feature"), colnames(DEG_erythroblast))[1]
+if (is.na(feature_col)) stop("Could not identify the ADT feature-name column in DEG_erythroblast.")
+
+marker_candidates <- DEG_erythroblast %>%
+    dplyr::mutate(
+        feature_name = as.character(.data[[feature_col]]),
+        cluster = as.character(cluster)
+    ) %>%
+    dplyr::filter(!is.na(feature_name), nzchar(feature_name), !is.na(pct.1_v_pct.2)) %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2))
+
+cluster_order <- unique(marker_candidates$cluster)
+
+used_features <- character()
+top5_features_by_subcluster <- list()
+
+for (cluster_id in cluster_order) {
+    cluster_markers <- marker_candidates %>%
+        dplyr::filter(cluster == cluster_id) %>%
+        dplyr::filter(!duplicated(feature_name)) %>%
+        dplyr::filter(!feature_name %in% used_features)
+
+    selected <- head(cluster_markers, 5)
+    if (nrow(selected) == 0) next
+
+    top5_features_by_subcluster[[paste0("Cluster ", cluster_id)]] <- selected$feature_name
+    used_features <- c(used_features, selected$feature_name)
+}
+
+print(DotPlot(
+    Erythroblast_sub, features = top5_features_by_subcluster, assay = "ADT"
+) +
+    RotatedAxis() +
+    ggtitle("Top 5 unique ADT markers per Erythroblast subcluster") +
+    theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 8)))
+```
+
+```{r}
+# Only cells belonging to a mapped subcluster get overwritten; everything else
+# keeps its existing Celltype ('Erythroblast'). Indexing subcluster_labels[...]
+# alone would return NA for unmapped subclusters and blank out those cells.
+subcluster_labels <- c(
+    "4" = "Plasma"
+)
+
+mapped_cells <- rownames(Erythroblast_sub@meta.data)[
+    as.character(Erythroblast_sub$seurat_clusters) %in% names(subcluster_labels)
+]
+
+Base_embedding@meta.data[mapped_cells, "Celltype"] <-
+    subcluster_labels[as.character(Erythroblast_sub$seurat_clusters[mapped_cells])]
+
+cat("Relabelled", length(mapped_cells), "cell(s) as:\n")
+print(table(Base_embedding@meta.data[mapped_cells, "Celltype"]))
+```
+
 ## - Low res removal
 
 We remove these cells and instead project them on top of good quality protein embedding
@@ -935,8 +1092,7 @@ Base_embedding <- FindNeighbors(
     graph.name = c("harmony_nn", "harmony_snn")
 )
 
-resolutions <- seq(0.5, 1.5, by = 0.25)
-resolutions <- round(resolutions, 2)
+resolutions <- seq(1, 1.5, by = 0.1)
 
 # Fixed IDs used everywhere: 0.50, 0.75, 1.00, 1.25, 1.50
 resolution_ids <- sprintf("%.2f", resolutions)
@@ -964,7 +1120,7 @@ library(ggplot2)
 
 # Matches the fixed names created in the clustering loop:
 # cluster_res_0.50, cluster_res_0.75, ..., cluster_res_1.50
-resolutions <- seq(0.5, 1.5, by = 0.25)
+resolutions <- seq(1, 1.5, by = 0.1)
 cluster_cols <- paste0("cluster_res_", sprintf("%.2f", resolutions))
 
 # Retain only clustering columns actually present in metadata.
@@ -1107,6 +1263,161 @@ Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.0
 Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% 9),'Celltype'] <- 'Monocyte'
 Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.00 %in% 3),'Celltype'] <- 'NK cell'
 Base_embedding@meta.data[WhichCells(Base_embedding, expression = cluster_res_1.50 %in% 15),'Celltype'] <- 'pDC'
+```
+
+```{r}
+# ============================================================
+# Subcluster Erythroblast
+# ============================================================
+# Follows the same recipe used for the base map (PCA on ADT -> Harmony by
+# Sample -> UMAP -> Louvain/Leiden clustering -> marker DEGs), but restricted
+# to cells already called 'Erythroblast'. Re-running PCA on the subset rather
+# than reusing the whole-object embedding is deliberate: within-erythroblast
+# variance is a small fraction of the full dataset's variance, so it would be
+# invisible in the first few global PCs.
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+erythroblast_cells <- WhichCells(Base_embedding, expression = Celltype == 'Erythroblast')
+cat("Erythroblast cells:", length(erythroblast_cells), "\n")
+
+Erythroblast_sub <- subset(Base_embedding, cells = erythroblast_cells)
+
+# ---- Re-normalize and re-embed on the subset ---------------------------------
+DefaultAssay(Erythroblast_sub) <- "ADT"
+
+Erythroblast_sub <- NormalizeData(
+    Erythroblast_sub, normalization.method = 'CLR', margin = 2, verbose = FALSE
+)
+Erythroblast_sub <- ScaleData(Erythroblast_sub, verbose = FALSE)
+
+set.seed(123)
+Erythroblast_sub <- RunPCA(
+    Erythroblast_sub, features = rownames(Erythroblast_sub@assays$ADT), verbose = FALSE
+)
+
+print(ElbowPlot(Erythroblast_sub))
+
+# ---- Harmony, only if the subset spans more than one sample -----------------
+n_samples <- length(unique(na.omit(as.character(Erythroblast_sub$Sample))))
+reduction_for_umap <- "pca"
+
+if (n_samples > 1) {
+    set.seed(123)
+    Erythroblast_sub <- RunHarmony(
+        Erythroblast_sub, group.by.vars = 'Sample', dims.use = 1:15, verbose = FALSE
+    )
+    reduction_for_umap <- "harmony"
+} else {
+    message("Only one sample present in the Erythroblast subset — skipping Harmony")
+}
+
+n_dims <- min(15, ncol(Embeddings(Erythroblast_sub, reduction_for_umap)))
+
+set.seed(123)
+Erythroblast_sub <- RunUMAP(
+    Erythroblast_sub,
+    dims        = 1:n_dims,
+    min.dist    = 0.20,
+    spread      = 0.5,
+    reduction   = reduction_for_umap,
+    n.neighbors = min(50, ncol(Erythroblast_sub) - 1),
+    seed.use    = 42,
+    verbose     = FALSE
+)
+
+set.seed(123)
+Erythroblast_sub <- FindNeighbors(
+    Erythroblast_sub, reduction = reduction_for_umap, dims = 1:n_dims, verbose = FALSE
+)
+
+set.seed(123)
+Erythroblast_sub <- FindClusters(
+    Erythroblast_sub, algorithm = 4, resolution = 1, verbose = FALSE
+)
+
+p_sub_clusters <- DimPlot(
+    Erythroblast_sub, group.by = 'seurat_clusters', label = TRUE, pt.size = 1.4
+) + ggtitle("Erythroblast subclusters")
+
+p_sub_sample <- DimPlot(
+    Erythroblast_sub, group.by = 'Sample', pt.size = 1.4
+) + ggtitle("By sample")
+
+print(p_sub_clusters | p_sub_sample)
+
+cat("\nCells per subcluster:\n")
+print(table(Erythroblast_sub$seurat_clusters))
+
+cat("\nSubcluster composition by sample:\n")
+print(table(Erythroblast_sub$seurat_clusters, Erythroblast_sub$Sample))
+
+# ---- Marker DEGs per subcluster ----------------------------------------------
+Idents(Erythroblast_sub) <- Erythroblast_sub$seurat_clusters
+
+DEG_erythroblast <- FindAllMarkers(
+    Erythroblast_sub, assay = 'ADT', max.cells.per.ident = 1000
+)
+
+DEG_erythroblast$pct.1_v_pct.2 <- DEG_erythroblast$pct.1 - DEG_erythroblast$pct.2
+
+feature_col <- intersect(c("gene", "feature"), colnames(DEG_erythroblast))[1]
+if (is.na(feature_col)) stop("Could not identify the ADT feature-name column in DEG_erythroblast.")
+
+marker_candidates <- DEG_erythroblast %>%
+    dplyr::mutate(
+        feature_name = as.character(.data[[feature_col]]),
+        cluster = as.character(cluster)
+    ) %>%
+    dplyr::filter(!is.na(feature_name), nzchar(feature_name), !is.na(pct.1_v_pct.2)) %>%
+    dplyr::arrange(cluster, dplyr::desc(pct.1_v_pct.2))
+
+cluster_order <- unique(marker_candidates$cluster)
+
+used_features <- character()
+top5_features_by_subcluster <- list()
+
+for (cluster_id in cluster_order) {
+    cluster_markers <- marker_candidates %>%
+        dplyr::filter(cluster == cluster_id) %>%
+        dplyr::filter(!duplicated(feature_name)) %>%
+        dplyr::filter(!feature_name %in% used_features)
+
+    selected <- head(cluster_markers, 5)
+    if (nrow(selected) == 0) next
+
+    top5_features_by_subcluster[[paste0("Cluster ", cluster_id)]] <- selected$feature_name
+    used_features <- c(used_features, selected$feature_name)
+}
+
+print(DotPlot(
+    Erythroblast_sub, features = top5_features_by_subcluster, assay = "ADT"
+) +
+    RotatedAxis() +
+    ggtitle("Top 5 unique ADT markers per Erythroblast subcluster") +
+    theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(size = 8)))
+```
+
+```{r}
+# Only cells belonging to a mapped subcluster get overwritten; everything else
+# keeps its existing Celltype ('Erythroblast'). Indexing subcluster_labels[...]
+# alone would return NA for unmapped subclusters and blank out those cells.
+subcluster_labels <- c(
+    "12" = "Plasma"
+)
+
+mapped_cells_higher_qc <- rownames(Erythroblast_sub@meta.data)[
+    as.character(Erythroblast_sub$seurat_clusters) %in% names(subcluster_labels)
+]
+
+Base_embedding@meta.data[mapped_cells_higher_qc, "Celltype"] <-
+    subcluster_labels[as.character(Erythroblast_sub$seurat_clusters[mapped_cells_higher_qc])]
+
+cat("Relabelled", length(mapped_cells_higher_qc), "cell(s) as:\n")
+print(table(Base_embedding@meta.data[mapped_cells_higher_qc, "Celltype"]))
 ```
 
 # 5. Subclustering
@@ -1858,7 +2169,105 @@ Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Macs, expression = seura
 Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Macs, expression = seurat_clusters %in% c(4)),'Celltype_revised'] <- 'Mono/Macrophage'
 ```
 
-# 6. Re-assignment of noisy cells
+# 6. Plasma cells
+
+```{r}
+# ============================================================
+# mapped_cells — subset, Harmonize, recluster
+# ============================================================
+# Subsets Base_embedding to exactly the mapped_cells barcodes (Erythroblast
+# subcluster 4 from the first run), then re-runs CLR normalization, PCA,
+# Harmony integration by Sample, UMAP, and clustering on that subset alone —
+# the same recipe used for every other population above.
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+mapped_cells <- intersect(mapped_cells, colnames(Base_embedding))
+cat("mapped_cells present in Base_embedding:", length(mapped_cells), "\n")
+
+if (length(mapped_cells) < 30) {
+    stop("Only ", length(mapped_cells), " cell(s) in mapped_cells — too few ",
+         "for a stable PCA/Harmony/clustering run.")
+}
+
+Base_embedding_mapped <- subset(Base_embedding, cells = mapped_cells)
+DefaultAssay(Base_embedding_mapped) <- "ADT"
+
+Base_embedding_mapped <- NormalizeData(
+    Base_embedding_mapped, normalization.method = "CLR", margin = 2, verbose = FALSE
+)
+Base_embedding_mapped <- ScaleData(Base_embedding_mapped, verbose = FALSE)
+
+set.seed(123)
+Base_embedding_mapped <- RunPCA(
+    Base_embedding_mapped, features = rownames(Base_embedding_mapped@assays$ADT),
+    verbose = FALSE
+)
+
+n_dims <- min(10, ncol(Embeddings(Base_embedding_mapped, "pca")))
+
+n_samples <- length(unique(na.omit(as.character(Base_embedding_mapped$Sample))))
+cat("Samples represented:", n_samples, "\n")
+
+if (n_samples > 1) {
+    set.seed(123)
+    Base_embedding_mapped <- RunHarmony(
+        Base_embedding_mapped, group.by.vars = "Sample",
+        dims.use = seq_len(n_dims), verbose = FALSE
+    )
+    reduction_use <- "harmony"
+} else {
+    message("Only one sample present — skipping Harmony, using PCA directly")
+    reduction_use <- "pca"
+}
+
+n_neighbors <- min(15, ncol(Base_embedding_mapped) - 1)
+
+set.seed(123)
+Base_embedding_mapped <- RunUMAP(
+    Base_embedding_mapped,
+    reduction    = reduction_use,
+    dims         = seq_len(n_dims),
+    min.dist     = 0.20,
+    spread       = 1.5,
+    n.neighbors  = n_neighbors,
+    seed.use     = 42,
+    return.model = TRUE,
+    verbose      = FALSE
+)
+
+set.seed(123)
+Base_embedding_mapped <- FindNeighbors(
+    Base_embedding_mapped, reduction = reduction_use, dims = seq_len(n_dims),
+    k.param = n_neighbors, verbose = FALSE
+)
+
+set.seed(123)
+Base_embedding_mapped <- FindClusters(
+    Base_embedding_mapped, algorithm = 4, resolution = 1,
+    random.seed = 123, verbose = FALSE
+)
+
+DimPlot(
+    Base_embedding_mapped, group.by = "Sample", pt.size = 1.4
+) + ggtitle("mapped_cells — by sample (post-Harmony)")
+
+DimPlot(
+    Base_embedding_mapped, group.by = "seurat_clusters", label = TRUE, pt.size = 1.4
+) + ggtitle("mapped_cells — subclusters")
+
+cat("\nCells per subcluster:\n")
+print(table(Base_embedding_mapped$seurat_clusters))
+
+cat("\nSubcluster composition by sample:\n")
+print(table(Base_embedding_mapped$seurat_clusters, Base_embedding_mapped$Sample))
+```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding_mapped, expression = seurat_clusters %in% '3'), 'Celltype_revised'] <- 'Plasma'
+```
+
+# 7. Re-assignment of noisy cells
 
 ```{r}
 # ---- 1. Compute silhouette on Harmony space ----
@@ -2449,8 +2858,305 @@ top5_pctdiff_by_cluster_Mono_Mac
 
 ```{r}
 Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Mac, expression = seurat_clusters %in% c(1)),'Celltype_revised_refined'] <- 'Other T cell'
+Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Mac, expression = seurat_clusters %in% c(4)),'Celltype_revised_refined'] <- 'Other T cell'
 Base_embedding@meta.data[WhichCells(Base_embedding_Mono_Mac, expression = seurat_clusters %in% c(5)),'Celltype_revised_refined'] <- 'Other T cell'
 ```
+
+```{r}
+Base_embedding@meta.data[WhichCells(Base_embedding, expression = Celltype_revised_refined %in% 'Plasma'), 'Celltype_revised_refined'] <- 'Plasma cell'
+```
+
+## - Further refinement
+
+### - Mono mac / Other T
+
+```{r}
+## - Other T cell + Mono/Macrophage — pooled subclustering
+
+# Same parameters as the other subclustering blocks (pDC, Monocyte, Other T,
+# Mono/Mac individually). Pooling the two populations together lets the
+# clustering itself decide the boundary between them, rather than relying on
+# repeated manual back-and-forth reassignment as in the two blocks above.
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_OtherT_MonoMac <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype_revised_refined %in% c("Other T cell", "Mono/Macrophage")
+    )
+)
+
+cat("Cells going in, by current label:\n")
+print(table(Base_embedding_OtherT_MonoMac$Celltype_revised_refined))
+
+Base_embedding_OtherT_MonoMac <- NormalizeData(
+    Base_embedding_OtherT_MonoMac,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_OtherT_MonoMac <- ScaleData(Base_embedding_OtherT_MonoMac)
+
+set.seed(123)
+
+Base_embedding_OtherT_MonoMac <- RunPCA(
+    Base_embedding_OtherT_MonoMac,
+    features = rownames(Base_embedding_OtherT_MonoMac@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_OtherT_MonoMac <- RunHarmony(
+    Base_embedding_OtherT_MonoMac,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_OtherT_MonoMac <- RunUMAP(
+    object = Base_embedding_OtherT_MonoMac,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_OtherT_MonoMac <- FindNeighbors(
+    Base_embedding_OtherT_MonoMac,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_OtherT_MonoMac <- FindClusters(
+    Base_embedding_OtherT_MonoMac,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_OtherT_MonoMac,
+    group.by = "Celltype_revised_refined",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_OtherT_MonoMac,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+Base_embedding@meta.data[colnames(Base_embedding_OtherT_MonoMac), 'Celltype_revised_refined'] <- 'Mono/Macrophage'
+Base_embedding@meta.data[WhichCells(Base_embedding_OtherT_MonoMac, expression = seurat_clusters %in% c('2', '1', '7')), 'Celltype_revised_refined'] <- 'Other T cell'
+```
+
+### - cDC / pDC
+
+```{r}
+## - cDC/pDC — pooled subclustering
+
+# Same parameters as the other subclustering blocks (pDC, Monocyte, Other T,
+# Mono/Mac individually). Pooling the two populations together lets the
+# clustering itself decide the boundary between them, rather than relying on
+# repeated manual back-and-forth reassignment as in the two blocks above.
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_cDC_pDC <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype_revised_refined %in% c("cDC", "pDC")
+    )
+)
+
+cat("Cells going in, by current label:\n")
+print(table(Base_embedding_cDC_pDC$Celltype_revised_refined))
+
+Base_embedding_cDC_pDC <- NormalizeData(
+    Base_embedding_cDC_pDC,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_cDC_pDC <- ScaleData(Base_embedding_cDC_pDC)
+
+set.seed(123)
+
+Base_embedding_cDC_pDC <- RunPCA(
+    Base_embedding_cDC_pDC,
+    features = rownames(Base_embedding_cDC_pDC@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_cDC_pDC <- RunHarmony(
+    Base_embedding_cDC_pDC,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_cDC_pDC <- RunUMAP(
+    object = Base_embedding_cDC_pDC,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_cDC_pDC <- FindNeighbors(
+    Base_embedding_cDC_pDC,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_cDC_pDC <- FindClusters(
+    Base_embedding_cDC_pDC,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_cDC_pDC,
+    group.by = "Celltype_revised_refined",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_cDC_pDC,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+Base_embedding@meta.data[colnames(Base_embedding_cDC_pDC), 'Celltype_revised_refined'] <- 'pDC'
+Base_embedding@meta.data[WhichCells(Base_embedding_cDC_pDC, expression = seurat_clusters %in% c('1')), 'Celltype_revised_refined'] <- 'HSPC'
+Base_embedding@meta.data[WhichCells(Base_embedding_cDC_pDC, expression = seurat_clusters %in% c('5')), 'Celltype_revised_refined'] <- 'cDC'
+```
+
+### - CD14+ / CD16+ mono
+
+```{r}
+## - CD14+/CD16+ mono pooled subclustering
+
+# Same parameters as the other subclustering blocks (pDC, Monocyte, Other T,
+# Mono/Mac individually). Pooling the two populations together lets the
+# clustering itself decide the boundary between them, rather than relying on
+# repeated manual back-and-forth reassignment as in the two blocks above.
+
+DefaultAssay(Base_embedding) <- "ADT"
+
+Base_embedding_cd14_cd16_mono <- subset(
+    Base_embedding,
+    cells = WhichCells(
+        Base_embedding,
+        expression = Celltype_revised_refined %in% c("CD14+ monocyte", "CD16+ monocyte")
+    )
+)
+
+cat("Cells going in, by current label:\n")
+print(table(Base_embedding_cd14_cd16_mono$Celltype_revised_refined))
+
+Base_embedding_cd14_cd16_mono <- NormalizeData(
+    Base_embedding_cd14_cd16_mono,
+    normalization.method = "CLR",
+    margin = 2
+)
+
+Base_embedding_cd14_cd16_mono <- ScaleData(Base_embedding_cd14_cd16_mono)
+
+set.seed(123)
+
+Base_embedding_cd14_cd16_mono <- RunPCA(
+    Base_embedding_cd14_cd16_mono,
+    features = rownames(Base_embedding_cd14_cd16_mono@assays$ADT)
+)
+
+set.seed(123)
+
+Base_embedding_cd14_cd16_mono <- RunHarmony(
+    Base_embedding_cd14_cd16_mono,
+    group.by.vars = "Sample",
+    dims.use = 1:10
+)
+
+set.seed(123)
+
+Base_embedding_cd14_cd16_mono <- RunUMAP(
+    object = Base_embedding_cd14_cd16_mono,
+    dims = 1:10,
+    min.dist = 0.20,
+    spread = 1.5,
+    reduction = "harmony",
+    n.neighbors = 15,
+    seed.use = 42,
+    return.model = TRUE
+)
+
+set.seed(123)
+
+Base_embedding_cd14_cd16_mono <- FindNeighbors(
+    Base_embedding_cd14_cd16_mono,
+    reduction = "harmony",
+    dims = 1:10,
+    k.param = 15
+)
+
+set.seed(123)
+
+Base_embedding_cd14_cd16_mono <- FindClusters(
+    Base_embedding_cd14_cd16_mono,
+    algorithm = 4,
+    resolution = 1
+)
+
+DimPlot(
+    Base_embedding_cd14_cd16_mono,
+    group.by = "Celltype_revised_refined",
+    label = TRUE,
+    pt.size = 1.4
+)
+
+DimPlot(
+    Base_embedding_cd14_cd16_mono,
+    group.by = "seurat_clusters",
+    label = TRUE,
+    pt.size = 1.4
+)
+```
+
+```{r}
+Base_embedding@meta.data[colnames(Base_embedding_cd14_cd16_mono), 'Celltype_revised_refined'] <- 'CD14+ monocyte'
+Base_embedding@meta.data[WhichCells(Base_embedding_cd14_cd16_mono, expression = seurat_clusters %in% c('3', '6')), 'Celltype_revised_refined'] <- 'CD16+ monocyte'
+```
+
 
 ## - Inspection
 
@@ -2462,6 +3168,7 @@ umap_df$Celltype <- Base_embedding$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#FFBE7D",
     "CD16+ monocyte"      = "#F28E2B",
@@ -2498,6 +3205,7 @@ library(patchwork)
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#FFBE7D",
     "CD16+ monocyte"      = "#F28E2B",
@@ -2542,7 +3250,7 @@ for (ct in celltypes) {
 wrap_plots(plot_list, ncol = 5)
 ```
 
-# 7. Projection of lower quality samples
+# 8. Projection of lower quality samples
 
 ```{r}
 library(Seurat)
@@ -3078,6 +3786,7 @@ umap_df$Celltype <- Base_embedding$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3118,6 +3827,7 @@ umap_df$Celltype <- query_obj$predicted.Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3194,6 +3904,7 @@ umap_df$Celltype <- query_obj$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3300,8 +4011,7 @@ table(combined$Celltype_revised_refined, combined$source)
 combined_lower_quality_pts <- combined
 ```
 
-
-# 8. Projection of lower quality data
+# 9. Projection of lower quality data
 
 ```{r}
 library(Seurat)
@@ -3422,7 +4132,7 @@ query_obj <- MapQuery(
     refdata = list(
         Celltype_revised_refined = "Celltype_revised_refined"
     ),
-    reference.reduction = "harmony",
+    reference.reduction = "pca",
     reduction.model = "umap"
 )
 
@@ -3438,6 +4148,7 @@ umap_df$Celltype <- Base_embedding$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3478,6 +4189,7 @@ umap_df$Celltype <- query_obj$predicted.Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3554,6 +4266,7 @@ umap_df$Celltype <- query_obj$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3660,7 +4373,7 @@ table(combined$Celltype_revised_refined, combined$source)
 combined_lower_quality_cell_cluster <- combined
 ```
 
-# 9. Final merge
+# 11. Final merge
 
 ```{r}
 library(Seurat)
@@ -3819,7 +4532,7 @@ length(intersect(
 ))
 ```
 
-# 10. Viz
+# 12. Viz
 
 ## - Panel D
 
@@ -3831,6 +4544,7 @@ umap_df <- as.data.frame(Embeddings(combined, "umap"))
 
 color_map <- c(
     "B cell"            = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     "CD14+ monocyte"    = "#F28E2B",
     "CD16+ monocyte"    = "#FFBE7D",
     "Mono/Macrophage"   = "#BAB0AC",
@@ -3852,10 +4566,13 @@ names(color_map_light) <- names(color_map)
 umap_df$Celltype <- factor(combined$Celltype_revised_refined, levels = names(color_map))
 stopifnot(!anyNA(umap_df$Celltype))   # fail loudly if a label has no colour
 
-# Shuffle row order so no single celltype is systematically drawn on top.
-# In a single geom_point layer, z-order follows row order.
-set.seed(123)
-umap_df <- umap_df[sample(nrow(umap_df)), , drop = FALSE]
+celltype_counts <- table(umap_df$Celltype)
+abundance_order <- names(sort(celltype_counts, decreasing = TRUE))  # most -> least abundant
+
+umap_df <- umap_df[order(match(umap_df$Celltype, abundance_order)), , drop = FALSE]
+
+cat("Draw order (bottom to top, i.e. most to least abundant):\n")
+print(celltype_counts[abundance_order])
 
 p <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2)) +
     geom_point(
@@ -3893,9 +4610,9 @@ ggsave(file.path(save_dir, "Fig_1D.png"),
 save_dir <- "/project/meadlab/shared/02__Projects/02b__Tapestri/results/figures/Additional"
 dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
 ggsave(file.path(save_dir, "UMAP_celltypes_merged_labels_no_legend.pdf"),
-    plot = p_no_legend, width = 5.5, height = 4.5, device = cairo_pdf)
+    plot = p_no_legend, width = 5.5, height = 5, device = cairo_pdf)
 ggsave(file.path(save_dir, "UMAP_celltypes_merged_labels_no_legend.png"),
-    plot = p_no_legend, width = 5.5, height = 4.5, dpi = 300)
+    plot = p_no_legend, width = 5.5, height = 5, dpi = 300)
 ```
 
 ## - Fig S2
@@ -3922,6 +4639,7 @@ pad          <- 0.6
 
 color_map <- c(
     "B cell"          = "#B07AA1",
+    "Plasma cell"   = "#514DAD",
     "CD14+ monocyte"  = "#F28E2B",
     "CD16+ monocyte"  = "#FFBE7D",
     "Mono/Macrophage" = "#BAB0AC",
@@ -4456,7 +5174,7 @@ grid.draw(g_combined)
 dev.off()
 ```
 
-# 11. Saving results
+# 13. Saving results
 
 ```{r}
 OUT_MERGED <- file.path(local_wd_folder, 'results/integrated/Protein_base_embedding.rds')

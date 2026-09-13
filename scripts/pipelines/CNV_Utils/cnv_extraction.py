@@ -395,7 +395,7 @@ def extract_cnv_data(
         OUT_DIR = f"{wd}/results/per_sample/{EXPERIMENT}/{PATIENT_ID}/dna_cnv/clonotypes/ploidy"
     
     if desired_plotting_order is None:
-        desired_plotting_order = list(set(Sample.dna.row_attrs['Clone']))
+        desired_plotting_order = sorted(set(Sample.dna.row_attrs['Clone']))
 
     os.makedirs(OUT_DIR, exist_ok=True)
 

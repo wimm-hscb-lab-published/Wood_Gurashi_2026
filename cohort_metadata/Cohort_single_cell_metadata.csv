@@ -10,12 +10,12 @@ PT08,Bi Allelic,Linear,None,Yes
 PT09,Bi Allelic,Linear,None,Yes
 PT10,Bi Allelic,Parallel,None,Yes
 PT11,Mono Allelic,Linear,None,Yes
-PT12,Bi Allelic,Linear,None,Yes
+PT12,Bi Allelic,Linear,Independent,Yes
 PT13,Bi Allelic,Undetermined,None,Yes
 PT14,Bi Allelic,Parallel,Independent,Yes
 PT15,Mono Allelic,Linear,None,No
 PT16,Mono Allelic,Linear,Both,Yes
 PT17,Mono Allelic,Parallel,Independent,No
 PT18,Mono Allelic,Linear,Co-occuring,No
-PT19,Bi Allelic,Parallel,Independent,Yes
+PT19,Bi Allelic,Parallel,Independent,No
 PT20,Mono Allelic,Parallel,Independent,No

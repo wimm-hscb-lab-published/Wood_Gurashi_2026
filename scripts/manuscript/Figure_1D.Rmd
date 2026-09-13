@@ -3168,7 +3168,7 @@ umap_df$Celltype <- Base_embedding$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#FFBE7D",
     "CD16+ monocyte"      = "#F28E2B",
@@ -3205,7 +3205,7 @@ library(patchwork)
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#FFBE7D",
     "CD16+ monocyte"      = "#F28E2B",
@@ -3786,7 +3786,7 @@ umap_df$Celltype <- Base_embedding$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3794,7 +3794,7 @@ color_map <- c(
     "Mono/Macrophage"      = "#BAB0AC",
     
     "CD4+ T cell" = "#9D7660",
-    "CD8+ T cell" = "#8CD17D",
+    "CD8+ T cell" = "#514DAD",
     
     "cDC"                 = "#F1CE63",
     "pDC"                 = "#86BCB6",
@@ -3827,7 +3827,7 @@ umap_df$Celltype <- query_obj$predicted.Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3835,7 +3835,7 @@ color_map <- c(
     "Mono/Macrophage"      = "#BAB0AC",
     
     "CD4+ T cell" = "#9D7660",
-    "CD8+ T cell" = "#8CD17D",
+    "CD8+ T cell" = "#514DAD",
     
     "cDC"                 = "#F1CE63",
     "pDC"                 = "#86BCB6",
@@ -3904,7 +3904,7 @@ umap_df$Celltype <- query_obj$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -3912,7 +3912,7 @@ color_map <- c(
     "Mono/Macrophage"      = "#BAB0AC",
     
     "CD4+ T cell" = "#9D7660",
-    "CD8+ T cell" = "#8CD17D",
+    "CD8+ T cell" = "#514DAD",
     
     "cDC"                 = "#F1CE63",
     "pDC"                 = "#86BCB6",
@@ -4148,7 +4148,7 @@ umap_df$Celltype <- Base_embedding$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -4156,7 +4156,7 @@ color_map <- c(
     "Mono/Macrophage"      = "#BAB0AC",
     
     "CD4+ T cell" = "#9D7660",
-    "CD8+ T cell" = "#8CD17D",
+    "CD8+ T cell" = "#514DAD",
     
     "cDC"                 = "#F1CE63",
     "pDC"                 = "#86BCB6",
@@ -4189,7 +4189,7 @@ umap_df$Celltype <- query_obj$predicted.Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -4197,7 +4197,7 @@ color_map <- c(
     "Mono/Macrophage"      = "#BAB0AC",
     
     "CD4+ T cell" = "#9D7660",
-    "CD8+ T cell" = "#8CD17D",
+    "CD8+ T cell" = "#514DAD",
     
     "cDC"                 = "#F1CE63",
     "pDC"                 = "#86BCB6",
@@ -4266,7 +4266,7 @@ umap_df$Celltype <- query_obj$Celltype_revised_refined
 
 color_map <- c(
     "B cell"   = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     
     "CD14+ monocyte"      = "#F28E2B",
     "CD16+ monocyte"      = "#FFBE7D",
@@ -4274,7 +4274,7 @@ color_map <- c(
     "Mono/Macrophage"      = "#BAB0AC",
     
     "CD4+ T cell" = "#9D7660",
-    "CD8+ T cell" = "#8CD17D",
+    "CD8+ T cell" = "#514DAD",
     
     "cDC"                 = "#F1CE63",
     "pDC"                 = "#86BCB6",
@@ -4544,22 +4544,29 @@ umap_df <- as.data.frame(Embeddings(combined, "umap"))
 
 color_map <- c(
     "B cell"            = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
+    "Plasma cell"   = "#8CD17D",
     "CD14+ monocyte"    = "#F28E2B",
     "CD16+ monocyte"    = "#FFBE7D",
-    "Mono/Macrophage"   = "#BAB0AC",
+    "Mono/Macrophage"   = "#5A5A5A",
     "CD4+ T cell"       = "#9D7660",
-    "CD8+ T cell"       = "#8CD17D",
+    "CD8+ T cell"       = "#514DAD",
     "cDC"               = "#F1CE63",
     "pDC"               = "#86BCB6",
     "NK cell"           = "#FABFD2",
     "Erythroblast"      = "#E15759",
     "HSPC"              = "#4E79A7",
-    "Other T cell"      = "#5A5A5A"
+    "Other T cell"      = "#BAB0AC"
 )
 
-color_map_light <- lighten(color_map, amount = 0.4)
-names(color_map_light) <- names(color_map)
+# ------------------------------------------------------------
+# Outline colour: DARKENED (not lightened) so individual point
+# boundaries stay visible against overlapping neighbours. Darkened
+# further this round (0.35 -> 0.5) since larger points with a heavier
+# stroke need more contrast to read as distinct circles rather than a
+# fused mass at their edges.
+# ------------------------------------------------------------
+color_map_dark <- darken(color_map, amount = 0.5)
+names(color_map_dark) <- names(color_map)
 
 # Factor with explicit levels => legend follows color_map order (not alphabetical),
 # and any label missing from color_map surfaces immediately rather than plotting grey.
@@ -4574,16 +4581,36 @@ umap_df <- umap_df[order(match(umap_df$Celltype, abundance_order)), , drop = FAL
 cat("Draw order (bottom to top, i.e. most to least abundant):\n")
 print(celltype_counts[abundance_order])
 
+# ------------------------------------------------------------
+# Alpha scaled by abundance -- ABUNDANT types get LOWER alpha (so
+# overlapping points in dense clusters show through each other),
+# RARE types get alpha near 1. Range widened slightly (0.35-0.95 ->
+# 0.28-0.95) since larger points overlap MORE at a given density, so
+# the most-abundant end needs to go a bit lower to keep individual
+# cells distinguishable.
+# ------------------------------------------------------------
+ALPHA_RANGE <- c(0.28, 0.95)
+
+abundance_rank <- rank(-celltype_counts[names(color_map)], ties.method = "average")
+normalized_rank <- (abundance_rank - 1) / (length(abundance_rank) - 1)
+alpha_map <- ALPHA_RANGE[1] + normalized_rank * diff(ALPHA_RANGE)
+names(alpha_map) <- names(color_map)
+
+cat("\nAlpha by cell type (low = abundant, high = rare):\n")
+print(round(sort(alpha_map), 3))
+
 p <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2)) +
     geom_point(
-        aes(fill = Celltype, color = Celltype),
+        aes(fill = Celltype, color = Celltype, alpha = Celltype),
         shape  = 21,
-        size   = 1,
-        stroke = 0.05,
-        alpha  = 0.85
+        size   = 2,    # increased from 2 -- larger individual points
+        stroke = 0.40    # increased from 0.18 -- heavier outline scales
+                         # with the larger point size, keeping edges crisp
+                         # rather than proportionally thinner
     ) +
     scale_fill_manual(values  = color_map) +
-    scale_color_manual(values = color_map_light) +
+    scale_color_manual(values = color_map_dark) +
+    scale_alpha_manual(values = alpha_map, guide = "none") +
     theme_void(base_size = 12) +
     theme(
         plot.margin       = margin(10, 10, 10, 10),
@@ -4615,7 +4642,7 @@ ggsave(file.path(save_dir, "UMAP_celltypes_merged_labels_no_legend.png"),
     plot = p_no_legend, width = 5.5, height = 5, dpi = 300)
 ```
 
-## - Fig S2
+## - Fig S1
 
 ```{r}
 # ---- packages ----
@@ -4638,19 +4665,19 @@ gradient_exp <- rev(brewer.pal(9, "RdBu"))
 pad          <- 0.6
 
 color_map <- c(
-    "B cell"          = "#B07AA1",
-    "Plasma cell"   = "#514DAD",
-    "CD14+ monocyte"  = "#F28E2B",
-    "CD16+ monocyte"  = "#FFBE7D",
-    "Mono/Macrophage" = "#BAB0AC",
-    "CD4+ T cell"     = "#9D7660",
-    "CD8+ T cell"     = "#8CD17D",
-    "cDC"             = "#F1CE63",
-    "pDC"             = "#86BCB6",
-    "NK cell"         = "#FABFD2",
-    "Erythroblast"    = "#E15759",
-    "HSPC"            = "#4E79A7",
-    "Other T cell"    = "#5A5A5A"
+    "B cell"            = "#B07AA1",
+    "Plasma cell"   = "#8CD17D",
+    "CD14+ monocyte"    = "#F28E2B",
+    "CD16+ monocyte"    = "#FFBE7D",
+    "Mono/Macrophage"   = "#5A5A5A",
+    "CD4+ T cell"       = "#9D7660",
+    "CD8+ T cell"       = "#514DAD",
+    "cDC"               = "#F1CE63",
+    "pDC"               = "#86BCB6",
+    "NK cell"           = "#FABFD2",
+    "Erythroblast"      = "#E15759",
+    "HSPC"              = "#4E79A7",
+    "Other T cell"      = "#BAB0AC"
 )
 
 # -------------------------------------------------
@@ -5147,7 +5174,7 @@ dir.create(
 cairo_pdf(
     filename = file.path(
         save_dir,
-        "Fig_S2.pdf"
+        "Fig_S1.pdf"
     ),
     width = plot_w,
     height = plot_h
@@ -5160,7 +5187,7 @@ dev.off()
 png(
     filename = file.path(
         save_dir,
-        "Fig_S2.png"
+        "Fig_S1.png"
     ),
     width = plot_w,
     height = plot_h,

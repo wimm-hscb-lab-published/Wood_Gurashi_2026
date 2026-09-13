@@ -557,18 +557,18 @@ colors_top_annotation <-  list(
     'Bi Allelic' = '#b92831'
   ),
   `CNA` = c(
-    'Yes' = '#5B5F97',
-    'No'  = '#C7C9E0'
+    'Yes' = '#5c6098',
+    'No'  = '#c7c9df'
   ),
   `TP53 clone evolution` = c(
-    'Linear' = '#4E79A7',
-    'Parallel' = '#8E6BAA',
-    'Undetermined' = '#D9D9D9'
+    'Linear' = '#507aa8',
+    'Parallel' = '#8f6caa',
+    'Undetermined' = '#d9d9d8'
   ),
   `Co-mutations` = c(
-    'Co-occuring' = '#2A9D8F',
+    'Co-occuring' = '#78bfb4',
     'Independent' = '#CDE7E3',
-    'Both' = '#78BFB4',
+    'Both' = '#1dbfcf',
     'None' = '#D9D9D9'
   )
 )

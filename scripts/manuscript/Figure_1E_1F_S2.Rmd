@@ -1,0 +1,3272 @@
+---
+title: "Figure 1E"
+output: 
+  rmdformats::robobook:
+    lightbox: true
+    fig_caption: true
+---
+
+## - Setting work directories
+  
+Defining work directory within rmarkdown chunk
+
+```{r setup, include=TRUE}
+local_wd_folder = dirname(dirname(dirname(rstudioapi::getSourceEditorContext()$path)))
+knitr::opts_knit$set(root.dir = local_wd_folder)
+```
+
+```{r}
+setwd(local_wd_folder)
+```
+
+## - Setting seed
+
+This step ensures reproducibility in randomized processes
+
+```{r}
+set.seed(seed = 123, kind = "Mersenne-Twister", normal.kind = "Inversion")
+```
+
+## - Options
+
+```{r}
+options(Seurat.object.assay.version = 'v3')
+options(future.globals.maxSize= 891289600*200)
+```
+
+## - Loading packages
+
+```{r}
+reticulate::use_condaenv('/project/meadlab/kgurashi/miniconda3/envs/sceasy')
+```
+
+```{r}
+library(Seurat)
+library(future)
+plan("multisession", workers = 10)
+library(ggplot2)
+library(dplyr)
+library(harmony)
+```
+
+## - Loading palettes
+
+```{r}
+# Load additional colour palette packages
+library(unikn, quietly = TRUE)
+library(RColorBrewer, quietly = TRUE)
+library(yarrr, quietly = TRUE)
+library(scales, quietly = TRUE)
+library(ggsci, quietly = TRUE)
+
+# Define a set of custom color palettes from the unikn package
+mix_1 <- usecol(pal = c(Karpfenblau, "white", Peach), n = 15)
+mix_2 <- usecol(pal = c(rev(pal_seeblau), "white", pal_pinky))
+mix_3 <- usecol(pal = c(rev(pal_bordeaux), "white", pal_petrol), n = 15)
+
+# Display the custom palettes
+seecol(list(mix_1, mix_2, mix_3), col_brd = "white", lwd_brd = 4, title = "Comparing palettes mixed from unikn colors", pal_names = c("mix_1", "mix_2", "mix_3"))
+
+# Define a second set of custom palettes from the RColorBrewer and yarrr packages
+brew_mix <- usecol(c(rev(brewer.pal(n = 4, name = "Reds")), "white", brewer.pal(n = 4, name = "Blues")), n = 13)
+brew_ext <- usecol(brewer.pal(n = 11, name = "Spectral"), n = 12)
+yarrr_mix <- usecol(c(piratepal("nemo"), piratepal("bugs")))
+yarrr_mod <- usecol(c(piratepal("ipod")), n = 9)
+
+gradient_exp <- rev(c('#710D10', '#A21317', brew_mix[1:8], '#E9EBEF'))
+
+# Display the second set of custom palettes
+seecol(pal = list(brew_mix, brew_ext, yarrr_mix, yarrr_mod), col_brd = "white", lwd_brd = 2, title = "Using usecol() and seecol() to mix and modify palettes", pal_names = c("brew_mix", "brew_ext", "yarrr_mix", "yarrr_mod"))
+
+# Define additional custom palettes from the scales package
+natjournals_palette <- pal_npg("nrc")(10)
+```
+
+# 2. Loading integrated protein single cell object
+
+```{r}
+OUT_MERGED <- file.path(local_wd_folder, 'results/integrated/Protein_base_embedding.rds')
+combined <- qs::qread(OUT_MERGED)
+```
+
+# 3. Add metadata
+
+```{r}
+# ============================================================
+# Patient-level metadata -> combined (standalone)
+# ============================================================
+patient_meta <- data.frame(
+    Donor = c(
+        "PT01", "PT02", "PT03", "PT04", "PT05",
+        "PT06", "PT07", "PT08", "PT09", "PT10",
+        "PT11", "PT12", "PT13", "PT14", "PT15",
+        "PT16", "PT17", "PT18", "PT19", "PT20"
+    ),
+    IPSS_M = c(
+        "N/A", "Very High", "Very High", "Very Low", "N/A",
+        "Very High", "N/A", "High", "Very High", "Very High",
+        "Very Low", "Very High", "Very High", "Moderate Low", "Very Low",
+        "Low", "Low", "Moderate Low", "N/A", "N/A"
+    ),
+    WHO = c(
+        "Mono Allelic", "Bi Allelic", "Bi Allelic", "Mono Allelic", "Bi Allelic",
+        "Bi Allelic", "Bi Allelic", "Mono Allelic", "Bi Allelic", "Bi Allelic",
+        "Mono Allelic", "Bi Allelic", "Bi Allelic", "Mono Allelic", "Mono Allelic",
+        "Mono Allelic", "Mono Allelic", "Mono Allelic", "Mono Allelic", "Mono Allelic"
+    ),
+    ICC = c(
+        "Multi Hit", "Multi Hit", "Multi Hit", "Single Hit", "Multi Hit",
+        "Multi Hit", "Multi Hit", "Multi Hit", "Multi Hit", "Multi Hit",
+        "Single Hit", "Multi Hit", "Multi Hit", "Multi Hit", "Single Hit",
+        "Single Hit", "Single Hit", "Single Hit", "Single Hit", "Single Hit"
+    ),
+    CK = c(
+        "Yes", "Yes", "Yes", "No", "Yes",
+        "Yes", "Yes", "Yes", "Yes", "Yes",
+        "No", "Yes", "Yes", "Yes", "No",
+        "No", "No", "No", "No", "No"
+    ),
+    Cytogenetics = c(
+        "Abnormal", "Abnormal", "Abnormal", "Normal", "Abnormal",
+        "Abnormal", "Abnormal", "Abnormal", "Abnormal", "Abnormal",
+        "Abnormal", "Abnormal", "Abnormal", "Abnormal", "Normal",
+        "Abnormal", "Normal", "Not done", "Normal", "Normal"
+    ),
+    No_TP53_vars_in_bulk = c(
+        1, 2, 1, 1, 1,
+        2, 2, 1, 1, 2,
+        1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1
+    ),
+    No_TP53_vars_in_singlecell = c(
+        1, 2, 1, 1, 1,
+        3, 2, 1, 1, 4,
+        1, 1, 1, 3, 1,
+        1, 2, 1, 2, 3
+    ),
+    stringsAsFactors = FALSE
+)
+
+# ------------------------------------------------------------------
+# Add patient-level metadata to combined
+# ------------------------------------------------------------------
+stopifnot(exists("combined"))
+
+idx <- match(as.character(combined$Donor), patient_meta$Donor)
+
+combined$IPSS_M                     <- patient_meta$IPSS_M[idx]
+combined$WHO                        <- patient_meta$WHO[idx]
+combined$ICC                        <- patient_meta$ICC[idx]
+combined$CK                         <- patient_meta$CK[idx]
+combined$Cytogenetics               <- patient_meta$Cytogenetics[idx]
+combined$No_TP53_vars_in_bulk       <- patient_meta$No_TP53_vars_in_bulk[idx]
+combined$No_TP53_vars_in_singlecell <- patient_meta$No_TP53_vars_in_singlecell[idx]
+
+# Optional check: cells with no matched patient metadata
+table(is.na(combined$IPSS_M))
+```
+
+
+# 4. Loading variants data
+
+```{r}
+# ============================================================
+# Load variants per patient,
+# then align their barcodes to combined's Seurat cell names.
+# ============================================================
+
+library(data.table)
+
+stopifnot(exists("combined"), exists("local_wd_folder"))
+
+# ---- Manifest -------------------------------------------------------------------
+variant_manifest <- data.frame(
+    sample_id = c(
+        "PT01", "PT02", "PT03", "PT04", "PT05", "PT06",
+        "PT07", "PT08", "PT09", "PT10", "PT11", "PT12",
+        "PT13", "PT14", "PT15", "PT16", "PT17", "PT18",
+        "PT15_FU", "PT19", "PT20", "PT20_FU"
+    ),
+    experiment = c(
+        "MDS001", "MDS001", "MDS001", "MDS003", "MDS003", "MDS002",
+        "MDS002", "MDS002", "MDS005", "MDS005", "MDS006", "MDS006",
+        "MDS007", "MDS008", "MDS009", "MDS009", "MDS010", "MDS010",
+        "MDS011", "MDS011", "pMDS001", "pMDS002"
+    ),
+    donor = c(
+        "Donor_C", "Donor_B", "Donor_A", "Donor_B", "Donor_A", "Donor_A",
+        "Donor_C", "Donor_B", "Donor_B", "Donor_A", "Donor_A", "Donor_B",
+        "Donor_A", "Donor_A", "Donor_B", "Donor_A", "Donor_A", "Donor_B",
+        "Donor_A", "Donor_B", "Donor_A", "Donor_A"
+    ),
+    stringsAsFactors = FALSE
+)
+stopifnot(!anyDuplicated(variant_manifest$sample_id))
+
+# ---- Curated variants of interest ------------------------------------------------
+curated_variants <- data.frame(
+    pt_id = c(
+        1L, 2L, 2L, 3L,
+        4L, 4L, 4L, 4L, 4L,
+        5L, 5L,
+        6L, 6L, 6L, 6L,
+        7L, 7L, 7L, 7L, 7L,
+        8L,
+        9L, 9L,
+        10L, 10L, 10L, 10L,
+        11L,
+        12L, 12L,
+        13L,
+        14L, 14L, 14L, 14L,
+        15L,
+        16L, 16L, 16L, 16L,
+        17L, 17L, 17L, 17L,
+        18L, 18L, 18L, 18L, 18L,
+        19L, 19L, 19L,
+        20L, 20L, 20L, 20L
+    ),
+    gene = c(
+        "TP53", "TP53", "TP53", "TP53",
+        "ASXL1", "ZRSR2", "TET2", "TET2", "TP53",
+        "TP53", "SETBP1",
+        "TP53", "TP53", "TP53", "SF3B1",
+        "BCORL1", "TP53", "TP53", "SRSF2", "GATA2",
+        "TP53",
+        "TP53", "ASXL1",
+        "TP53", "TP53", "TP53", "TP53",
+        "TP53",
+        "TP53", "CEBPA",
+        "TP53",
+        "TP53", "TP53", "TP53", "DNMT3A",
+        "TP53",
+        "U2AF1", "DNMT3A", "TP53", "DNMT3A",
+        "ASXL1", "TP53", "TP53", "BRAF",
+        "TET2", "DNMT3A", "TP53", "DNMT3A", "PHF6",
+        "TP53", "CALR", "TP53",
+        "TP53", "TP53", "TP53", "BCOR"
+    ),
+    cdna = c(
+        "c.524G>A", "c.818G>A", "c.524G>A", "c.746G>C",
+        "c.1934dup", "c.391_392del", "c.5226dup", "c.1648C>T", "c.329G>A",
+        "c.455C>T", "c.1492C>T",
+        "c.378C>A", "c.818G>A", "c.721T>A", "c.1998G>C",
+        "c.2719del", "c.659A>G", "c.610G>T", "c.(286_732)", "c.194_195delAC",
+        "c.434T>A",
+        "c.537T>G", "c.1927_1929",
+        "c.743G>T", "c.775G>T", "c.1040C>T", "c.818G>A",
+        "c.742C>T",
+        "c.817C>T", "c.847_849del",
+        "c.668C>T",
+        "c.742C>T", "c.817C>T", "c.818G>A", "c.2364_2376dup",
+        "c.524G>C",
+        "c.470A>G", "c.2141C>G", "c.824G>T", "c.1668-2A>G",
+        "c.1934dup", "c.632C>T", "c.830G>A", "c.1397G>C",
+        "c.4621C>T", "c.1228G>A", "c.733G>A", "c.1796del", "c.915T>A",
+        "c.427G>A", "c.1099_1150del", "c.451C>T",
+        "c.337T>G", "c.743G>A", "c.742C>T", "c.1261G>A"
+    ),
+    aa_change = c(
+        "R175H", "R273H", "R175H", "R249T",
+        "G646Wfs*12", "E131Kfs*13", "N1743Qfs*10", "R550*", "R110H",
+        "P152L", "R498W",
+        "Y126*", "R273H", "S241T", "K666N",
+        "T907Lfs*18", "Y220C", "E204*", "P96Rfs*148", "H65Rfs*119",
+        "L145Q",
+        "H179Q", "G643fs*",
+        "R248L", "D259Y", "A347V", "R273H",
+        "R248W",
+        "R273C", "N283del",
+        "P223L",
+        "R248W", "R273C", "R273H", "Y793Tfs*9",
+        "R175P",
+        "Q157R", "S714C", "C275F", NA,
+        "G646Wfs*12", "T211I", "C277Y", "G466A",
+        "Q1541*", "A410T", "G245S", "E599Gfs*52", "C305*",
+        "V143M", "L367Tfs*46", "P151S",
+        "F113V", "R248Q", "R248W", "G421S"
+    ),
+    stringsAsFactors = FALSE
+)
+
+curated_variants$sample_id <- sprintf("PT%02d", curated_variants$pt_id)
+
+fu_inheritance <- c(PT15_FU = "PT15", PT20_FU = "PT20")
+curated_variants <- rbind(
+    curated_variants,
+    do.call(rbind, lapply(names(fu_inheritance), function(fu) {
+        base <- curated_variants[
+            curated_variants$sample_id == fu_inheritance[[fu]], , drop = FALSE
+        ]
+        base$sample_id <- fu
+        base
+    }))
+)
+rownames(curated_variants) <- NULL
+
+# ---- Path helpers -----------------------------------------------------------------
+variant_dir <- function(experiment, donor) {
+    file.path(
+        local_wd_folder, "results", "per_sample", experiment, donor,
+        "dna_cnv", "variants", "all_variants"
+    )
+}
+variant_matrix_path <- function(experiment, donor) {
+    file.path(variant_dir(experiment, donor), "NGT_all_variants.csv")
+}
+variant_metadata_path <- function(experiment, donor) {
+    file.path(variant_dir(experiment, donor), "variant_metadata_all_variants.csv")
+}
+
+# ---- Matching helpers ---------------------------------------------------------------
+norm_key <- function(x) gsub("[[:space:]]+", "", toupper(trimws(as.character(x))))
+
+norm_protein <- function(x) {
+    x   <- trimws(as.character(x))
+    out <- sub("^.*?p\\.", "", x, perl = TRUE)
+    out <- sub("^p\\.", "", out, perl = TRUE)
+    out[!grepl("p\\.", x, perl = TRUE)] <- NA_character_
+    out[is.na(x) | !nzchar(x) | out %in% c("?", "", "NA")] <- NA_character_
+    norm_key(out)
+}
+
+resolve_curated_ids <- function(meta, curated_sub, sample_id) {
+    gene_col <- grep("^gene$",    colnames(meta), ignore.case = TRUE, value = TRUE)[1]
+    cdna_col <- grep("^cdna$",    colnames(meta), ignore.case = TRUE, value = TRUE)[1]
+    prot_col <- grep("^protein$", colnames(meta), ignore.case = TRUE, value = TRUE)[1]
+
+    if (is.na(gene_col) || is.na(cdna_col)) {
+        stop("Metadata for ", sample_id, " lacks Gene/cDNA columns. Have: ",
+             paste(head(colnames(meta), 40), collapse = ", "))
+    }
+
+    meta_key  <- paste(norm_key(meta[[gene_col]]), norm_key(meta[[cdna_col]]))
+    meta_prot <- if (is.na(prot_col)) rep(NA_character_, nrow(meta))
+                 else norm_protein(meta[[prot_col]])
+
+    do.call(rbind, lapply(seq_len(nrow(curated_sub)), function(i) {
+        key  <- paste(norm_key(curated_sub$gene[i]), norm_key(curated_sub$cdna[i]))
+        hits <- which(meta_key == key)
+
+        if (length(hits) > 1 && !is.na(curated_sub$aa_change[i])) {
+            want    <- norm_key(sub("^p\\.", "", curated_sub$aa_change[i]))
+            refined <- hits[which(meta_prot[hits] == want)]
+            if (length(refined) >= 1) hits <- refined
+        }
+
+        data.frame(
+            sample_id  = sample_id,
+            gene       = curated_sub$gene[i],
+            cdna       = curated_sub$cdna[i],
+            aa_change  = curated_sub$aa_change[i],
+            variant_id = if (length(hits) == 0) NA_character_
+                        else meta[[".variant_id"]][hits[1]],
+            n_hits     = length(hits),
+            stringsAsFactors = FALSE
+        )
+    }))
+}
+
+build_label <- function(gene, cdna, aa_change, variant_id) {
+    parts <- strsplit(variant_id, ":", fixed = TRUE)
+    pos   <- vapply(parts, `[`, character(1), 2)
+    refalt <- strsplit(vapply(parts, `[`, character(1), 3), "/", fixed = TRUE)
+    ref <- vapply(refalt, function(x) if (length(x) >= 1) x[1] else "", character(1))
+    alt <- vapply(refalt, function(x) if (length(x) >= 2) x[2] else "", character(1))
+    aa <- ifelse(is.na(aa_change), "NA", aa_change)
+    paste(gene, cdna, aa, pos, ref, alt, sep = "_")
+}
+
+# Same key format used for aligning DNA to combined:
+# <single-cell barcode> + '__' + <terminal sample tag>
+make_cell_key <- function(cell_names) {
+    key <- sub(
+        "^.*(?:\\.|_)([^._]+)_(PT[0-9]+(?:FU)?)$",
+        "\\1__\\2",
+        cell_names,
+        perl = TRUE
+    )
+    valid <- grepl(
+        "^.*(?:\\.|_)[^._]+_(PT[0-9]+(?:FU)?)$",
+        cell_names,
+        perl = TRUE
+    )
+    key[!valid] <- NA_character_
+    key
+}
+
+align_curated_dna_to_seurat <- function(df, sample_id, sample_id_to_suffix,
+                                        seurat_name_lookup) {
+    suffix   <- sample_id_to_suffix[[sample_id]]
+    dna_keys <- paste0(rownames(df), "__", suffix)
+
+    matched_seurat_names <- unname(seurat_name_lookup[dna_keys])
+    matched_idx <- !is.na(matched_seurat_names)
+
+    new_rownames <- rownames(df)
+    new_rownames[matched_idx] <- matched_seurat_names[matched_idx]
+
+    if (anyDuplicated(new_rownames)) {
+        stop("Duplicate row names created while aligning ", sample_id, " to combined.")
+    }
+
+    rownames(df) <- new_rownames
+    attr(df, "n_matched_to_seurat")   <- sum(matched_idx)
+    attr(df, "n_unmatched_to_seurat") <- sum(!matched_idx)
+    df
+}
+
+# ---- Per-sample load + resolve + targeted read -------------------------------------
+DNA_data_list   <- setNames(vector("list", nrow(variant_manifest)),
+                            variant_manifest$sample_id)
+resolution_list <- list()
+
+for (i in seq_len(nrow(variant_manifest))) {
+    sample_id  <- variant_manifest$sample_id[i]
+    experiment <- variant_manifest$experiment[i]
+    donor      <- variant_manifest$donor[i]
+
+    curated_sub <- curated_variants[curated_variants$sample_id == sample_id, ,
+                                    drop = FALSE]
+    if (nrow(curated_sub) == 0) {
+        message("Skipping ", sample_id, " — no curated variants")
+        next
+    }
+
+    message("Loading ", sample_id, " (", experiment, "/", donor, "), ",
+            nrow(curated_sub), " curated variant(s) ...")
+
+    meta_path <- variant_metadata_path(experiment, donor)
+    if (!file.exists(meta_path)) stop("Metadata not found: ", meta_path)
+
+    meta <- as.data.frame(
+        fread(meta_path, header = TRUE, check.names = FALSE, showProgress = FALSE)
+    )
+    meta[[".variant_id"]] <- as.character(meta[[1]])
+
+    resolved <- resolve_curated_ids(meta, curated_sub, sample_id)
+    resolution_list[[sample_id]] <- resolved
+
+    found_ids <- unique(na.omit(resolved$variant_id))
+    if (length(found_ids) == 0) {
+        warning("No curated variant resolved for ", sample_id)
+        rm(meta); gc(verbose = FALSE)
+        next
+    }
+    rm(meta); gc(verbose = FALSE)
+
+    ngt_path <- variant_matrix_path(experiment, donor)
+    if (!file.exists(ngt_path)) stop("NGT matrix not found: ", ngt_path)
+
+    header <- names(fread(ngt_path, nrows = 0, check.names = FALSE))
+    bc_col <- header[1]
+
+    missing_cols <- setdiff(found_ids, header)
+    if (length(missing_cols) > 0) {
+        stop("Resolved variant ID(s) absent from the NGT header for ",
+             sample_id, ": ", paste(head(missing_cols, 3), collapse = ", "))
+    }
+
+    ngt_dt <- fread(
+        ngt_path, select = c(bc_col, found_ids),
+        header = TRUE, check.names = FALSE, showProgress = FALSE
+    )
+
+    barcodes <- as.character(ngt_dt[[bc_col]])
+    ngt_dt[, (bc_col) := NULL]
+
+    ngt <- as.matrix(ngt_dt)
+    storage.mode(ngt) <- "integer"
+    rownames(ngt) <- barcodes
+
+    lab <- resolved[!is.na(resolved$variant_id), , drop = FALSE]
+    lab$label <- build_label(lab$gene, lab$cdna, lab$aa_change, lab$variant_id)
+
+    colnames(ngt) <- make.unique(
+        lab$label[match(colnames(ngt), lab$variant_id)], sep = "."
+    )
+
+    DNA_data_list[[sample_id]] <- as.data.frame(ngt, check.names = FALSE)
+
+    rm(ngt_dt, ngt)
+    gc(verbose = FALSE)
+}
+
+DNA_data_list <- Filter(Negate(is.null), DNA_data_list)
+
+# ---- Resolution report --------------------------------------------------------------
+resolution_summary <- do.call(rbind, unname(resolution_list))
+rownames(resolution_summary) <- NULL
+
+unresolved <- resolution_summary[is.na(resolution_summary$variant_id), , drop = FALSE]
+if (nrow(unresolved) > 0) {
+    cat("Unresolved (", nrow(unresolved), ") — likely non-standard HGVS or ",
+        "homopolymer left-alignment mismatch:\n", sep = "")
+    print(unresolved[, c("sample_id", "gene", "cdna", "aa_change")], row.names = FALSE)
+}
+
+ambiguous <- resolution_summary[resolution_summary$n_hits > 1, , drop = FALSE]
+if (nrow(ambiguous) > 0) {
+    cat("\nAmbiguous — several coordinate IDs shared one gene+cDNA:\n")
+    print(ambiguous[, c("sample_id", "gene", "cdna", "aa_change", "n_hits")],
+          row.names = FALSE)
+}
+
+cat("\nLoaded matrices (pre-alignment):\n")
+print(data.frame(
+    Sample     = names(DNA_data_list),
+    n_cells    = vapply(DNA_data_list, nrow, integer(1)),
+    n_variants = vapply(DNA_data_list, ncol, integer(1)),
+    row.names  = NULL
+), row.names = FALSE)
+
+# ---- Align every matrix's barcodes to combined ---------------------------------------
+sample_id_to_suffix <- setNames(
+    gsub("_FU$", "FU", names(DNA_data_list)),
+    names(DNA_data_list)
+)
+
+seurat_cells <- colnames(combined)
+seurat_keys  <- make_cell_key(seurat_cells)
+
+if (anyNA(seurat_keys)) {
+    stop("Could not parse ", sum(is.na(seurat_keys)), " Seurat cell names.")
+}
+if (anyDuplicated(seurat_keys)) {
+    stop("Duplicated Seurat barcode/sample keys detected.")
+}
+
+seurat_name_lookup <- setNames(seurat_cells, seurat_keys)
+
+DNA_data_list <- setNames(
+    lapply(names(DNA_data_list), function(sample_id) {
+        align_curated_dna_to_seurat(
+            DNA_data_list[[sample_id]], sample_id,
+            sample_id_to_suffix, seurat_name_lookup
+        )
+    }),
+    names(DNA_data_list)
+)
+
+for (sample_id in names(DNA_data_list)) {
+    assign(paste0("DNA_", sample_id), DNA_data_list[[sample_id]], envir = .GlobalEnv)
+}
+
+# ---- Alignment report -----------------------------------------------------------------
+alignment_summary <- do.call(rbind, lapply(names(DNA_data_list), function(sample_id) {
+    df <- DNA_data_list[[sample_id]]
+    data.frame(
+        sample_id   = sample_id,
+        n_cells     = nrow(df),
+        n_matched   = attr(df, "n_matched_to_seurat"),
+        n_unmatched = attr(df, "n_unmatched_to_seurat"),
+        stringsAsFactors = FALSE
+    )
+}))
+
+print(alignment_summary, row.names = FALSE)
+cat("\nTotal matched across all samples:", sum(alignment_summary$n_matched),
+    "/", sum(alignment_summary$n_cells), "\n")
+```
+
+```{r}
+# ============================================================
+# Drop unmatched cells from each curated DNA matrix, then add
+# the variant genotype columns as metadata on `combined`.
+# ============================================================
+# Only cells present in `combined` can be attached as metadata, so unmatched
+# rows (attr n_unmatched_to_seurat) are dropped per sample first. Columns are
+# added by cell name via combined@meta.data[rownames(df), col] <- df[[col]],
+# so cells absent from a given sample's matrix keep NA rather than getting
+# overwritten with something spurious.
+
+stopifnot(exists("DNA_data_list"), exists("combined"))
+
+# ---- 1. Drop unmatched rows from every sample's matrix -----------------------
+DNA_data_list_matched <- lapply(names(DNA_data_list), function(sample_id) {
+    df <- DNA_data_list[[sample_id]]
+    matched <- rownames(df) %in% colnames(combined)
+
+    n_before <- nrow(df)
+    df <- df[matched, , drop = FALSE]
+
+    message(sample_id, ": kept ", nrow(df), " / ", n_before,
+            " cells (dropped ", n_before - nrow(df), " unmatched)")
+
+    df
+})
+names(DNA_data_list_matched) <- names(DNA_data_list)
+
+DNA_data_list <- DNA_data_list_matched
+rm(DNA_data_list_matched)
+
+for (sample_id in names(DNA_data_list)) {
+    assign(paste0("DNA_", sample_id), DNA_data_list[[sample_id]], envir = .GlobalEnv)
+}
+
+# ---- 2. Combine matched cells across samples into one variant matrix --------
+# Column union across samples, since not every patient carries every curated
+# variant; missing genotypes default to 0 (WT/no-call), matching the earlier
+# SNV-matrix convention (`x[is.na(x)] <- 0`).
+all_variant_cols <- unique(unlist(lapply(DNA_data_list, colnames), use.names = FALSE))
+
+DNA_variants_aligned <- lapply(DNA_data_list, function(df) {
+    missing_cols <- setdiff(all_variant_cols, colnames(df))
+    for (col_name in missing_cols) df[[col_name]] <- 0L
+    df[, all_variant_cols, drop = FALSE]
+})
+
+DNA_variants_combined <- do.call(rbind, unname(DNA_variants_aligned))
+
+if (anyDuplicated(rownames(DNA_variants_combined))) {
+    stop("Duplicate cell names across samples after alignment — check for ",
+         "cells matched in more than one sample's matrix.")
+}
+
+cat("\nCombined variant matrix:", nrow(DNA_variants_combined), "cells x",
+    ncol(DNA_variants_combined), "variants\n")
+
+# ---- 3. Attach as metadata on combined ---------------------------------------
+# Cells not present in DNA_variants_combined (no curated variant data, or
+# excluded earlier) are left as NA in combined@meta.data for these columns.
+for (col_name in all_variant_cols) {
+    combined@meta.data[[col_name]] <- NA_integer_
+    combined@meta.data[rownames(DNA_variants_combined), col_name] <-
+        DNA_variants_combined[[col_name]]
+}
+
+cat("\nAdded", length(all_variant_cols), "variant column(s) to combined metadata:\n")
+print(all_variant_cols)
+
+cat("\nCells with at least one curated variant genotype available:",
+    sum(colnames(combined) %in% rownames(DNA_variants_combined)),
+    "/", ncol(combined), "\n")
+```
+
+```{r}
+# ============================================================
+# TP53 status per cell, derived from curated TP53 variant genotypes
+# ============================================================
+# TP53_ columns are the curated TP53 variant genotypes just attached to
+# combined@meta.data (build_label() prefixes every TP53 variant with
+# "TP53_"). Only the columns belonging to a cell's own sample are non-NA
+# for that cell — every other sample's TP53 columns stay NA, since that
+# sample's matrix never had a row for this cell — so classification is done
+# per cell over whichever TP53_ columns are actually populated for it.
+#
+# Priority when a cell has more than one TP53 variant: MUT > nGT > WT.
+# A single called mutant genotype (1/2) makes the cell MUT even if another
+# curated TP53 site is a no-call (3); nGT is reserved for cells where every
+# curated TP53 site failed to genotype.
+
+tp53_cols <- grep("^TP53_", colnames(combined@meta.data), value = TRUE)
+
+if (length(tp53_cols) == 0) {
+    stop("No TP53_ variant columns found in combined@meta.data. ",
+         "Run the variant-metadata-attachment step first.")
+}
+
+cat("TP53 variant columns used:\n")
+print(tp53_cols)
+
+tp53_mat <- as.matrix(combined@meta.data[, tp53_cols, drop = FALSE])
+
+has_data <- rowSums(!is.na(tp53_mat)) > 0
+has_mut  <- rowSums(!is.na(tp53_mat) & tp53_mat %in% c(1, 2), na.rm = TRUE) > 0
+# Recompute has_mut correctly per-row (the line above misuses %in% on a matrix;
+# do it row-wise instead).
+has_mut  <- apply(tp53_mat, 1, function(x) any(x %in% c(1, 2), na.rm = TRUE))
+has_ngt  <- apply(tp53_mat, 1, function(x) any(x == 3, na.rm = TRUE))
+all_wt   <- apply(tp53_mat, 1, function(x) {
+    nx <- x[!is.na(x)]
+    length(nx) > 0 && all(nx == 0)
+})
+
+combined$TP53 <- NA_character_
+combined$TP53[has_data & has_mut]                 <- "MUT"
+combined$TP53[has_data & !has_mut & has_ngt]       <- "nGT"
+combined$TP53[has_data & !has_mut & !has_ngt & all_wt] <- "WT"
+
+cat("\nTP53 status:\n")
+print(table(combined$TP53, useNA = "ifany"))
+```
+
+# 5. Loading clonal and CNA data
+
+```{r}
+# ============================================================
+# Load per-sample CNA/structural-variant data and attach to combined
+# — combined is never subset; unmatched cells simply get NA
+# ============================================================
+
+# ---- Manifest -----------------------------------------------------------------
+dna_manifest <- data.frame(
+    sample_id  = c(
+        "PT01", "PT02", "PT03", "PT04", "PT05", "PT06",
+        "PT07", "PT08", "PT09", "PT10", "PT11", "PT12",
+        "PT13", "PT14", "PT15", "PT16", "PT17", "PT18",
+        "PT15_FU", "PT19", "PT20", "PT20_FU"
+    ),
+    experiment = c(
+        "MDS001", "MDS001", "MDS001", "MDS003", "MDS003", "MDS002",
+        "MDS002", "MDS002", "MDS005", "MDS005", "MDS006", "MDS006",
+        "MDS007", "MDS008", "MDS009", "MDS009", "MDS010", "MDS010",
+        "MDS011", "MDS011", "pMDS001", "pMDS002"
+    ),
+    donor = c(
+        "Donor_C", "Donor_B", "Donor_A", "Donor_B", "Donor_A", "Donor_A",
+        "Donor_C", "Donor_B", "Donor_B", "Donor_A", "Donor_A", "Donor_B",
+        "Donor_A", "Donor_A", "Donor_B", "Donor_A", "Donor_A", "Donor_B",
+        "Donor_A", "Donor_B", "Donor_A", "Donor_A"
+    ),
+    stringsAsFactors = FALSE
+)
+
+# Barcode suffix has no underscore for the two follow-up samples
+# (PT15_FU -> PT15FU, PT20_FU -> PT20FU); every other sample's suffix
+# equals its sample_id.
+dna_manifest$suffix <- gsub("_FU$", "FU", dna_manifest$sample_id)
+
+stopifnot(!anyDuplicated(dna_manifest$sample_id))
+stopifnot(exists("combined"))
+
+# ---- 1. Load per-sample aberrancy tables, rename barcodes, merge --------------
+read_dna_data <- function(experiment, donor) {
+    read.csv(
+        file.path(
+            local_wd_folder, "results", "per_sample", experiment, donor,
+            "dna_cnv", "matrices", "All_aberrancies.csv"
+        ),
+        header    = TRUE,
+        row.names = "NGT"
+    )
+}
+
+# Handles both raw barcodes and the previously added PT_IDxx.<barcode>_PTxx form.
+rename_dna_cell_barcodes <- function(dna_df, sample_id, suffix) {
+    barcode <- rownames(dna_df)
+    if (is.null(barcode)) stop("DNA data frame has no row names.")
+
+    barcode <- sub("^PT_ID[0-9]+(?:_FU)?\\.", "", barcode)
+    barcode <- sub("^PT[0-9]+(?:_FU)?\\.PT[0-9]+(?:_FU)?_", "", barcode)
+    barcode <- sub("_(PT[0-9]+(?:FU)?)$", "", barcode)
+
+    new_barcodes <- paste0(sample_id, ".", sample_id, "_", barcode, "_", suffix)
+
+    if (anyDuplicated(new_barcodes)) {
+        stop("Duplicate DNA barcodes detected after renaming for ", sample_id)
+    }
+
+    rownames(dna_df) <- new_barcodes
+    dna_df
+}
+
+dna_samples <- setNames(
+    lapply(seq_len(nrow(dna_manifest)), function(i) {
+        df <- read_dna_data(dna_manifest$experiment[i], dna_manifest$donor[i])
+        rename_dna_cell_barcodes(
+            df, dna_manifest$sample_id[i], dna_manifest$suffix[i]
+        )
+    }),
+    dna_manifest$sample_id
+)
+
+head(rownames(dna_samples[["PT01"]]))
+# PT01.PT01_AACAATGCACCGTACGGA_PT01
+
+# ---- Align columns across samples and merge -----------------------------------
+all_dna_columns <- unique(unlist(lapply(dna_samples, colnames), use.names = FALSE))
+all_dna_columns <- c("label", setdiff(all_dna_columns, "label"))  # "label" first
+
+dna_samples_aligned <- lapply(dna_samples, function(df) {
+    missing_columns <- setdiff(all_dna_columns, colnames(df))
+    for (column_name in missing_columns) df[[column_name]] <- NA
+    df[, all_dna_columns, drop = FALSE]
+})
+
+all_cell_barcodes <- unlist(lapply(dna_samples_aligned, rownames), use.names = FALSE)
+if (anyDuplicated(all_cell_barcodes)) {
+    stop("Duplicated DNA cell barcodes detected after alignment: ",
+         paste(unique(all_cell_barcodes[duplicated(all_cell_barcodes)]), collapse = ", "))
+}
+
+# unname() prevents the sample_id from being added as a row-name prefix.
+DNA_combined <- do.call(rbind, unname(dna_samples_aligned))
+
+# "label" -> "Clone" throughout.
+colnames(DNA_combined)[colnames(DNA_combined) == "label"] <- "Clone"
+
+NON_WT_cells <- rownames(DNA_combined)[
+    !is.na(DNA_combined$Clone) & DNA_combined$Clone != "WT"
+]
+
+# ---- 2. Chromosome-aware column ordering (for the CNA/structural-variant block) ----
+chr_rank <- function(x) {
+    chr <- sub("^chr([0-9]+|X|Y).*$", "\\1", x)
+    out <- rep(NA_real_, length(chr))
+    out[chr %in% as.character(1:22)] <- as.numeric(chr[chr %in% as.character(1:22)])
+    out[chr == "X"] <- 23
+    out[chr == "Y"] <- 24
+    out
+}
+
+chr_name <- function(x) sub("^chr([0-9]+|X|Y).*$", "\\1", x)
+
+cn <- colnames(DNA_combined)
+meta_cols <- intersect(c("Clone", "sample_id"), cn)
+
+whole_chr <- grep("^chr([0-9]+|X|Y)$", cn, value = TRUE)
+arms      <- grep("^chr([0-9]+|X|Y)(p|q)$", cn, value = TRUE)
+# Point-mutation columns are excluded entirely — genotypes already exist on
+# `combined` from the curated-variant workflow, so only Clone + CNA/arm
+# columns are carried forward from here.
+
+chroms_present <- unique(chr_name(c(whole_chr, arms)))
+chroms_present <- chroms_present[order(chr_rank(paste0("chr", chroms_present)))]
+
+ordered_cols <- meta_cols
+for (ch in chroms_present) {
+    this_chr <- paste0("chr", ch)
+
+    wc <- whole_chr[whole_chr == this_chr]
+
+    this_arms <- arms[grepl(paste0("^", this_chr, "(p|q)$"), arms)]
+    this_arms <- this_arms[order(sub(paste0("^", this_chr, "(p|q)$"), "\\1", this_arms))]
+
+    ordered_cols <- c(ordered_cols, wc, this_arms)
+}
+
+# ---- 3. Keep Clone + CNA/structural-variant columns only -----------------------
+cna_feature_cols <- c(whole_chr, arms)
+cna_ordered_cols <- ordered_cols[ordered_cols %in% c(meta_cols, cna_feature_cols)]
+
+all_aberr_cna_df <- DNA_combined[, cna_ordered_cols, drop = FALSE]
+
+# A missing CNA call means no aberrancy was recorded for that region.
+all_aberr_cna_df[, cna_feature_cols] <- lapply(
+    all_aberr_cna_df[, cna_feature_cols, drop = FALSE],
+    function(x) { x[is.na(x)] <- "WT"; x }
+)
+
+DNA_combined_CNV <- all_aberr_cna_df
+
+dim(DNA_combined_CNV)
+head(colnames(DNA_combined_CNV))
+
+# ---- 4. Infer whole-chromosome events from matching p/q arm states, ------------
+#         then reorder: metadata, whole chromosome, p arm, q arm
+arm_cols  <- grep("^chr([0-9]+|X|Y)(p|q)$", colnames(all_aberr_cna_df), value = TRUE)
+chr_names <- unique(sub("^(chr[0-9]+|chrX|chrY)(p|q)$", "\\1", arm_cols))
+
+for (ch in chr_names) {
+    p_col <- paste0(ch, "p")
+    q_col <- paste0(ch, "q")
+
+    if (!p_col %in% colnames(all_aberr_cna_df) ||
+        !q_col %in% colnames(all_aberr_cna_df)) next
+    if (ch %in% colnames(all_aberr_cna_df)) next  # don't overwrite an existing column
+
+    p_vals <- as.character(all_aberr_cna_df[[p_col]])
+    q_vals <- as.character(all_aberr_cna_df[[q_col]])
+
+    whole_chr_state <- rep("WT", nrow(all_aberr_cna_df))
+    whole_chr_state[p_vals == "Del"   & q_vals == "Del"]   <- "Monosomy"
+    whole_chr_state[p_vals == "Amp"   & q_vals == "Amp"]   <- "Trisomy"
+    whole_chr_state[p_vals == "cnLOH" & q_vals == "cnLOH"] <- "cnLOH"
+
+    if (any(whole_chr_state != "WT")) {
+        all_aberr_cna_df[[ch]] <- whole_chr_state
+        message("Created ", ch, ": ",
+                sum(whole_chr_state == "Monosomy"), " Monosomy, ",
+                sum(whole_chr_state == "Trisomy"), " Trisomy, ",
+                sum(whole_chr_state == "cnLOH"), " cnLOH")
+    }
+}
+
+cn <- colnames(all_aberr_cna_df)
+meta_cols <- intersect(c("Clone", "sample_id"), cn)
+
+whole_chr_cols <- grep("^chr([0-9]+|X|Y)$", cn, value = TRUE)
+arm_cols       <- grep("^chr([0-9]+|X|Y)(p|q)$", cn, value = TRUE)
+
+chromosomes <- unique(sub("^chr([0-9]+|X|Y).*$", "\\1", c(whole_chr_cols, arm_cols)))
+chromosomes <- chromosomes[order(chr_rank(paste0("chr", chromosomes)))]
+
+ordered_cna_cols <- meta_cols
+for (ch in chromosomes) {
+    chrom <- paste0("chr", ch)
+    ordered_cna_cols <- c(
+        ordered_cna_cols,
+        intersect(chrom, whole_chr_cols),
+        intersect(paste0(chrom, "p"), arm_cols),
+        intersect(paste0(chrom, "q"), arm_cols)
+    )
+}
+
+all_aberr_cna_df <- all_aberr_cna_df[, ordered_cna_cols, drop = FALSE]
+
+# ---- 5. Align to combined's Seurat cell names ----------------------------------
+# Key: <single-cell barcode> + <terminal sample tag>, e.g.
+# PT02.PT02_AACAACTGGGGTAGACAT_PT02  and  PT_ID02.AACAACTGGGGTAGACAT_PT02
+# both map to AACAACTGGGGTAGACAT__PT02.
+make_cell_key <- function(cell_names) {
+    key <- sub("^.*(?:\\.|_)([^._]+)_(PT[0-9]+(?:FU)?)$", "\\1__\\2", cell_names, perl = TRUE)
+    valid <- grepl("^.*(?:\\.|_)[^._]+_(PT[0-9]+(?:FU)?)$", cell_names, perl = TRUE)
+    key[!valid] <- NA_character_
+    key
+}
+
+align_dna_rownames_to_seurat <- function(dna_df, seurat_cells) {
+    dna_keys    <- make_cell_key(rownames(dna_df))
+    seurat_keys <- make_cell_key(seurat_cells)
+
+    if (anyNA(dna_keys))    stop("Could not parse ", sum(is.na(dna_keys)), " DNA cell names.")
+    if (anyNA(seurat_keys)) stop("Could not parse ", sum(is.na(seurat_keys)), " Seurat cell names.")
+    if (anyDuplicated(dna_keys))    stop("Duplicated DNA barcode/sample keys detected.")
+    if (anyDuplicated(seurat_keys)) stop("Duplicated Seurat barcode/sample keys detected.")
+
+    seurat_name_lookup   <- setNames(seurat_cells, seurat_keys)
+    matched_seurat_names <- unname(seurat_name_lookup[dna_keys])
+    matched_idx          <- !is.na(matched_seurat_names)
+
+    new_dna_names <- rownames(dna_df)
+    new_dna_names[matched_idx] <- matched_seurat_names[matched_idx]
+
+    if (anyDuplicated(new_dna_names)) stop("Duplicate DNA row names created during alignment.")
+
+    rownames(dna_df) <- new_dna_names
+    attr(dna_df, "n_matched_to_seurat")   <- sum(matched_idx)
+    attr(dna_df, "n_unmatched_to_seurat") <- sum(!matched_idx)
+    dna_df
+}
+
+all_aberr_cna_df <- align_dna_rownames_to_seurat(all_aberr_cna_df, colnames(combined))
+
+message("CNA rows matched: ", attr(all_aberr_cna_df, "n_matched_to_seurat"),
+        " / ", nrow(all_aberr_cna_df))
+
+sum(rownames(all_aberr_cna_df) %in% colnames(combined))
+
+# ---- 6. Attach Clone + CNA columns to combined (no subsetting) -----------------
+# `combined` retains every cell; only cells with a matched DNA row get real
+# values in the new columns, everything else stays NA. Subsetting to
+# DNA-matched cells is deferred to whatever downstream step needs it.
+matched <- rownames(all_aberr_cna_df) %in% colnames(combined)
+all_aberr_cna_df_matched <- all_aberr_cna_df[matched, , drop = FALSE]
+
+message("Cells with matched CNA metadata: ", sum(matched),
+        " / ", length(matched), " (", sum(!matched), " unmatched, left as NA)")
+
+attach_cols <- setdiff(colnames(all_aberr_cna_df_matched), "sample_id")
+
+for (col_name in attach_cols) {
+    combined@meta.data[[col_name]] <- NA
+    combined@meta.data[rownames(all_aberr_cna_df_matched), col_name] <-
+        all_aberr_cna_df_matched[[col_name]]
+}
+
+cat("Added", length(attach_cols), "column(s) to combined metadata:\n")
+print(attach_cols)
+
+# combined still has ncol(combined) cells — unchanged.
+ncol(combined)
+```
+
+# 6. Add TP53 Status
+
+```{r}
+# ============================================================
+# TP53_Status on combined_dna_pro (standalone)
+# ============================================================
+# Both the curated TP53/other variant genotypes (section 4) and the
+# CNA/structural-variant columns (section "Loading clonal and CNA data") were
+# attached directly to combined@meta.data — there is no separate DNA data
+# frame left to intersect against. "DNA-matched" here means cells with at
+# least one non-NA curated variant genotype, i.e. combined$TP53 is not NA.
+stopifnot(exists("combined"))
+tp53_cols <- grep("^TP53_", colnames(combined@meta.data), value = TRUE)
+tp53_cols <- setdiff(tp53_cols, c("TP53_Status", "TP53_Het_count", "TP53_Hem_flag"))
+if (length(tp53_cols) == 0) {
+    stop("No TP53 protein-level mutation columns were found. Run the ",
+         "variant-metadata-attachment step (section 4) first.")
+}
+# ---- Subset to cells with matched DNA (curated variant) metadata --------------
+Idents(combined) <- combined$Celltype_revised_refined
+common_cells <- colnames(combined)[!is.na(combined$TP53)]
+message("Cells in combined Seurat object: ", ncol(combined))
+message("Cells with matched DNA metadata: ", length(common_cells))
+combined_dna_pro <- subset(combined, cells = common_cells)
+table(combined_dna_pro$IPSS_M, useNA = "ifany")
+
+# ---- Derive TP53_Status ---------------------------------------------------------
+# TP53_<label> columns are named like TP53_R175H_..., with
+# 0 = WT, 1 = HET, 2 = HOM/HEM (per the curated-variant NGT convention).
+#
+# Multi-Hit  = >=2 distinct HET variants, OR any HOM/HEM call
+# Single-Hit = exactly one HET variant and no HOM/HEM call
+# WT         = no called variant at all
+# (Complex karyotype (CK) is retained as its own annotation column but no
+# longer promotes a lone het to Multi-Hit.)
+tp53_mat <- as.matrix(combined_dna_pro@meta.data[, tp53_cols, drop = FALSE])
+suppressWarnings(storage.mode(tp53_mat) <- "numeric")
+tp53_het_count <- rowSums(!is.na(tp53_mat) & tp53_mat == 1)
+tp53_hem_flag  <- rowSums(!is.na(tp53_mat) & tp53_mat >= 2) > 0
+
+combined_dna_pro$TP53_Status <- ifelse(
+    tp53_hem_flag | tp53_het_count >= 2,
+    "Multi-Hit",
+    ifelse(tp53_het_count == 1, "Single-Hit", "WT")
+)
+combined_dna_pro$TP53_Status <- factor(
+    combined_dna_pro$TP53_Status,
+    levels = c("WT", "Single-Hit", "Multi-Hit")
+)
+table(combined_dna_pro$TP53_Status, useNA = "ifany")
+table(combined_dna_pro$TP53_Status, combined_dna_pro$WHO, useNA = "ifany")
+```
+
+# 7. Saving results
+
+```{r}
+sceasy::convertFormat(obj = combined_dna_pro,
+                      outFile = file.path(local_wd_folder, 'results/integrated/DNA_Integrated.h5ad'),
+                      from="seurat", to="anndata",
+                      assay = 'ADT', main_layer = 'data')
+```
+
+```{r}
+OUT_MERGED <- file.path(local_wd_folder, 'results/integrated/DNA_Integrated.rds')
+qs::qsave(combined_dna_pro, OUT_MERGED)
+OUT_MERGED
+```
+
+# 8. Investigating co-mutations
+
+```{r}
+# ============================================================
+# Per-sample clonal heatmap: VAF-by-clone + CNA-by-clone panels
+# ============================================================
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+  library(scales)
+  library(grid)
+})
+
+# ---- Column identification --------------------------------------------------
+get_variant_cols <- function(meta) grep("_c\\.", colnames(meta), value = TRUE)
+get_chr_cols     <- function(meta) grep("^chr([0-9]+|X|Y)(p|q)?$", colnames(meta), value = TRUE)
+
+# ---- Chromosome ordering helpers ---------------------------------------------
+# Numeric sort key for chr1..chr22, chrX, chrY.
+chr_rank <- function(chr_name) {
+    n <- sub("^chr", "", chr_name)
+    out <- rep(NA_real_, length(n))
+    is_num <- grepl("^[0-9]+$", n)
+    out[is_num] <- as.numeric(n[is_num])
+    out[n == "X"] <- 23
+    out[n == "Y"] <- 24
+    out
+}
+
+# Base chromosome name (drops trailing p/q) and arm suffix, for grouping and
+# within-group ordering (whole chr, then p, then q).
+chr_base <- function(col_names) sub("^(chr([0-9]+|X|Y))(p|q)?$", "\\1", col_names)
+chr_arm  <- function(col_names) {
+    arm <- sub("^chr([0-9]+|X|Y)(p|q)?$", "\\2", col_names)
+    factor(arm, levels = c("", "p", "q"))  # whole chr first, then p, then q
+}
+
+# Order a vector of chr/arm column names by chromosome, then whole/p/q.
+order_chr_cols <- function(cols) {
+    base <- chr_base(cols)
+    arm  <- chr_arm(cols)
+    cols[order(chr_rank(base), arm)]
+}
+
+# ---- Helpers ------------------------------------------------------------------
+get_mode <- function(x) {
+    x <- x[!is.na(x) & x != ""]
+    if (length(x) == 0) return(NA_character_)
+    ux <- unique(x)
+    ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Genotype columns may come back as factor/character (e.g. after alignment
+# steps that filled missing columns with NA of a different type) rather than
+# numeric — coerce safely so 1/2 comparisons don't silently fail.
+as_numeric_geno <- function(x) {
+    if (is.factor(x)) x <- as.character(x)
+    suppressWarnings(as.numeric(x))
+}
+
+discrete_colors <- function(levels, palette = NULL) {
+    levels <- unique(levels[!is.na(levels)])
+    if (is.null(palette)) return(setNames(scales::hue_pal()(length(levels)), levels))
+    if (!is.null(names(palette))) {
+        missing <- setdiff(levels, names(palette))
+        if (length(missing) > 0) {
+            palette <- c(palette, setNames(scales::hue_pal()(length(missing)), missing))
+        }
+        return(palette[levels])
+    }
+    setNames(palette[seq_along(levels)], levels)
+}
+
+# Wrap a long "_"-delimited label onto two lines, breaking at whichever
+# underscore lands closest to the string's midpoint. Labels with no
+# underscore (or too short to bother) are left as-is. Display-only — never
+# apply this to the vector used for matching/indexing.
+wrap_label_two_lines <- function(x, sep = "_", min_len = 15) {
+    vapply(x, function(lbl) {
+        if (is.na(lbl) || nchar(lbl) < min_len) return(lbl)
+        parts <- strsplit(lbl, sep, fixed = TRUE)[[1]]
+        if (length(parts) <= 1) return(lbl)
+        cum_len  <- cumsum(nchar(parts) + 1)  # +1 accounts for the separator
+        target   <- utils::tail(cum_len, 1) / 2
+        split_at <- which.min(abs(cum_len - target))
+        split_at <- min(max(split_at, 1), length(parts) - 1)
+        line1 <- paste(parts[seq_len(split_at)], collapse = sep)
+        line2 <- paste(parts[(split_at + 1):length(parts)], collapse = sep)
+        paste(line1, line2, sep = "\n")
+    }, character(1), USE.NAMES = FALSE)
+}
+
+clone_vaf_matrix <- function(sub_meta, clones, variant_cols) {
+    mat <- matrix(NA_real_, nrow = length(clones), ncol = length(variant_cols),
+                  dimnames = list(clones, variant_cols))
+    for (cl in clones) {
+        cells <- rownames(sub_meta)[sub_meta$Clone == cl & !is.na(sub_meta$Clone)]
+        if (length(cells) == 0) next
+        g <- sub_meta[cells, variant_cols, drop = FALSE]
+        g <- as.matrix(as.data.frame(lapply(g, as_numeric_geno)))
+        n_wt  <- colSums(g == 0, na.rm = TRUE)
+        n_het <- colSums(g == 1, na.rm = TRUE)
+        n_hom <- colSums(g == 2, na.rm = TRUE)
+        n_gt  <- n_wt + n_het + n_hom
+        mat[cl, ] <- ifelse(n_gt > 0, (n_het + 2 * n_hom) / (2 * n_gt), NA_real_)
+    }
+    mat
+}
+
+clone_cna_matrix <- function(sub_meta, clones, chr_cols) {
+    mat <- matrix(NA_character_, nrow = length(clones), ncol = length(chr_cols),
+                  dimnames = list(clones, chr_cols))
+    for (cl in clones) {
+        cells <- rownames(sub_meta)[sub_meta$Clone == cl & !is.na(sub_meta$Clone)]
+        if (length(cells) == 0) next
+        for (cc in chr_cols) mat[cl, cc] <- get_mode(as.character(sub_meta[cells, cc]))
+    }
+    mat
+}
+
+# ---- Main per-sample plotting function ----------------------------------------
+plot_sample_clonal_heatmap <- function(seurat_obj, sample_id,
+                                        sample_col = "Sample",
+                                        min_clone_cells = 5,
+                                        file = NULL) {
+    meta <- seurat_obj@meta.data
+    variant_cols <- get_variant_cols(meta)
+    chr_cols     <- get_chr_cols(meta)
+
+    sub_meta <- meta[meta[[sample_col]] == sample_id & !is.na(meta[[sample_col]]), , drop = FALSE]
+    if (nrow(sub_meta) == 0) stop("No cells found for sample: ", sample_id)
+
+    relevant_variants <- variant_cols[
+        vapply(variant_cols, function(v) {
+            any(as_numeric_geno(sub_meta[[v]]) %in% c(1, 2), na.rm = TRUE)
+        }, logical(1))
+    ]
+    if (length(relevant_variants) == 0) {
+        message("No mutant variants found for ", sample_id, " — skipping."); return(invisible(NULL))
+    }
+
+    relevant_chr <- chr_cols[
+        vapply(chr_cols, function(cc) any(!sub_meta[[cc]] %in% c("WT", NA), na.rm = TRUE), logical(1))
+    ]
+    # Order chromosome/arm columns chromosome-by-chromosome (whole chr, then
+    # p, then q) so each chromosome forms one contiguous panel.
+    relevant_chr <- order_chr_cols(relevant_chr)
+
+    clone_tab <- sort(table(sub_meta$Clone[!is.na(sub_meta$Clone)]), decreasing = TRUE)
+
+    # Total cells with a clone assignment in this sample — the denominator
+    # for relative clone size.
+    n_total_annotated <- sum(clone_tab)
+
+    clones <- names(clone_tab)[clone_tab >= min_clone_cells]
+    if ("WT" %in% clones) clones <- c("WT", setdiff(clones, "WT"))
+    if (length(clones) == 0) {
+        message("No clone with >= ", min_clone_cells, " cells for ", sample_id, " — skipping."); return(invisible(NULL))
+    }
+
+    vaf_mat <- clone_vaf_matrix(sub_meta, clones, relevant_variants)
+    cna_mat <- if (length(relevant_chr) > 0) clone_cna_matrix(sub_meta, clones, relevant_chr) else NULL
+
+    # ---- Row (clone-level) clinical annotation ---------------------------------
+    clone_meta <- do.call(rbind, lapply(clones, function(cl) {
+        cells <- rownames(sub_meta)[sub_meta$Clone == cl & !is.na(sub_meta$Clone)]
+        data.frame(
+            Clone       = cl,
+            n_cells     = length(cells),
+            TP53_Status = get_mode(as.character(sub_meta[cells, "TP53_Status"])),
+            IPSS_M      = get_mode(as.character(sub_meta[cells, "IPSS_M"])),
+            WHO         = get_mode(as.character(sub_meta[cells, "WHO"])),
+            ICC         = get_mode(as.character(sub_meta[cells, "ICC"])),
+            CK          = get_mode(as.character(sub_meta[cells, "CK"])),
+            stringsAsFactors = FALSE
+        )
+    }))
+    rownames(clone_meta) <- clone_meta$Clone
+    clone_meta <- clone_meta[clones, ]
+
+    # Relative clone size vs. total clone-annotated cells in the sample,
+    # formatted "n (XX.X%)".
+    clone_meta$pct_of_annotated <- 100 * clone_meta$n_cells / n_total_annotated
+    clone_meta$size_label <- sprintf(
+        "%d (%.1f%%)", clone_meta$n_cells, clone_meta$pct_of_annotated
+    )
+
+    ann_colors <- list(
+        TP53_Status = discrete_colors(clone_meta$TP53_Status,
+                        c("WT" = "grey80", "Single-Hit" = "orange", "Multi-Hit" = "firebrick")),
+        IPSS_M = discrete_colors(clone_meta$IPSS_M),
+        WHO    = discrete_colors(clone_meta$WHO),
+        ICC    = discrete_colors(clone_meta$ICC),
+        CK     = discrete_colors(clone_meta$CK, c("Yes" = "black", "No" = "grey90"))
+    )
+
+    row_anno <- rowAnnotation(
+        TP53_Status = clone_meta$TP53_Status,
+        IPSS_M      = clone_meta$IPSS_M,
+        WHO         = clone_meta$WHO,
+        ICC         = clone_meta$ICC,
+        CK          = clone_meta$CK,
+        n_cells     = anno_barplot(clone_meta$n_cells, width = unit(1.5, "cm")),
+        `n (%)`     = anno_text(
+            clone_meta$size_label,
+            gp = gpar(fontsize = 7),
+            just = "left",
+            location = unit(0, "npc")
+        ),
+        col = ann_colors,
+        annotation_name_side = "top",
+        annotation_name_rot = 45,
+        annotation_name_gp = gpar(fontsize = 8),
+        simple_anno_size = unit(3, "mm")
+    )
+
+    vaf_col_fun <- colorRamp2(c(0, 0.5, 1), c("white", "orange", "firebrick"))
+
+    # Display-only wrapped labels (matrices/annotations above still keyed on
+    # the original unwrapped `clones` / column names).
+    vaf_mat_display <- vaf_mat
+    rownames(vaf_mat_display) <- wrap_label_two_lines(rownames(vaf_mat))
+    colnames(vaf_mat_display) <- wrap_label_two_lines(colnames(vaf_mat))
+
+    ht_vaf <- Heatmap(
+        vaf_mat_display, name = "VAF", col = vaf_col_fun,
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        row_names_side = "left", column_title = "Variants (VAF)",
+        column_names_rot = 45,
+        column_names_gp = gpar(fontsize = 7, lineheight = 0.85),
+        row_names_gp = gpar(fontsize = 8, lineheight = 0.85),
+        na_col = "grey90",
+        left_annotation = row_anno,
+        row_names_max_width = unit(6, "cm"),
+        column_names_max_height = unit(5, "cm")
+    )
+
+    ht_list <- ht_vaf
+
+    if (!is.null(cna_mat) && ncol(cna_mat) > 0) {
+        cna_mat_display <- cna_mat
+        colnames(cna_mat_display) <- wrap_label_two_lines(colnames(cna_mat))
+
+        # One panel per chromosome: split columns by base chromosome, in
+        # chromosome-numeric order, with a small gap between panels.
+        chr_group <- chr_base(colnames(cna_mat))
+        chr_group_levels <- unique(chr_group)  # already chr-ordered via order_chr_cols()
+        chr_group <- factor(chr_group, levels = chr_group_levels)
+
+        cna_levels <- unique(as.vector(cna_mat))
+        cna_colors <- discrete_colors(cna_levels, c(
+            "WT" = "grey95", "Del" = "steelblue", "Amp" = "firebrick",
+            "cnLOH" = "purple", "Monosomy" = "darkblue", "Trisomy" = "darkred"
+        ))
+        ht_cna <- Heatmap(
+            cna_mat_display, name = "CNA", col = cna_colors,
+            cluster_rows = FALSE, cluster_columns = FALSE,
+            cluster_column_slices = FALSE,
+            column_split = chr_group,
+            column_gap = unit(1.5, "mm"),
+            column_title = "%s",
+            column_title_gp = gpar(fontsize = 8, fontface = "bold"),
+            column_title_rot = 0,
+            show_row_names = FALSE,
+            column_names_rot = 45,
+            column_names_gp = gpar(fontsize = 7, lineheight = 0.85),
+            na_col = "white",
+            column_names_max_height = unit(5, "cm")
+        )
+        ht_list <- ht_list + ht_cna
+    }
+
+    draw(
+        ht_list,
+        column_title = sample_id,
+        merge_legend = TRUE,
+        heatmap_legend_side = "right",
+        annotation_legend_side = "right",
+        padding = unit(c(2, 2, 8, 2), "mm")
+    )
+
+    invisible(ht_list)
+}
+
+# ---- Run for every sample (in-session only, no export) ------------------------
+samples <- sort(unique(combined_dna_pro$Sample))
+# for (s in samples) {
+#     plot_sample_clonal_heatmap(combined_dna_pro, sample_id = s)
+#     if (interactive()) readline(prompt = paste0(s, " — press [Enter] for next sample"))
+# }
+```
+
+# 9. Viz
+
+## - Panel 1E
+
+```{r}
+combined_dna_pro_no_ngt <- subset(combined_dna_pro, cells = WhichCells(combined_dna_pro, expression = TP53 %in% c('WT', 'MUT')))
+```
+
+```{r}
+# ============================================================
+# Build the ADT embedding + sketch subsets for combined_dna_pro
+# ============================================================
+DefaultAssay(combined_dna_pro_no_ngt) <- 'ADT'
+combined_dna_pro_no_ngt <- NormalizeData(combined_dna_pro_no_ngt, normalization.method = 'CLR', margin = 2)
+combined_dna_pro_no_ngt <- ScaleData(combined_dna_pro_no_ngt)
+
+set.seed(123)
+combined_dna_pro_no_ngt <- RunPCA(combined_dna_pro_no_ngt, features = rownames(combined_dna_pro_no_ngt@assays$ADT))
+
+set.seed(123)
+combined_dna_pro_no_ngt <- RunHarmony(combined_dna_pro_no_ngt,
+                               group.by.vars = c('Sample'), dims.use = 1:15)
+
+# TP53 can be "WT", "MUT", "nGT", or NA (see the TP53-status derivation
+# chunk); only WT/MUT are meaningful comparison groups here.
+combined_dna_pro_no_ngt_WT  <- subset(combined_dna_pro_no_ngt, cells = WhichCells(combined_dna_pro_no_ngt, expression = TP53 %in% 'WT'))
+combined_dna_pro_no_ngt_MUT <- subset(combined_dna_pro_no_ngt, cells = WhichCells(combined_dna_pro_no_ngt, expression = TP53 %in% 'MUT'))
+
+combined_dna_pro_no_ngt_WT <- SketchData(
+    object          = combined_dna_pro_no_ngt_WT,
+    ncells          = min(table(combined_dna_pro_no_ngt$Condition)),
+    method          = "LeverageScore",
+    features        = rownames(combined_dna_pro_no_ngt),
+    sketched.assay  = "sketch"
+)
+combined_dna_pro_no_ngt_WT <- subset(combined_dna_pro_no_ngt_WT, cells = colnames(combined_dna_pro_no_ngt_WT@assays$sketch$counts))
+
+combined_dna_pro_no_ngt_MUT <- SketchData(
+    object          = combined_dna_pro_no_ngt_MUT,
+    ncells          = min(table(combined_dna_pro_no_ngt$Condition)),
+    method          = "LeverageScore",
+    features        = rownames(combined_dna_pro_no_ngt),
+    sketched.assay  = "sketch"
+)
+combined_dna_pro_no_ngt_MUT <- subset(combined_dna_pro_no_ngt_MUT, cells = colnames(combined_dna_pro_no_ngt_MUT@assays$sketch$counts))
+```
+
+```{r}
+# ============================================================
+# Panel 1E: UMAP coloured by TP53 status (WT vs MUT only)
+# ============================================================
+# Restrict to WT/MUT explicitly rather than letting factor(levels=c("WT","MUT"))
+# silently coerce "nGT" (and any stray NA) to NA — that would both drop points
+# from the plot without comment and make the printed WT/MUT counts wrong,
+# since they'd be computed before the coercion.
+wt_mut_cells <- colnames(combined_dna_pro_no_ngt)[combined_dna_pro_no_ngt$TP53 %in% c("WT", "MUT")]
+
+umap_df <- as.data.frame(Embeddings(combined_dna_pro_no_ngt, "umap")[wt_mut_cells, , drop = FALSE])
+umap_df$TP53 <- factor(combined_dna_pro_no_ngt$TP53[wt_mut_cells], levels = c("WT", "MUT"))
+
+message("Plotting ", sum(umap_df$TP53 == "WT"), " WT cells and ",
+        sum(umap_df$TP53 == "MUT"), " MUT cells (",
+        sum(combined_dna_pro_no_ngt$TP53 %in% "nGT", na.rm = TRUE), " nGT and ",
+        sum(is.na(combined_dna_pro_no_ngt$TP53)), " NA cells excluded).")
+
+# Shuffle all cells together so neither label is systematically drawn on top —
+# no downsampling, so relative abundance of WT vs MUT is preserved as-is.
+set.seed(123)
+umap_plot_df <- umap_df[sample(nrow(umap_df)), , drop = FALSE]
+
+# Aesthetic maps
+tp53_color_map       <- c("WT" = "#d2e3f0", "MUT" = "#ff003f")  # fill
+tp53_color_map_light <- c("WT" = "#98c1d9", "MUT" = "#800f2f")  # outline (already darker than fill, good contrast)
+tp53_stroke_map      <- c("WT" = 0.4,       "MUT" = 0.4)        # outline width, increased from 0.35
+tp53_alpha_map       <- c("WT" = 0.85,      "MUT" = 0.95)       # opacity
+
+p <- ggplot(umap_plot_df, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(
+        aes(fill = TP53, color = TP53, stroke = TP53, alpha = TP53),
+        shape = 21,
+        size  = 2    # increased from 1 -- larger individual points, matching the UMAP_celltypes treatment
+    ) +
+    scale_fill_manual(values = tp53_color_map) +
+    scale_color_manual(values = tp53_color_map_light) +
+    scale_discrete_manual(aesthetics = "stroke", values = tp53_stroke_map) +
+    scale_alpha_manual(values = tp53_alpha_map) +
+    theme_void(base_size = 12) +
+    theme(
+        plot.margin     = margin(10, 10, 10, 10),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 9),
+        legend.title    = element_blank(),
+        legend.key.size = unit(0.9, "lines"),
+        legend.margin   = margin(t = 6)
+    ) +
+    guides(
+        color  = "none",
+        alpha  = "none",
+        stroke = "none",
+        fill   = guide_legend(
+            ncol = 2,
+            override.aes = list(size = 4, stroke = 0.3, alpha = 1)
+        )
+    )
+
+p_no_legend <- p + theme(legend.position = "none")
+
+dir.create(file.path(local_wd_folder, "results/figures/Additional"),
+           recursive = TRUE, showWarnings = FALSE)
+
+pdf(file = file.path(local_wd_folder, "results/figures/Fig_1E.pdf"),
+    width = 6.25, height = 5.75)
+print(p)
+dev.off()
+
+ggsave(file.path(local_wd_folder, "results/figures/Fig_1E.png"),
+    plot = p_no_legend, width = 6.25, height = 5.75, dpi = 300)
+
+pdf(file = file.path(local_wd_folder, "results/figures/Additional/Fig_1E_no_legend.pdf"),
+    width = 5.5, height = 4.5)
+print(p_no_legend)
+dev.off()
+
+ggsave(file.path(local_wd_folder, "results/figures/Additional/Fig_1E_no_legend.png"),
+    plot = p_no_legend, width = 5.5, height = 5, dpi = 300)
+```
+
+## - Panel S2
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+tp53_color_map <- c("WT" = "#d2e3f0", "MUT" = "#ff003f")
+
+df <- as.data.frame(table(
+  TP53 = combined_dna_pro_no_ngt$TP53,
+  Celltype = combined_dna_pro_no_ngt$Celltype_revised_refined
+))
+
+plot_df <- df %>%
+  group_by(Celltype) %>%
+  mutate(pct = 100 * Freq / sum(Freq)) %>%
+  ungroup() %>%
+  mutate(TP53 = factor(TP53, levels = c("WT", "MUT")))
+
+# order cell types by %MUT descending (top of plot = highest MUT burden)
+celltype_order <- plot_df %>%
+  filter(TP53 == "MUT") %>%
+  arrange(desc(pct)) %>%
+  pull(Celltype)
+
+plot_df$Celltype <- factor(plot_df$Celltype, levels = rev(celltype_order))
+
+p <- ggplot(plot_df, aes(x = pct, y = Celltype, fill = TP53)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = tp53_color_map) +
+  scale_x_continuous(limits = c(0, 100), expand = c(0, 0),
+                      breaks = seq(0, 100, 25)) +
+  labs(x = "% of cells", y = NULL, fill = "TP53") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "top"
+  )
+
+p
+
+pdf(file = file.path(local_wd_folder, "results/figures/Fig_S2.pdf"),
+    width = 6, height = 6)
+print(p)
+dev.off()
+```
+
+## - Panel 1F
+
+For this analysis we did not use patients from MDS010 (PT17, PT18) as CD3 depleted with no HTOs
+PT20 Baseline HTO+ are whole MNCs, HTO- are depleted (but the depletion didn't work)
+PT19 HTO+ cells are whole MNCs
+Rest is whole MNCs
+
+```{r}
+# ============================================================
+# HTO-positive barcodes for PT19/PT20 (whole/unfractionated MNCs)
+# ============================================================
+PT19_whole_mncs_barcodes <- read.csv('/project/meadlab/shared/02__Projects/02b__Tapestri/resources/HTO_barcodes/PT19_MDS011_HTO_positive_barcodes.csv')$barcode
+PT19_whole_mncs_barcodes <- paste0('PT_ID19.', PT19_whole_mncs_barcodes, '_PT19')
+
+PT20_whole_mncs_barcodes <- read.csv('/project/meadlab/shared/02__Projects/02b__Tapestri/resources/HTO_barcodes/PT20_pMDS001_HTO_positive_barcodes.csv')$barcode
+PT20_whole_mncs_barcodes <- paste0('PT_ID20.', PT20_whole_mncs_barcodes, '_PT20')
+
+# Verify the constructed names actually exist in combined_dna_pro_no_ngt before using
+# them for subset() — Seurat's subset() silently drops unmatched cell names
+# rather than erroring, so a barcode-format mismatch (e.g. 'PT_ID19.<bc>_PT19'
+# vs the 'PT19.PT19_<bc>_PT19' form used elsewhere in this pipeline) would
+# otherwise pass unnoticed and quietly exclude these patients' HTO+ cells.
+n_pt19_matched <- sum(PT19_whole_mncs_barcodes %in% colnames(combined_dna_pro_no_ngt))
+n_pt20_matched <- sum(PT20_whole_mncs_barcodes %in% colnames(combined_dna_pro_no_ngt))
+
+message("PT19 HTO+ barcodes matched: ", n_pt19_matched, " / ", length(PT19_whole_mncs_barcodes))
+message("PT20 HTO+ barcodes matched: ", n_pt20_matched, " / ", length(PT20_whole_mncs_barcodes))
+
+if (n_pt19_matched == 0 || n_pt20_matched == 0) {
+    stop(
+        "None of the constructed PT19/PT20 barcodes matched colnames(combined_dna_pro_no_ngt). ",
+        "Example expected: ", PT19_whole_mncs_barcodes[1],
+        " | example actual colname: ", grep("PT19", colnames(combined_dna_pro_no_ngt), value = TRUE)[1],
+        ". The barcode-construction format (prefix/suffix) likely needs to be ",
+        "changed to match combined_dna_pro_no_ngt's actual naming convention."
+    )
+}
+```
+
+```{r}
+# ============================================================
+# Build the bone-marrow MNC subset and re-embed
+# ============================================================
+combined_dna_pro_no_ngt_bm_mncs_unfractionated <- subset(
+    combined_dna_pro_no_ngt,
+    cells = c(
+        PT19_whole_mncs_barcodes, PT20_whole_mncs_barcodes,
+        WhichCells(
+            combined_dna_pro_no_ngt,
+            expression = Sample %in% setdiff(
+                unique(na.omit(combined_dna_pro_no_ngt$Sample)),
+                c("PT17", "PT18", "PT20", "PT19")
+            )
+        )
+    )
+)
+
+DefaultAssay(combined_dna_pro_no_ngt_bm_mncs_unfractionated) <- "ADT"
+
+combined_dna_pro_no_ngt_bm_mncs_unfractionated <- NormalizeData(
+    combined_dna_pro_no_ngt_bm_mncs_unfractionated, normalization.method = 'CLR', margin = 2
+)
+combined_dna_pro_no_ngt_bm_mncs_unfractionated <- ScaleData(combined_dna_pro_no_ngt_bm_mncs_unfractionated)
+
+set.seed(123)
+combined_dna_pro_no_ngt_bm_mncs_unfractionated <- RunPCA(
+    combined_dna_pro_no_ngt_bm_mncs_unfractionated,
+    features = rownames(combined_dna_pro_no_ngt_bm_mncs_unfractionated@assays$ADT)
+)
+ElbowPlot(combined_dna_pro_no_ngt_bm_mncs_unfractionated)
+
+set.seed(123)
+combined_dna_pro_no_ngt_bm_mncs_unfractionated <- RunHarmony(
+    combined_dna_pro_no_ngt_bm_mncs_unfractionated,
+    group.by.vars = c('Sample'), dims.use = 1:15
+)
+```
+
+```{r}
+# ============================================================
+# Build the Milo object
+# ============================================================
+library(miloR)
+library(SingleCellExperiment)
+
+# LayerData() rather than @counts/@data: robust if this Seurat object (or any
+# ancestor it was subset from) has been converted to the Assay5 structure,
+# where @counts can silently return something other than what's expected.
+adt_counts <- LayerData(combined_dna_pro_no_ngt_bm_mncs_unfractionated, assay = "ADT", layer = "counts")
+adt_data   <- LayerData(combined_dna_pro_no_ngt_bm_mncs_unfractionated, assay = "ADT", layer = "data")
+
+set.seed(123)
+SCE_bm_MNCs <- SingleCellExperiment(
+    assays = list(counts = adt_counts, logcounts = adt_data),
+    colData = combined_dna_pro_no_ngt_bm_mncs_unfractionated@meta.data,
+    reducedDims = SimpleList(
+        PCA  = combined_dna_pro_no_ngt_bm_mncs_unfractionated@reductions$harmony@cell.embeddings,
+        UMAP = combined_dna_pro_no_ngt_bm_mncs_unfractionated@reductions$umap@cell.embeddings
+    )
+)
+
+BM_MNCs_milo <- Milo(SCE_bm_MNCs)
+BM_MNCs_milo
+```
+
+```{r}
+# ============================================================
+# Neighbourhoods, counting, distances
+# ============================================================
+BM_MNCs_milo <- buildGraph(BM_MNCs_milo, k = 20, d = 15, reduced.dim = "PCA")
+BM_MNCs_milo <- makeNhoods(BM_MNCs_milo, prop = 0.20, k = 20, d = 15,
+                           refined = TRUE, reduced_dims = "PCA")
+
+plotNhoodSizeHist(BM_MNCs_milo)
+```
+
+```{r}
+# Composite per-donor-per-genotype sample ID: WT and MUT cells from the same
+# patient are treated as separate "samples" for this within-patient clonal
+# abundance comparison.
+colData(BM_MNCs_milo)$Donor_TP53 <- paste0(
+    colData(BM_MNCs_milo)$Donor, "_",
+    colData(BM_MNCs_milo)$TP53
+)
+
+BM_MNCs_milo <- countCells(
+    BM_MNCs_milo,
+    meta.data = as.data.frame(colData(BM_MNCs_milo)),
+    sample = "Donor_TP53"
+)
+
+BM_MNCs_milo <- calcNhoodDistance(BM_MNCs_milo, d = 15, reduced.dim = "PCA")
+```
+
+```{r}
+# ============================================================
+# Design matrix — Donor now actually enters the model
+# ============================================================
+BM_MNCs_design <- data.frame(colData(BM_MNCs_milo))[, c("Donor_TP53", "Donor", "TP53")]
+
+# Keep Donor_TP53 as the composite — do NOT overwrite it with Donor
+BM_MNCs_design <- BM_MNCs_design[!duplicated(BM_MNCs_design$Donor_TP53), ]
+rownames(BM_MNCs_design) <- BM_MNCs_design$Donor_TP53
+
+BM_MNCs_design$TP53  <- factor(BM_MNCs_design$TP53, levels = c("WT", "MUT"))
+BM_MNCs_design$Donor <- factor(BM_MNCs_design$Donor)
+
+# Align design rows to the count-matrix columns explicitly (robust against ordering)
+BM_MNCs_design <- BM_MNCs_design[colnames(nhoodCounts(BM_MNCs_milo)), , drop = FALSE]
+
+# Check the design is a complete WT/MUT-per-donor layout before fitting
+# ~ Donor + TP53 — an incomplete/unbalanced design can make that formula
+# non-estimable (aliased coefficients) rather than simply less powerful.
+print(table(BM_MNCs_design$Donor, BM_MNCs_design$TP53))
+
+# ---- Test, blocking on Donor -----------------------------------------------
+# The previous formula (~ TP53 alone) let between-patient composition
+# differences leak into the TP53 effect estimate, since Donor was prepared in
+# the design but never included. Donor is now a covariate.
+da_results <- testNhoods(
+    BM_MNCs_milo,
+    design = ~ TP53,
+    design.df = BM_MNCs_design,
+    reduced.dim = "PCA",
+    fdr.weighting = "graph-overlap"
+)
+```
+
+```{r}
+# ============================================================
+# Annotate neighbourhoods and order cell types
+# ============================================================
+da_results <- annotateNhoods(
+    BM_MNCs_milo, da_results, coldata_col = "Celltype_revised_refined"
+)
+
+da_results$Celltype_revised_refined <- factor(
+    da_results$Celltype_revised_refined,
+    levels = rev(c(
+        "HSPC", "Erythroblast", "CD14+ monocyte", "CD16+ monocyte", "Mono/Macrophage",
+        "cDC", "pDC", "NK cell", "Plasma cell", "B cell", "CD4+ T cell", "CD8+ T cell", "Other T cell"
+    ))
+)
+```
+
+```{r}
+# ============================================================
+# Figure 1F: cell-type ordered beeswarm of neighbourhood logFC
+# ============================================================
+library(ggprism)
+
+da.res <- da_results
+group.by <- "Celltype_revised_refined"
+
+da.res <- da.res %>%
+    mutate(group_by = .data[[group.by]]) %>%
+    filter(!is.na(group_by))
+
+alpha <- 0.10
+
+sig_counts <- da.res %>%
+    filter(!is.na(SpatialFDR), SpatialFDR < alpha, !is.na(logFC)) %>%
+    group_by(group_by) %>%
+    summarise(
+        pos   = sum(logFC > 0, na.rm = TRUE),
+        neg   = sum(logFC < 0, na.rm = TRUE),
+        zero  = sum(logFC == 0, na.rm = TRUE),
+        n_sig = dplyr::n(),
+        .groups = "drop"
+    ) %>%
+    mutate(diff = pos - neg)
+
+group_levels_all <- da.res %>% distinct(group_by)
+rank_table <- group_levels_all %>%
+    left_join(sig_counts, by = "group_by") %>%
+    mutate(across(c(pos, neg, zero, n_sig, diff), ~ tidyr::replace_na(., 0))) %>%
+    arrange(desc(diff), desc(n_sig), group_by)
+
+ordered_levels <- rev(rank_table$group_by)
+da.res <- da.res %>%
+    mutate(
+        group_by     = factor(group_by, levels = ordered_levels, ordered = TRUE),
+        is_expanded  = SpatialFDR < alpha,
+        logFC_color  = ifelse(is_expanded, logFC, NA_real_)
+    )
+
+BM_MNCs_plot <-
+    ggplot(
+        da.res %>% arrange(group_by),
+        aes(x = group_by, y = logFC, color = logFC_color)
+    ) +
+    ggbeeswarm::geom_quasirandom(size = 0.7) +
+    scale_x_discrete(limits = ordered_levels, drop = FALSE) +
+    scale_color_gradientn(
+        colours = rev(c(
+            '#590d22', '#a4133c', '#BC162E', '#ff8fa3',
+            '#A7C7E7', '#6FA3D6', '#3A7CC5', '#1A5294'
+        )),
+        na.value = "grey80"
+    ) +
+    guides(color = "none") +
+    coord_flip() +
+    theme_prism(base_size = 22) +
+    theme(
+        strip.text.y      = element_text(angle = 0),
+        panel.grid.major  = element_blank(),
+        panel.grid.minor  = element_blank(),
+        panel.background  = element_blank(),
+        panel.border      = element_blank(),
+        plot.title        = element_text(hjust = 0.5, size = 12),
+        plot.subtitle     = element_text(hjust = 0.5, size = 12),
+        axis.line.y.left  = element_line(color = "black"),
+        axis.line.x       = element_line(color = "black"),
+        axis.title        = element_text(size = 12),
+        axis.text.x       = element_text(size = 10, colour = "black"),
+        axis.text.y       = element_text(size = 10, colour = "black"),
+        legend.position   = "none"
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+    ylab(expression(paste("Log Fold Change"))) +
+    xlab('')
+
+BM_MNCs_plot
+
+dir.create(file.path(local_wd_folder, "results/figures"), recursive = TRUE, showWarnings = FALSE)
+
+pdf(file = file.path(local_wd_folder, "results/figures/Fig_1F.pdf"), width = 3.65, height = 4.5)
+print(BM_MNCs_plot)
+dev.off()
+```
+
+# 10. Bulk to single cell VAFs correlation
+
+Calculate single cell VAFs
+
+```{r}
+# ============================================================
+# scVAF per curated variant, computed directly from DNA_variants_combined
+# (the per-cell genotype matrix already built in section 4) — no
+# lymphoid/non-lymphoid split, no meta.data lookups.
+# ============================================================
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
+
+stopifnot(exists("DNA_variants_combined"), exists("combined_dna_pro"))
+
+# ---- 1. Resolve each curated_variants row to a DNA_variants_combined column ---
+escape_regex <- function(x) {
+    special <- c("\\", ".", "^", "$", "|", "(", ")", "[", "]", "{", "}", "*", "+", "?")
+    for (s in special) x <- gsub(s, paste0("\\", s), x, fixed = TRUE)
+    x
+}
+
+resolve_variant_column <- function(cols, gene, cdna) {
+    pattern <- paste0("^", escape_regex(gene), "_", escape_regex(cdna), "_")
+    hit <- grep(pattern, cols, value = TRUE)
+    if (length(hit) == 0) return(NA_character_)
+    if (length(hit) > 1) {
+        warning("Multiple columns matched ", gene, "_", cdna, ": ",
+                paste(hit, collapse = ", "), " — using the first.")
+    }
+    hit[1]
+}
+
+variant_cols_available <- colnames(DNA_variants_combined)
+
+curated_variants$matched_column <- mapply(
+    function(g, c) resolve_variant_column(variant_cols_available, g, c),
+    curated_variants$gene, curated_variants$cdna
+)
+
+cat("Curated variants matched to DNA_variants_combined columns:",
+    sum(!is.na(curated_variants$matched_column)), "/", nrow(curated_variants), "\n")
+
+unmatched <- curated_variants[
+    is.na(curated_variants$matched_column), c("sample_id", "gene", "cdna", "aa_change")
+]
+if (nrow(unmatched) > 0) {
+    cat("\nUnmatched (not in DNA_variants_combined):\n")
+    print(unmatched, row.names = FALSE)
+}
+
+# ---- 2. Resolve each curated sample_id to combined_dna_pro's Sample values ----
+sample_ids_in_object <- unique(na.omit(combined_dna_pro$Sample))
+
+resolve_sample_id <- function(sample_id, available) {
+    if (sample_id %in% available) return(sample_id)
+    alt <- gsub("_FU$", "FU", sample_id)
+    if (alt %in% available) return(alt)
+    NA_character_
+}
+
+curated_variants$resolved_sample_id <- vapply(
+    curated_variants$sample_id, resolve_sample_id, character(1),
+    available = sample_ids_in_object
+)
+
+cat("\nCurated sample_ids matched to combined_dna_pro$Sample:",
+    sum(!is.na(curated_variants$resolved_sample_id)), "/", nrow(curated_variants), "\n")
+
+# ---- 3. Per-sample cell name lookup (once) -------------------------------------
+sample_cell_lookup <- split(
+    colnames(combined_dna_pro),
+    combined_dna_pro@meta.data$Sample
+)
+
+# ---- 4. Compute scVAF for each curated variant, from DNA_variants_combined -----
+compute_scvaf_from_matrix <- function(mat, sample_id, col_name, sample_cells) {
+    empty <- data.frame(
+        matched_column = col_name, match_type = NA_character_,
+        n_cells = NA_integer_, n_genotyped = NA_integer_,
+        pct_genotyped = NA_real_, n_WT = NA_integer_, n_HET = NA_integer_,
+        n_HOM = NA_integer_, n_missing = NA_integer_, VAF = NA_real_,
+        mutant_cell_fraction = NA_real_, stringsAsFactors = FALSE
+    )
+
+    if (is.na(sample_id) || is.na(col_name) || is.null(sample_cells)) {
+        empty$match_type <- "none"
+        return(empty)
+    }
+
+    cells_in_matrix <- intersect(sample_cells, rownames(mat))
+    n_cells <- length(cells_in_matrix)
+    if (n_cells == 0) {
+        empty$match_type <- "no_cells"
+        empty$n_cells <- 0L
+        return(empty)
+    }
+
+    g <- suppressWarnings(as.numeric(mat[cells_in_matrix, col_name]))
+
+    n_wt  <- sum(g == 0, na.rm = TRUE)
+    n_het <- sum(g == 1, na.rm = TRUE)
+    n_hom <- sum(g == 2, na.rm = TRUE)
+    n_genotyped <- n_wt + n_het + n_hom
+
+    mut_alleles <- n_het + 2 * n_hom
+    total_alleles <- 2 * n_genotyped
+    vaf <- if (total_alleles > 0) 100 * mut_alleles / total_alleles else NA_real_
+    mut_cell_frac <- if (n_genotyped > 0) (n_het + n_hom) / n_genotyped else NA_real_
+
+    data.frame(
+        matched_column = col_name, match_type = "exact",
+        n_cells = n_cells, n_genotyped = as.integer(n_genotyped),
+        pct_genotyped = round(100 * n_genotyped / n_cells, 1),
+        n_WT = as.integer(n_wt), n_HET = as.integer(n_het), n_HOM = as.integer(n_hom),
+        n_missing = as.integer(n_cells - n_genotyped),
+        VAF = vaf, mutant_cell_fraction = mut_cell_frac,
+        stringsAsFactors = FALSE
+    )
+}
+
+vaf_columns <- do.call(rbind, lapply(seq_len(nrow(curated_variants)), function(i) {
+    sid <- curated_variants$resolved_sample_id[i]
+    compute_scvaf_from_matrix(
+        DNA_variants_combined, sid,
+        curated_variants$matched_column[i],
+        sample_cell_lookup[[sid]]
+    )
+}))
+
+curated_variants_vaf <- cbind(curated_variants, vaf_columns)
+
+# cbind() duplicates matched_column (present in both curated_variants and
+# vaf_columns); keep only the first occurrence of any repeated name.
+curated_variants_vaf <- curated_variants_vaf[, !duplicated(colnames(curated_variants_vaf))]
+rownames(curated_variants_vaf) <- NULL
+
+curated_variants_vaf$Recovered_here <- ifelse(
+    is.na(curated_variants_vaf$matched_column) | is.na(curated_variants_vaf$VAF),
+    "No", "Yes"
+)
+curated_variants_vaf$estimable <- !is.na(curated_variants_vaf$n_genotyped) &
+    curated_variants_vaf$n_genotyped >= 10
+
+cat("\n=====================================================\n")
+cat("scVAF per curated variant (from DNA_variants_combined)\n")
+cat("=====================================================\n")
+print(
+    curated_variants_vaf[, c("sample_id", "gene", "cdna", "aa_change",
+                              "Recovered_here", "n_cells", "n_genotyped",
+                              "pct_genotyped", "n_WT", "n_HET", "n_HOM",
+                              "VAF", "mutant_cell_fraction",
+                              "match_type", "estimable")],
+    row.names = FALSE, digits = 3
+)
+```
+
+Bulk data VAF
+
+```{r}
+# ---- Bulk VAF lookup — corrected for PT18 PHF6, SH2B3 removed -----------------
+bulk_vaf_table <- data.frame(
+    sample_id = c(
+        "PT01",
+        "PT02", "PT02",
+        "PT03",
+        "PT04", "PT04", "PT04", "PT04", "PT04",
+        "PT05",
+        "PT06", "PT06",
+        "PT07", "PT07", "PT07", "PT07", "PT07",
+        "PT08",
+        "PT09", "PT09",
+        "PT10", "PT10",
+        "PT11",
+        "PT12", "PT12",
+        "PT13",
+        "PT14",
+        "PT15",
+        "PT16", "PT16", "PT16", "PT16",
+        "PT17", "PT17",
+        "PT18", "PT18", "PT18", "PT18",
+        "PT19", "PT19",
+        "PT20"
+    ),
+    variant_label = c(
+        "TP53_c.524G>A_p.R175H",
+        "TP53_c.524G>A_p.R175H", "TP53_c.818G>A_p.R273H",
+        "TP53_c.746G>C_p.R249T",
+        "TP53_c.329G>A_p.R110H", "TET2_c.1648C>T_p.R550*",
+        "TET2_c.5226dup_p.N1743Qfs*10", "ZRSR2_c.391_392del_p.E131Kfs*13",
+        "ASXL1_c.1934dup_p.G646Wfs*12",
+        "TP53_c.455C>T_p.P152L",
+        "TP53_c.378C>A_p.Y126*", "TP53_c.818G>A_p.R273H",
+        "TP53_c.659A>G_p.Y220C", "TP53_c.610G>T_p.E204*",
+        "SRSF2_c.(286_732)_p.P96Rfs*148", "BCORL1_c.2719del_p.T907Lfs*18",
+        "GATA2_c.194_195delAC_p.H65Rfs*119",
+        "TP53_c.434T>A_p.L145Q",
+        "TP53_c.537T>G_p.H179Q", "ASXL1_c.1927_1929_p.G643fs*",
+        "TP53_c.743G>T_p.R248L", "TP53_c.775G>T_p.D259Y",
+        "TP53_c.742C>T_p.R248W",
+        "TP53_c.817C>T_p.R273C", "CEBPA_c.847_849del_p.N283del",
+        "TP53_c.668C>T_p.P223L",
+        "TP53_c.742C>T_p.R248W",
+        "TP53_c.524G>C_p.R175P",
+        "TP53_c.824G>T_p.C275F", "U2AF1_c.470A>G_p.Q157R",
+        "DNMT3A_c.2141C>G_p.S714C", "DNMT3A_c.1668-2A>G",
+        "TP53_c.830G>A_p.C277Y", "ASXL1_c.1934dup_p.G646Wfs*12",
+        "TP53_c.733G>A_p.G245S", "DNMT3A_c.1796del_p.E599Gfs*52",
+        "PHF6_c.915T>A_p.C305*", "TET2_c.4621C>T_p.Q1541*",
+        "TP53_c.451C>T_p.P151S", "CALR_c.1099_1150del_p.L367Tfs*46",
+        "TP53_c.337T>G_p.F113V"
+    ),
+    bulkVAF = c(
+        25.0,
+        50.3, 49.8,
+        82.0,
+        44.0, 22.0, 25.0, 13.0, 12.0,
+        37.8,
+        36.6, 36.8,
+        35.0, 5.0, 5.8, 81.3, 34.9,
+        32.4,
+        69.9, 5.80,
+        18.0, 21.0,
+        17.0,
+        25.0, 49.00,
+        7.5,
+        13.4,
+        35.0,
+        11.0, 6.0, 3.0, 12.0,
+        10.0, 10.0,
+        8.0, 41.0, 6.0, 86.0,
+        23.0, 33.00,
+        27.7
+    ),
+    stringsAsFactors = FALSE
+)
+
+stopifnot(
+    !anyDuplicated(paste(bulk_vaf_table$sample_id, bulk_vaf_table$variant_label)),
+    !anyNA(bulk_vaf_table$bulkVAF)
+)
+
+bulk_keys <- paste(bulk_vaf_table$sample_id, bulk_vaf_table$variant_label)
+```
+
+Preparing data for plotting
+
+```{r}
+# ---- Build the merged scVAF/bulkVAF table --------------------------------------
+build_selected_columns <- function(vaf_table) {
+    out <- vaf_table[!grepl("_FU$", vaf_table$sample_id),
+                      c("sample_id", "gene", "cdna", "aa_change", "VAF")]
+    rownames(out) <- NULL
+    names(out)[names(out) == "VAF"] <- "scVAF"
+
+    out$variant_label <- paste0(
+        out$gene, "_", out$cdna,
+        ifelse(is.na(out$aa_change), "", paste0("_p.", out$aa_change))
+    )
+
+    curated_keys <- paste(out$sample_id, out$variant_label)
+
+    orphaned <- bulk_vaf_table[!bulk_keys %in% curated_keys, , drop = FALSE]
+    if (nrow(orphaned) > 0) {
+        stop(
+            "Bulk entries with no matching curated row:\n",
+            paste(orphaned$sample_id, orphaned$variant_label, collapse = "\n")
+        )
+    }
+
+    out$bulkVAF <- bulk_vaf_table$bulkVAF[match(curated_keys, bulk_keys)]
+
+    out[, c("sample_id", "variant_label", "gene", "cdna", "aa_change",
+            "scVAF", "bulkVAF")]
+}
+
+curated_vaf <- build_selected_columns(curated_variants_vaf)
+
+cat("\n===== scVAF (from DNA_variants_combined) vs bulkVAF, baseline samples only =====\n")
+print(curated_vaf, row.names = FALSE, digits = 3)
+```
+
+Plotting
+
+```{r}
+# ---- Linear regression + scatter plot ------------------------------------------
+# Regression fit is calculated on "Both" (variants detected in both bulk and
+# single-cell) only; the scatter plot itself shows every detected point
+# (Both / scDNA only / Bulk only).
+excluded_genes <- c("SETBP1")
+
+detection_colours <- c(
+    "Both"       = "#4D4D4D",
+    "scDNA only" = "#009E73",
+    "Bulk only"  = "#0072B2"
+)
+
+save_dir <- "/project/meadlab/shared/02__Projects/02b__Tapestri/results/figures"
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+
+build_vaf_scatter <- function(vaf_table, y_axis_label, set_label) {
+    # curated_vaf already excludes _FU samples, but this filter is kept so the
+    # function is safe to call on any similarly-shaped table.
+    vaf_plot_df <- vaf_table %>%
+        filter(!grepl("_FU$", sample_id), !gene %in% excluded_genes) %>%
+        mutate(
+            detected_sc = !is.na(scVAF),
+            detected_bulk = !is.na(bulkVAF),
+            scVAF_plot = ifelse(is.na(scVAF), 0, scVAF),
+            bulkVAF_plot = ifelse(is.na(bulkVAF), 0, bulkVAF),
+            detection = case_when(
+                detected_sc & detected_bulk ~ "Both",
+                detected_sc & !detected_bulk ~ "scDNA only",
+                !detected_sc & detected_bulk ~ "Bulk only",
+                TRUE ~ "Neither"
+            )
+        ) %>%
+        filter(detection != "Neither") %>%
+        mutate(row_id = row_number())
+
+    cat("\n[", set_label, "] points by detection category:\n", sep = "")
+    print(table(vaf_plot_df$detection))
+
+    # ---- Regression: "Both" only ---------------------------------------------
+    shared <- vaf_plot_df %>% filter(detection == "Both")
+    fit <- lm(scVAF ~ bulkVAF, data = shared)
+    fit_summary <- summary(fit)
+    r2 <- fit_summary$r.squared
+    p_value <- fit_summary$coefficients["bulkVAF", "Pr(>|t|)"]
+
+    residual_cols <- shared %>%
+        mutate(
+            fitted = as.numeric(fitted(fit)),
+            residual = as.numeric(residuals(fit)),
+            residual_stud = as.numeric(rstudent(fit))
+        ) %>%
+        dplyr::select(row_id, fitted, residual, residual_stud)
+
+    # Join residuals back onto the full plotting table — scDNA-only / Bulk-only
+    # rows simply get NA for fitted/residual, since they never entered the fit.
+    vaf_plot_df <- vaf_plot_df %>% left_join(residual_cols, by = "row_id")
+
+    residual_df <- vaf_plot_df %>%
+        filter(detection == "Both") %>%
+        mutate(cell_set = set_label) %>%
+        dplyr::select(
+            cell_set, dplyr::any_of(c("sample_id", "gene", "variant", "id")),
+            bulkVAF, scVAF, residual, residual_stud
+        ) %>%
+        arrange(desc(abs(residual_stud)))
+
+    cat(
+        "Linear fit on", nrow(shared), "shared variants:",
+        "R2 =", round(r2, 3),
+        "| slope =", round(coef(fit)["bulkVAF"], 3),
+        "| p =", format.pval(p_value, digits = 3),
+        "| Spearman rho =",
+        round(cor(shared$scVAF, shared$bulkVAF, method = "spearman"), 3),
+        "| residual SD =", round(fit_summary$sigma, 3), "\n"
+    )
+
+    write.csv(
+        residual_df,
+        file.path(save_dir, paste0("scVAF_vs_bulkVAF_residuals_", set_label, ".csv")),
+        row.names = FALSE
+    )
+
+    label_text <- paste0(
+        "R\u00b2 = ", format(round(r2, 3), nsmall = 3), "\n",
+        "p = ",
+        if (p_value < 0.0001) format(p_value, scientific = TRUE, digits = 3)
+        else format(round(p_value, 4), nsmall = 4),
+        "\nn = ", nrow(shared)
+    )
+
+    # ---- Plot: all detected points (Both / scDNA only / Bulk only) -----------
+    axis_max <- max(c(vaf_plot_df$scVAF_plot, vaf_plot_df$bulkVAF_plot), na.rm = TRUE)
+    axis_limit <- ceiling(axis_max / 10) * 10
+    marker_radius <- axis_limit * 0.0135
+    border_width <- 0.6
+
+    circle_polygon <- function(x, y, r, id, n = 90) {
+        theta <- seq(0, 2 * pi, length.out = n)
+        data.frame(x = x + r * cos(theta), y = y + r * sin(theta), marker_id = id)
+    }
+
+    marker_polygons <- do.call(rbind, lapply(seq_len(nrow(vaf_plot_df)), function(i) {
+        poly <- circle_polygon(
+            vaf_plot_df$bulkVAF_plot[i], vaf_plot_df$scVAF_plot[i],
+            marker_radius, id = i
+        )
+        poly$detection <- vaf_plot_df$detection[i]
+        poly
+    }))
+
+    draw_order <- order(-vaf_plot_df$scVAF_plot)
+    marker_polygons$marker_id <- factor(marker_polygons$marker_id, levels = draw_order)
+
+    poly_both <- marker_polygons %>% filter(detection == "Both")
+    poly_single <- marker_polygons %>% filter(detection != "Both")
+
+    threshold_label <- "2% VAF"
+
+    p <- ggplot() +
+        geom_hline(aes(yintercept = 2, linetype = threshold_label),
+                   colour = "grey55", linewidth = 0.7) +
+        geom_vline(aes(xintercept = 2, linetype = threshold_label),
+                   colour = "grey55", linewidth = 0.7, show.legend = FALSE) +
+        scale_linetype_manual(values = setNames("dashed", threshold_label), name = NULL) +
+        geom_abline(
+            slope = coef(fit)["bulkVAF"], intercept = coef(fit)["(Intercept)"],
+            colour = "#d62728", linewidth = 0.8
+        ) +
+        geom_polygon(
+            data = poly_both, aes(x = x, y = y, group = marker_id, fill = detection),
+            colour = "black", linewidth = border_width, linetype = "solid"
+        ) +
+        geom_polygon(
+            data = poly_single, aes(x = x, y = y, group = marker_id, fill = detection),
+            colour = "black", linewidth = border_width, linetype = "dashed"
+        ) +
+        geom_point(
+            data = vaf_plot_df, aes(x = bulkVAF_plot, y = scVAF_plot, fill = detection),
+            shape = 21, size = 0, stroke = 0, alpha = 0, linetype = "solid"
+        ) +
+        scale_fill_manual(
+            values = detection_colours,
+            breaks = c("Both", "scDNA only", "Bulk only"), name = NULL
+        ) +
+        annotate(
+            "text", x = axis_limit * 0.97, y = axis_limit * 0.97,
+            label = label_text, hjust = 1, vjust = 1,
+            size = 3.6, family = "sans", lineheight = 1.15
+        ) +
+        scale_x_continuous(
+            name = "Bulk VAF (%)", limits = c(-axis_limit * 0.04, axis_limit),
+            breaks = seq(0, axis_limit, by = 20), expand = c(0, 0)
+        ) +
+        scale_y_continuous(
+            name = y_axis_label, limits = c(-axis_limit * 0.04, axis_limit),
+            breaks = seq(0, axis_limit, by = 20), expand = c(0, 0)
+        ) +
+        coord_fixed(clip = "off") +
+        theme_classic(base_size = 12, base_family = "sans") +
+        theme(
+            axis.line = element_line(colour = "black", linewidth = 0.6),
+            axis.ticks = element_line(colour = "black", linewidth = 0.6),
+            axis.ticks.length = unit(0.18, "cm"),
+            axis.text = element_text(colour = "black", size = 11),
+            axis.title = element_text(colour = "black", size = 12),
+            panel.grid = element_blank(),
+            legend.position = "bottom",
+            legend.direction = "horizontal",
+            legend.box = "horizontal",
+            legend.box.just = "center",
+            legend.justification = "center",
+            legend.spacing.x = unit(0.6, "cm"),
+            legend.box.spacing = unit(0.35, "cm"),
+            legend.margin = margin(t = 2, b = 2),
+            legend.background = element_blank(),
+            legend.key = element_blank(),
+            legend.text = element_text(size = 10),
+            legend.key.size = unit(0.6, "cm"),
+            plot.margin = margin(12, 12, 4, 8)
+        ) +
+        guides(
+            fill = guide_legend(
+                order = 1, nrow = 1,
+                override.aes = list(shape = 21, size = 4.2, stroke = 0.7,
+                                     alpha = 1, colour = "black", linetype = "solid")
+            ),
+            linetype = guide_legend(
+                order = 2, nrow = 1,
+                override.aes = list(colour = "grey55", linewidth = 0.7,
+                                     shape = NA, fill = NA)
+            )
+        )
+
+    resid_plot_df <- vaf_plot_df %>% filter(detection == "Both")
+    resid_limit <- max(abs(resid_plot_df$residual_stud)) * 1.1
+
+    p_resid <- ggplot(resid_plot_df, aes(x = fitted, y = residual_stud)) +
+        geom_hline(yintercept = 0, colour = "#d62728", linewidth = 0.8) +
+        geom_point(shape = 21, size = 3, stroke = 0.6, colour = "black",
+                   fill = detection_colours[["Both"]]) +
+        scale_y_continuous(name = "Studentised residual", limits = c(-resid_limit, resid_limit)) +
+        scale_x_continuous(name = "Fitted single-cell VAF (%)") +
+        theme_classic(base_size = 12, base_family = "sans") +
+        theme(
+            axis.line = element_line(colour = "black", linewidth = 0.6),
+            axis.ticks = element_line(colour = "black", linewidth = 0.6),
+            axis.ticks.length = unit(0.18, "cm"),
+            axis.text = element_text(colour = "black", size = 11),
+            axis.title = element_text(colour = "black", size = 12),
+            panel.grid = element_blank(),
+            plot.margin = margin(12, 12, 4, 8)
+        )
+
+    list(
+        plot = p, residual_plot = p_resid, data = vaf_plot_df,
+        fit = fit, residuals = residual_df,
+        r2 = r2, p_value = p_value, n_shared = nrow(shared)
+    )
+}
+
+res <- build_vaf_scatter(
+    vaf_table = curated_vaf,
+    y_axis_label = "Single-cell VAF (%)",
+    set_label = "all_mutations"
+)
+print(res$plot)
+print(res$residual_plot)
+
+cat("\nRegression fit:\n")
+cat("R2 =", round(res$r2, 3),
+    "| slope =", round(coef(res$fit)["bulkVAF"], 3),
+    "| intercept =", round(coef(res$fit)["(Intercept)"], 3),
+    "| p =", format.pval(res$p_value, digits = 3),
+    "| n =", res$n_shared, "\n")
+
+ggsave(
+    file.path(save_dir, "Additional_fig_correlation_vafs.pdf"),
+    plot = res$plot, width = 5.2, height = 6.0, device = cairo_pdf
+)
+ggsave(
+    file.path(save_dir, "Additional_fig_correlation_vafs.png"),
+    plot = res$plot, width = 5.2, height = 6.0, dpi = 300
+)
+```
+
+# 9. Preparing HUNTRESS inputs
+
+```{r}
+# ============================================================
+# Per-sample DNA aberrancy loading, filtering, and one-hot splitting
+# ============================================================
+# For each sample:
+#   1. Read the raw All_aberrancies.csv (rownames = raw NGT barcode).
+#   2. Rename rownames to <sample>.<sample>_<barcode>_<suffix>, matching
+#      the intermediate convention used earlier in the pipeline.
+#   3. Key-match against `combined`'s actual cell names (NOT a plain
+#      rowname intersect — see note in process_dna_sample() below) and
+#      rename matched rows to the exact Seurat cell name.
+#   4. Split every CNA column (whole-chromosome or arm-level: chr7, chr7p,
+#      chr17q, ...) into three 0/1 columns: <col>_amp, <col>_del, <col>_cnLOH.
+#   5. Split every mutation column (locus-level NGT: chr17.7578406.C.T) into
+#      two 0/1 columns: <col>_HET (NGT == 1), <col>_HOM (NGT == 2) — EXCEPT
+#      for TP53 loci, where NGT == 2 represents a hemizygous call (a single
+#      mutant allele, the only copy left after chr17p loss/cnLOH — see the
+#      "_Hem" labels in the raw label column), not two mutant alleles. TP53
+#      loci therefore route NGT == 2 into HET, and HOM is always 0 for them.
+#   6. (At the end of this script) build one HUNTRESS-ready ternary matrix
+#      per sample, for downstream clonal tree reconstruction. This is a
+#      separate output from the one-hot split above: HUNTRESS needs plain
+#      presence/absence (0/1/3) at mutation loci only, so the HET/HOM/TP53
+#      distinction and every CNA column are irrelevant there and excluded.
+#
+# NA is preserved rather than coerced to 0: a WT column with a true NA means
+# "not assessed", and an NGT no-call (3) or any unexpected value means the
+# same for a mutation column. Neither should read as "confirmed absent".
+#
+# Each sample is processed in a tryCatch so a malformed source CSV for one
+# sample (e.g. a blank/duplicate column header) does not halt the run for
+# every other sample; failures are logged and reported at the end.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Manifest: one row per sample, matching the read_dna_data() calls already
+# in the pipeline.
+# ------------------------------------------------------------
+
+dna_manifest <- data.frame(
+    sample_id = c(
+        "PT01", "PT02", "PT03", "PT04", "PT05", "PT06",
+        "PT07", "PT08", "PT09", "PT10", "PT11", "PT12",
+        "PT13", "PT14", "PT15", "PT16", "PT17", "PT18",
+        "PT15_FU", "PT19", "PT20", "PT20_FU"
+    ),
+    experiment = c(
+        "MDS001", "MDS001", "MDS001", "MDS003", "MDS003", "MDS002",
+        "MDS002", "MDS002", "MDS005", "MDS005", "MDS006", "MDS006",
+        "MDS007", "MDS008", "MDS009", "MDS009", "MDS010", "MDS010",
+        "MDS011", "MDS011", "pMDS001", "pMDS002"
+    ),
+    donor = c(
+        "Donor_C", "Donor_B", "Donor_A", "Donor_B", "Donor_A", "Donor_A",
+        "Donor_C", "Donor_B", "Donor_B", "Donor_A", "Donor_A", "Donor_B",
+        "Donor_A", "Donor_A", "Donor_B", "Donor_A", "Donor_A", "Donor_B",
+        "Donor_A", "Donor_B", "Donor_A", "Donor_A"
+    ),
+    rename_sample_id = c(
+        "PT01", "PT02", "PT03", "PT04", "PT05", "PT06",
+        "PT07", "PT08", "PT09", "PT10", "PT11", "PT12",
+        "PT13", "PT14", "PT15", "PT16", "PT17", "PT18",
+        "PT15_FU", "PT19", "PT20", "PT20_FU"
+    ),
+    rename_suffix = c(
+        "PT01", "PT02", "PT03", "PT04", "PT05", "PT06",
+        "PT07", "PT08", "PT09", "PT10", "PT11", "PT12",
+        "PT13", "PT14", "PT15", "PT16", "PT17", "PT18",
+        "PT15FU", "PT19", "PT20", "PT20FU"
+    ),
+    stringsAsFactors = FALSE
+)
+
+stopifnot(!anyDuplicated(dna_manifest$sample_id))
+
+
+# ------------------------------------------------------------
+# Reader (as already defined in the pipeline; repeated here for a
+# self-contained block).
+# ------------------------------------------------------------
+
+read_dna_data <- function(experiment, donor) {
+    read.csv(
+        file.path(
+            local_wd_folder,
+            "results",
+            "per_sample",
+            experiment,
+            donor,
+            "dna_cnv",
+            "matrices",
+            "All_aberrancies.csv"
+        ),
+        header = TRUE,
+        row.names = "NGT"
+    )
+}
+
+
+# ------------------------------------------------------------
+# Barcode renaming (as already defined in the pipeline; repeated here).
+# ------------------------------------------------------------
+
+rename_dna_cell_barcodes <- function(dna_df, sample_id, suffix) {
+    barcode <- rownames(dna_df)
+
+    if (is.null(barcode)) {
+        stop("DNA data frame has no row names.")
+    }
+
+    barcode <- sub("^PT_ID[0-9]+(?:_FU)?\\.", "", barcode)
+    barcode <- sub("^PT[0-9]+(?:_FU)?\\.PT[0-9]+(?:_FU)?_", "", barcode)
+    barcode <- sub("_(PT[0-9]+(?:FU)?)$", "", barcode)
+
+    new_barcodes <- paste0(sample_id, ".", sample_id, "_", barcode, "_", suffix)
+
+    if (anyDuplicated(new_barcodes)) {
+        stop("Duplicate DNA barcodes detected after renaming.")
+    }
+
+    rownames(dna_df) <- new_barcodes
+
+    dna_df
+}
+
+
+# ------------------------------------------------------------
+# Cell-key builder — reduces a cell name to <barcode>__<PTxx> regardless
+# of which prefix/suffix convention produced it, so DNA rownames and
+# `combined`'s actual cell names can be matched.
+# ------------------------------------------------------------
+
+make_cell_key <- function(cell_names) {
+    key <- sub(
+        "^.*(?:\\.|_)([^._]+)_(PT[0-9]+(?:FU)?)$",
+        "\\1__\\2",
+        cell_names,
+        perl = TRUE
+    )
+
+    valid <- grepl(
+        "^.*(?:\\.|_)[^._]+_(PT[0-9]+(?:FU)?)$",
+        cell_names,
+        perl = TRUE
+    )
+
+    key[!valid] <- NA_character_
+    key
+}
+
+
+# ------------------------------------------------------------
+# Variant-key normaliser (matches the one used earlier in the pipeline
+# for mutation_column_mapping) — collapses the different separator
+# styles seen across raw column names / annotation Variant IDs onto one
+# common key, so a TP53 locus can be recognised regardless of which
+# format it currently appears in.
+# ------------------------------------------------------------
+
+variant_key <- function(x) {
+    x <- trimws(as.character(x))
+    gsub("[:/.]", "_", x)
+}
+
+
+# ------------------------------------------------------------
+# TP53 hemizygous-as-HET lookup
+# ------------------------------------------------------------
+# Built from the variant annotation table assembled earlier in the
+# pipeline (captured_variants_annot_df, with Gene + Variant ID columns).
+# If that table isn't present in the environment (e.g. this block is run
+# standalone), TP53_MUTATION_KEYS stays empty and every mutation column
+# falls back to the standard HET/HOM split — a silent no-op rather than
+# an error, but worth noticing in the printed count below.
+# ------------------------------------------------------------
+
+TP53_MUTATION_KEYS <- character(0)
+
+if (exists("captured_variants_annot_df")) {
+
+    annotation_df <- as.data.frame(captured_variants_annot_df, stringsAsFactors = FALSE)
+
+    if (!"Variant ID" %in% colnames(annotation_df)) {
+        annotation_df$`Variant ID` <- rownames(annotation_df)
+    }
+
+    if ("Gene" %in% colnames(annotation_df)) {
+        TP53_MUTATION_KEYS <- unique(
+            variant_key(
+                annotation_df$`Variant ID`[
+                    trimws(as.character(annotation_df$Gene)) == "TP53"
+                ]
+            )
+        )
+    }
+}
+
+cat(
+    "TP53 loci identified for HET-not-HOM override:",
+    length(TP53_MUTATION_KEYS), "\n"
+)
+
+if (length(TP53_MUTATION_KEYS) == 0) {
+    cat(
+        "  NOTE: no TP53 loci found — `captured_variants_annot_df` may not ",
+        "be in the environment. Every mutation column will use the ",
+        "standard HET/HOM split (NGT 2 -> HOM) until this is available.\n"
+    )
+}
+
+is_tp53_mutation_column <- function(colname) {
+    variant_key(colname) %in% TP53_MUTATION_KEYS
+}
+
+
+# ------------------------------------------------------------
+# Column-type detectors
+# ------------------------------------------------------------
+
+is_cna_column <- function(x) {
+    !is.na(x) & grepl("^chr([0-9]+|X|Y)(p|q)?$", x)
+}
+
+is_mutation_column <- function(x) {
+    !is.na(x) & grepl("^chr([0-9]+|X|Y)\\.[0-9]+\\.", x)
+}
+
+
+# ------------------------------------------------------------
+# Split one CNA column into three 0/1 columns.
+# ------------------------------------------------------------
+
+split_cna_column <- function(values, colname) {
+    values <- as.character(values)
+
+    unexpected <- setdiff(unique(values[!is.na(values)]), c("WT", "Amp", "Del", "cnLOH"))
+
+    if (length(unexpected) > 0) {
+        warning(
+            "Unexpected value(s) in `", colname, "`: ",
+            paste(unexpected, collapse = ", "), " (treated as missing, not WT)"
+        )
+    }
+
+    known <- values %in% c("WT", "Amp", "Del", "cnLOH")
+
+    amp   <- as.integer(values == "Amp")
+    del   <- as.integer(values == "Del")
+    cnLOH <- as.integer(values == "cnLOH")
+
+    unassessed <- is.na(values) | !known
+    amp[unassessed]   <- NA_integer_
+    del[unassessed]   <- NA_integer_
+    cnLOH[unassessed] <- NA_integer_
+
+    out <- data.frame(amp = amp, del = del, cnLOH = cnLOH)
+    colnames(out) <- paste0(colname, c("_amp", "_del", "_cnLOH"))
+
+    out
+}
+
+
+# ------------------------------------------------------------
+# Split one mutation column into HET / HOM 0/1 columns.
+# NGT convention: 0 = WT, 1 = HET, 2 = HOM, 3 = missing / no-call.
+#
+# hemizygous_as_het = TRUE overrides this for TP53: NGT 1 (true HET) and
+# NGT 2 (hemizygous — a single mutant allele, the only copy remaining
+# after chr17p loss/cnLOH) both count as one mutant allele, so both map
+# to HET; HOM is never set for these columns, since this dataset never
+# actually observes two mutant TP53 alleles.
+# ------------------------------------------------------------
+
+split_mutation_column <- function(values, colname, hemizygous_as_het = FALSE) {
+    values <- suppressWarnings(as.numeric(as.character(values)))
+
+    unexpected <- setdiff(unique(values[!is.na(values)]), c(0, 1, 2, 3))
+
+    if (length(unexpected) > 0) {
+        warning(
+            "Unexpected NGT value(s) in `", colname, "`: ",
+            paste(unexpected, collapse = ", "), " (treated as missing)"
+        )
+    }
+
+    if (hemizygous_as_het) {
+        het <- as.integer(values %in% c(1, 2))
+        hom <- rep(0L, length(values))
+    } else {
+        het <- as.integer(values == 1)
+        hom <- as.integer(values == 2)
+    }
+
+    # No-call (3), NA, or anything unrecognised -> NA, not 0, so a missing
+    # genotype is never read as "confirmed WT" at that locus. Applied
+    # after the hemizygous_as_het branch so missingness is handled
+    # identically either way.
+    missing <- is.na(values) | values == 3 | !(values %in% c(0, 1, 2))
+    het[missing] <- NA_integer_
+    hom[missing] <- NA_integer_
+
+    out <- data.frame(het = het, hom = hom)
+    colnames(out) <- paste0(colname, c("_HET", "_HOM"))
+
+    out
+}
+
+
+# ------------------------------------------------------------
+# Safe column split: verifies length(values) == nrow(filtered_df) BEFORE
+# calling the split function, and forwards any extra arguments (e.g.
+# hemizygous_as_het) through to it.
+# ------------------------------------------------------------
+
+safe_split <- function(filtered_df, cn, split_fn, sample_label, ...) {
+    values <- filtered_df[[cn]]
+
+    if (is.null(values) || length(values) != nrow(filtered_df)) {
+        stop(
+            "'", sample_label, "': column `", cn, "` has length ",
+            length(values), " but filtered_df has ", nrow(filtered_df),
+            " rows. This usually means a duplicated or malformed column ",
+            "header in the source CSV for this sample — inspect the raw ",
+            "All_aberrancies.csv header for this sample directly."
+        )
+    }
+
+    split_fn(values, cn, ...)
+}
+
+
+# ------------------------------------------------------------
+# Validate a cbind()-assembled split block against the expected row
+# count, with a full per-column dump if it disagrees.
+# ------------------------------------------------------------
+
+validate_split_block <- function(split_block, expected_nrow, block_label, sample_label) {
+    if (is.null(split_block)) {
+        return(invisible(NULL))
+    }
+
+    if (nrow(split_block) != expected_nrow) {
+        per_col_len <- vapply(split_block, length, integer(1))
+
+        cat(
+            "\n'", sample_label, "' — ", block_label,
+            " row mismatch: expected ", expected_nrow, ", got ",
+            nrow(split_block), ".\nPer-column lengths:\n", sep = ""
+        )
+        print(per_col_len)
+
+        stop(
+            "'", sample_label, "': ", block_label,
+            " has ", nrow(split_block), " rows but filtered_df has ",
+            expected_nrow, " rows. See per-column length dump above."
+        )
+    }
+
+    invisible(NULL)
+}
+
+
+# ------------------------------------------------------------
+# Full per-sample pipeline: read -> rename -> KEY-MATCH to `combined` ->
+# split CNA and mutation columns.
+# ------------------------------------------------------------
+
+process_dna_sample <- function(experiment, donor, rename_sample_id, rename_suffix,
+                                seurat_cells, sample_label, verbose = TRUE) {
+
+    raw_df <- read_dna_data(experiment, donor)
+
+    n_before_rename <- nrow(raw_df)
+
+    if (verbose) {
+        message(
+            "  '", sample_label, "' raw dims: ", nrow(raw_df), " rows x ",
+            ncol(raw_df), " cols"
+        )
+    }
+
+    renamed_df <- rename_dna_cell_barcodes(
+        raw_df,
+        sample_id = rename_sample_id,
+        suffix = rename_suffix
+    )
+
+    dna_keys <- make_cell_key(rownames(renamed_df))
+    seurat_keys_full <- make_cell_key(seurat_cells)
+
+    if (anyNA(dna_keys)) {
+        warning(
+            "'", sample_label, "': could not parse ", sum(is.na(dna_keys)),
+            " DNA cell name(s) into a key; these rows cannot be matched."
+        )
+    }
+
+    seurat_key_lookup <- seurat_cells[!is.na(seurat_keys_full)]
+    names(seurat_key_lookup) <- seurat_keys_full[!is.na(seurat_keys_full)]
+
+    if (anyDuplicated(names(seurat_key_lookup))) {
+        stop(
+            "'", sample_label,
+            "': duplicated keys among Seurat cell names — cannot match ",
+            "unambiguously."
+        )
+    }
+
+    matched_seurat_names <- unname(seurat_key_lookup[dna_keys])
+
+    matched_idx <- !is.na(matched_seurat_names)
+
+    aligned_df <- renamed_df
+    rownames(aligned_df)[matched_idx] <- matched_seurat_names[matched_idx]
+
+    filtered_df <- aligned_df[matched_idx, , drop = FALSE]
+
+    if (anyDuplicated(rownames(filtered_df))) {
+        stop(
+            "'", sample_label,
+            "': duplicate cell names after key-based alignment — check ",
+            "for barcode collisions."
+        )
+    }
+
+    n_after_filter <- nrow(filtered_df)
+
+    if (n_after_filter == 0) {
+        stop(
+            "'", sample_label, "': 0 cells matched to `combined` after ",
+            "key-based alignment (", n_before_rename, " raw cells). ",
+            "Example DNA key: ", dna_keys[1], " | example Seurat key: ",
+            seurat_keys_full[1], ". This sample cannot be split with no ",
+            "rows — check its barcode/suffix convention against ",
+            "dna_manifest."
+        )
+    }
+
+    if (verbose) {
+        message(
+            "  '", sample_label, "' matched ", n_after_filter, " / ",
+            n_before_rename, " cells; filtered_df dims: ",
+            nrow(filtered_df), " x ", ncol(filtered_df)
+        )
+    }
+
+    bad_cols <- is.na(colnames(filtered_df)) | !nzchar(colnames(filtered_df))
+
+    if (any(bad_cols)) {
+        warning(
+            "'", sample_label, "': dropping ", sum(bad_cols),
+            " column(s) with missing/empty name(s) — likely a malformed ",
+            "header in the source CSV for this sample."
+        )
+        filtered_df <- filtered_df[, !bad_cols, drop = FALSE]
+    }
+
+    if (anyDuplicated(colnames(filtered_df))) {
+        dupes <- unique(colnames(filtered_df)[duplicated(colnames(filtered_df))])
+        stop(
+            "'", sample_label, "': duplicate column name(s) after ",
+            "dropping malformed headers: ", paste(dupes, collapse = ", "),
+            ". Inspect the source CSV header for this sample."
+        )
+    }
+
+    cna_cols <- colnames(filtered_df)[is_cna_column(colnames(filtered_df))]
+    mut_cols <- colnames(filtered_df)[is_mutation_column(colnames(filtered_df))]
+    other_cols <- setdiff(colnames(filtered_df), c(cna_cols, mut_cols))
+
+    n_tp53_cols <- sum(is_tp53_mutation_column(mut_cols))
+
+    if (verbose) {
+        message(
+            "  '", sample_label, "' column classification: ",
+            length(other_cols), " other, ", length(cna_cols), " CNA, ",
+            length(mut_cols), " mutation (", n_tp53_cols,
+            " TP53, HET-not-HOM applied)"
+        )
+    }
+
+    cna_split <- if (length(cna_cols) > 0) {
+        do.call(
+            cbind,
+            lapply(
+                cna_cols,
+                function(cn) safe_split(filtered_df, cn, split_cna_column, sample_label)
+            )
+        )
+    } else {
+        NULL
+    }
+
+    validate_split_block(cna_split, n_after_filter, "cna_split", sample_label)
+
+    mut_split <- if (length(mut_cols) > 0) {
+        do.call(
+            cbind,
+            lapply(
+                mut_cols,
+                function(cn) {
+                    safe_split(
+                        filtered_df, cn, split_mutation_column, sample_label,
+                        hemizygous_as_het = is_tp53_mutation_column(cn)
+                    )
+                }
+            )
+        )
+    } else {
+        NULL
+    }
+
+    validate_split_block(mut_split, n_after_filter, "mut_split", sample_label)
+
+    other_block <- filtered_df[, other_cols, drop = FALSE]
+    validate_split_block(other_block, n_after_filter, "other_block", sample_label)
+
+    out <- cbind(other_block, cna_split, mut_split)
+
+    rownames(out) <- rownames(filtered_df)
+
+    list(
+        data = out,
+        summary = data.frame(
+            sample_id = sample_label,
+            n_cells_raw = n_before_rename,
+            n_cells_in_combined = n_after_filter,
+            pct_retained = round(100 * n_after_filter / n_before_rename, 1),
+            n_cna_columns = length(cna_cols),
+            n_mutation_columns = length(mut_cols),
+            n_tp53_mutation_columns = n_tp53_cols,
+            stringsAsFactors = FALSE
+        )
+    )
+}
+
+
+# ------------------------------------------------------------
+# Run for every sample in the manifest
+# ------------------------------------------------------------
+
+seurat_cells <- colnames(combined)
+
+DNA_split_list <- setNames(
+    vector("list", nrow(dna_manifest)),
+    dna_manifest$sample_id
+)
+
+dna_split_log <- list()
+dna_split_failures <- list()
+
+for (i in seq_len(nrow(dna_manifest))) {
+    sample_id <- dna_manifest$sample_id[i]
+
+    message("Processing ", sample_id, " ...")
+
+    result <- tryCatch(
+        process_dna_sample(
+            experiment = dna_manifest$experiment[i],
+            donor = dna_manifest$donor[i],
+            rename_sample_id = dna_manifest$rename_sample_id[i],
+            rename_suffix = dna_manifest$rename_suffix[i],
+            seurat_cells = seurat_cells,
+            sample_label = sample_id
+        ),
+        error = function(e) {
+            message("  FAILED: ", conditionMessage(e))
+            dna_split_failures[[sample_id]] <<- conditionMessage(e)
+            NULL
+        }
+    )
+
+    if (is.null(result)) next
+
+    DNA_split_list[[sample_id]] <- result$data
+    dna_split_log[[sample_id]] <- result$summary
+}
+
+dna_split_summary <- do.call(rbind, dna_split_log)
+rownames(dna_split_summary) <- NULL
+
+print(dna_split_summary, row.names = FALSE)
+
+cat(
+    "\nTotal cells retained across all samples:",
+    sum(dna_split_summary$n_cells_in_combined),
+    "of", sum(dna_split_summary$n_cells_raw), "\n"
+)
+
+if (length(dna_split_failures) > 0) {
+    cat("\nSamples that FAILED to process:\n")
+    for (sample_id in names(dna_split_failures)) {
+        cat("  ", sample_id, ": ", dna_split_failures[[sample_id]], "\n", sep = "")
+    }
+} else {
+    cat("\nAll samples processed successfully.\n")
+}
+
+for (sample_id in names(DNA_split_list)) {
+    if (!is.null(DNA_split_list[[sample_id]])) {
+        assign(paste0("DNA_PT_ID", sample_id, "_split"), DNA_split_list[[sample_id]])
+    }
+}
+
+
+# ------------------------------------------------------------
+# Quick check on one sample: CNA (amp/del/cnLOH) columns.
+# ------------------------------------------------------------
+
+cna_split_cols <- grep(
+    "_amp$|_del$|_cnLOH$",
+    colnames(DNA_split_list[["PT01"]]),
+    value = TRUE
+)
+head(DNA_split_list[["PT01"]][, c("label", head(cna_split_cols, 6))])
+
+
+# ------------------------------------------------------------
+# Show mutation (HET/HOM) columns specifically.
+# ------------------------------------------------------------
+
+mut_split_cols <- grep(
+    "_HET$|_HOM$",
+    colnames(DNA_split_list[["PT01"]]),
+    value = TRUE
+)
+
+cat("Mutation (HET/HOM) columns found for PT01:", length(mut_split_cols), "\n")
+print(head(mut_split_cols, 10))
+
+head(DNA_split_list[["PT01"]][, c("label", head(mut_split_cols, 6))])
+
+
+# ------------------------------------------------------------
+# Before / after comparison
+# ------------------------------------------------------------
+# Confirms the TP53 HET-not-HOM override directly: for the "_Hem" rows
+# (NGT == 2 at the TP53 locus), the split output should now show
+# _HET = 1, _HOM = 0 — not the reverse.
+
+compare_sample_id <- "PT01"
+
+raw_df <- read_dna_data(
+    dna_manifest$experiment[dna_manifest$sample_id == compare_sample_id],
+    dna_manifest$donor[dna_manifest$sample_id == compare_sample_id]
+)
+
+raw_renamed <- rename_dna_cell_barcodes(
+    raw_df,
+    sample_id = dna_manifest$rename_sample_id[dna_manifest$sample_id == compare_sample_id],
+    suffix = dna_manifest$rename_suffix[dna_manifest$sample_id == compare_sample_id]
+)
+
+split_df <- DNA_split_list[[compare_sample_id]]
+
+raw_keys <- make_cell_key(rownames(raw_renamed))
+split_keys <- make_cell_key(rownames(split_df))
+
+example_keys <- head(
+    intersect(
+        raw_keys[raw_renamed$label != "WT"],
+        split_keys
+    ),
+    4
+)
+
+raw_examples <- raw_renamed[match(example_keys, raw_keys), , drop = FALSE]
+split_examples <- split_df[match(example_keys, split_keys), , drop = FALSE]
+
+raw_cna_check_cols <- c("chr5q", "chr7p", "chr7q", "chr17p")
+
+after_cna_check_cols <- unlist(
+    lapply(raw_cna_check_cols, function(cn) paste0(cn, c("_amp", "_del", "_cnLOH")))
+)
+
+raw_mut_check_col <- grep("^chr17\\.", colnames(raw_examples), value = TRUE)[1]
+after_mut_check_cols <- paste0(raw_mut_check_col, c("_HET", "_HOM"))
+
+cat(
+    "\nTP53 locus under comparison:", raw_mut_check_col,
+    "| treated as TP53 (HET-not-HOM):",
+    is_tp53_mutation_column(raw_mut_check_col), "\n"
+)
+
+cat("\n===== BEFORE (raw All_aberrancies.csv, renamed) =====\n")
+print(
+    raw_examples[, c("label", raw_cna_check_cols, raw_mut_check_col)],
+    row.names = TRUE
+)
+
+cat("\n===== AFTER (split into 0/1 columns) =====\n")
+print(
+    split_examples[, c("label", after_cna_check_cols, after_mut_check_cols)],
+    row.names = TRUE
+)
+
+cat(
+    "\nExpected for '_Hem' rows: ", after_mut_check_cols[1], " = 1, ",
+    after_mut_check_cols[2], " = 0 (hemizygous = one mutant allele, ",
+    "not two).\n", sep = ""
+)
+
+
+# ------------------------------------------------------------
+# Targeted diagnostic for a still-failing sample
+# ------------------------------------------------------------
+
+diagnose_dna_sample <- function(sample_id) {
+    row <- dna_manifest[dna_manifest$sample_id == sample_id, ]
+
+    raw_df <- read_dna_data(row$experiment, row$donor)
+
+    cat("===== ", sample_id, " raw diagnostic =====\n", sep = "")
+    cat("dim(raw_df):", nrow(raw_df), "rows x", ncol(raw_df), "cols\n")
+    cat("Any NA/blank column names?:",
+        any(is.na(colnames(raw_df)) | !nzchar(colnames(raw_df))), "\n")
+    cat("Any duplicated column names?:", anyDuplicated(colnames(raw_df)) > 0, "\n")
+    cat("First 10 column names:\n")
+    print(head(colnames(raw_df), 10))
+    cat("Last 10 column names:\n")
+    print(tail(colnames(raw_df), 10))
+
+    renamed_df <- rename_dna_cell_barcodes(raw_df, row$rename_sample_id, row$rename_suffix)
+
+    dna_keys <- make_cell_key(rownames(renamed_df))
+    seurat_keys_full <- make_cell_key(colnames(combined))
+
+    cat("\nDNA cell-key parse failures:", sum(is.na(dna_keys)), "/", length(dna_keys), "\n")
+    cat("Example renamed rowname:", rownames(renamed_df)[1], "\n")
+    cat("Example DNA key:", dna_keys[1], "\n")
+    cat("Cells matched to `combined`:",
+        sum(dna_keys %in% seurat_keys_full, na.rm = TRUE), "/", length(dna_keys), "\n")
+
+    invisible(list(raw_df = raw_df, renamed_df = renamed_df, dna_keys = dna_keys))
+}
+
+# Uncomment to run against one of the failing samples:
+# diagnostic_PT04 <- diagnose_dna_sample("PT04")
+
+
+# ============================================================
+# Build HUNTRESS-ready ternary mutation matrices, one per sample
+# ============================================================
+# HUNTRESS input spec (confirmed from PASSIONLab/HUNTRESS docs):
+#   - tab-delimited, rows = cells, columns = mutations
+#   - upper-left cell literally the string "cellID/mutID"
+#   - values: 0 = absent, 1 = present, 3 = missing/no-call
+#
+# Built by re-reading and re-filtering each sample directly (reusing
+# read_dna_data / rename_dna_cell_barcodes / make_cell_key / is_mutation_
+# column from above), rather than reconstructing NGT out of the HET/HOM
+# split already built into DNA_split_list — that split intentionally
+# discards the distinction between HET and HOM/hemizygous, and for
+# HUNTRESS's presence/absence model neither the HET/HOM/TP53-hemizygous
+# distinction nor any CNA column is relevant, so the simplest and most
+# direct source is the raw NGT value at each mutation locus:
+#   NGT 0        -> 0 (absent)
+#   NGT 1 or 2   -> 1 (present — het, hom, and hemizygous all collapse
+#                       to "mutation present" for tree reconstruction)
+#   NGT 3 or NA  -> 3 (missing / no-call)
+#
+# Run per sample, not pooled: HUNTRESS reconstructs one clonal tree per
+# input matrix, and pooling unrelated patients' mutations into one
+# matrix does not correspond to a real phylogeny.
+# ============================================================
+
+HUNTRESS_INPUT_DIR <- file.path(local_wd_folder, "results", "huntress", "input")
+dir.create(HUNTRESS_INPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Mutations present in fewer than this many cells, or missing (NGT == 3)
+# in more than this fraction of cells, are dropped before writing —
+# mirrors the filtering the HUNTRESS paper itself applied (>650 missing
+# entries, <10 cells with the mutation, in their HGSOC dataset). Set to
+# 0 / 1 to disable filtering entirely.
+MIN_CELLS_WITH_MUTATION <- 5
+MAX_MISSING_FRACTION <- 0.5
+
+
+# ------------------------------------------------------------
+# Recode NGT -> HUNTRESS ternary encoding (0 / 1 / 3)
+# ------------------------------------------------------------
+
+recode_for_huntress <- function(values) {
+    values <- suppressWarnings(as.numeric(as.character(values)))
+
+    out <- rep(3L, length(values))          # default: missing
+    out[values == 0] <- 0L                  # WT
+    out[values %in% c(1, 2)] <- 1L          # HET or HOM/hemizygous -> present
+    # values == 3, NA, or anything unrecognised stays 3 (missing)
+
+    out
+}
+
+
+# ------------------------------------------------------------
+# Build and write one sample's HUNTRESS input matrix
+# ------------------------------------------------------------
+
+build_huntress_matrix <- function(experiment, donor, rename_sample_id, rename_suffix,
+                                   seurat_cells, sample_label, out_dir) {
+
+    raw_df <- read_dna_data(experiment, donor)
+
+    renamed_df <- rename_dna_cell_barcodes(
+        raw_df,
+        sample_id = rename_sample_id,
+        suffix = rename_suffix
+    )
+
+    # Same key-based match used in process_dna_sample() — see that
+    # function's comments for why a plain rowname intersect fails here.
+    dna_keys <- make_cell_key(rownames(renamed_df))
+    seurat_keys_full <- make_cell_key(seurat_cells)
+
+    seurat_key_lookup <- seurat_cells[!is.na(seurat_keys_full)]
+    names(seurat_key_lookup) <- seurat_keys_full[!is.na(seurat_keys_full)]
+
+    matched_seurat_names <- unname(seurat_key_lookup[dna_keys])
+    matched_idx <- !is.na(matched_seurat_names)
+
+    if (sum(matched_idx) == 0) {
+        warning("'", sample_label, "': 0 cells matched; skipping.")
+        return(invisible(NULL))
+    }
+
+    aligned_df <- renamed_df
+    rownames(aligned_df)[matched_idx] <- matched_seurat_names[matched_idx]
+    filtered_df <- aligned_df[matched_idx, , drop = FALSE]
+
+    if (anyDuplicated(rownames(filtered_df))) {
+        stop(
+            "'", sample_label,
+            "': duplicate cell names after key-based alignment — check ",
+            "for barcode collisions."
+        )
+    }
+
+    mut_cols <- colnames(filtered_df)[is_mutation_column(colnames(filtered_df))]
+
+    if (length(mut_cols) == 0) {
+        warning("'", sample_label, "': no mutation (locus-level) columns found; skipping.")
+        return(invisible(NULL))
+    }
+
+    geno <- as.data.frame(
+        lapply(mut_cols, function(cn) recode_for_huntress(filtered_df[[cn]])),
+        row.names = rownames(filtered_df)
+    )
+    colnames(geno) <- mut_cols
+
+    # ---- Filter sparse/uninformative mutations -------------------------
+    n_present <- colSums(geno == 1)
+    frac_missing <- colSums(geno == 3) / nrow(geno)
+
+    keep_muts <- n_present >= MIN_CELLS_WITH_MUTATION &
+        frac_missing <= MAX_MISSING_FRACTION
+
+    if (sum(keep_muts) == 0) {
+        warning(
+            "'", sample_label, "': no mutations pass MIN_CELLS_WITH_MUTATION = ",
+            MIN_CELLS_WITH_MUTATION, " / MAX_MISSING_FRACTION = ",
+            MAX_MISSING_FRACTION, "; skipping."
+        )
+        return(invisible(NULL))
+    }
+
+    geno <- geno[, keep_muts, drop = FALSE]
+
+    cat(
+        "'", sample_label, "': ", nrow(geno), " cells x ", ncol(geno),
+        " mutations (", sum(!keep_muts), " mutation(s) dropped by filter)\n",
+        sep = ""
+    )
+
+    # ---- Write in HUNTRESS's exact expected format ----------------------
+    out_path <- file.path(out_dir, paste0(sample_label, "_huntress_input.tsv"))
+
+    write.table(
+        cbind(`cellID/mutID` = rownames(geno), geno),
+        file = out_path,
+        sep = "\t",
+        quote = FALSE,
+        row.names = FALSE,
+        col.names = TRUE
+    )
+
+    cat("  Wrote:", out_path, "\n")
+
+    invisible(list(matrix = geno, path = out_path))
+}
+
+
+# ------------------------------------------------------------
+# Run for every sample
+# ------------------------------------------------------------
+
+huntress_input_log <- list()
+huntress_input_failures <- list()
+
+for (i in seq_len(nrow(dna_manifest))) {
+    sample_id <- dna_manifest$sample_id[i]
+
+    message("Building HUNTRESS input for ", sample_id, " ...")
+
+    result <- tryCatch(
+        build_huntress_matrix(
+            experiment = dna_manifest$experiment[i],
+            donor = dna_manifest$donor[i],
+            rename_sample_id = dna_manifest$rename_sample_id[i],
+            rename_suffix = dna_manifest$rename_suffix[i],
+            seurat_cells = seurat_cells,
+            sample_label = sample_id,
+            out_dir = HUNTRESS_INPUT_DIR
+        ),
+        error = function(e) {
+            message("  FAILED: ", conditionMessage(e))
+            huntress_input_failures[[sample_id]] <<- conditionMessage(e)
+            NULL
+        }
+    )
+
+    if (is.null(result)) next
+
+    huntress_input_log[[sample_id]] <- data.frame(
+        sample_id = sample_id,
+        n_cells = nrow(result$matrix),
+        n_mutations = ncol(result$matrix),
+        path = result$path,
+        stringsAsFactors = FALSE
+    )
+}
+
+huntress_input_summary <- do.call(rbind, huntress_input_log)
+rownames(huntress_input_summary) <- NULL
+
+cat("\n============================================\n")
+cat("HUNTRESS input matrices\n")
+cat("============================================\n")
+
+print(huntress_input_summary, row.names = FALSE)
+
+if (length(huntress_input_failures) > 0) {
+    cat("\nSamples that FAILED to produce a HUNTRESS input matrix:\n")
+    for (sample_id in names(huntress_input_failures)) {
+        cat("  ", sample_id, ": ", huntress_input_failures[[sample_id]], "\n", sep = "")
+    }
+} else {
+    cat("\nAll samples produced a HUNTRESS input matrix.\n")
+}
+
+cat(
+    "\nHUNTRESS input files written to:", HUNTRESS_INPUT_DIR,
+    "\n(one *_huntress_input.tsv per sample, ready for",
+    "'python HUNTRESS.py --i <file> --o <output_prefix>')\n"
+)
+```
+

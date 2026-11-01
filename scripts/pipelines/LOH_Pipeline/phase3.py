@@ -1,45 +1,59 @@
 """
-Phase 3 – LOH Clone QC: Outlier Removal, Homogeneity, Rescue, Reconciliation
-==============================================================================
+Phase 3 – LOH clone QC: outlier removal, rescue, homogeneity, reconciliation.
+=============================================================================
 
-Steps executed in order:
+Entry point: ``run_phase3(state, cfg=None)``.  Steps executed in order:
 
-1. **Per-cell outlier removal** — correlate every cell to clone mean on
-   LOH-arm variants. Strip cells below ``mean(r) − k × std(r)``
-   (default k=2).
+1. **Per-cell outlier removal** — correlate every cell to its clone mean on
+   the LOH block (or all LOH-arm variants).  Clones with more than
+   ``phase3_outlier_small_clone_max_cells`` (default 10) cells strip cells
+   below ``mean(r) − k × std(r)`` (``phase3_outlier_k``, default 2); smaller
+   clones strip only cells below an absolute floor (default 0.80).
 
-2. **Rescue merges** — small LOH clones merged into a compatible LOH
-   clone (same base, arms ⊆ target; small→small allowed).
+2. **Rescue merges** — small LOH clones (< ``min_final_clone_size``) merged
+   into a same-base LOH clone whose arm set is a strict superset, when the
+   mean profiles correlate on every target arm (small→small allowed).
 
-3. **Clone-level homogeneity** — discard clones whose average
-   cell-to-mean r is below ``phase3_min_mean_corr_to_mean``. Directional
-   consistency is checked on the LOH block for single-arm clones and separately
-   on each LOH arm for multi-arm clones. Optionally, a single discordant
-   amplicon can be tolerated for strong blocks, consistent with ADO/dropout.
+3. **Clone-level homogeneity** — single-arm clones need mean cell-to-mean r
+   ≥ ``phase3_min_mean_corr_to_mean`` plus directional consistency on the LOH
+   block (optionally tolerating one discordant amplicon, consistent with
+   ADO).  Directional failures are split on the cell axis into validated
+   child clones; unresolved cells become ``SUB:`` and other failures ``FP:``.
+   Multi-arm clones are checked for correlation independently on each
+   arm's Phase-1 block (no directional check); partial failures become
+   ``SUB:``.
+
+3b. **Nested parent-child rescue** (``phase3_nested_loh_rescue_enabled``) —
+   ``FP:`` populations with a single same-base active child whose LOH arms are
+   a strict superset are partitioned into parent / child / FP cells.
 
 4. **Discard small LOH clones** — revert clones below
-   ``min_final_clone_size``.
+   ``min_final_clone_size`` to their base label.
 
-4b. **Flag reverted LOH outliers** — cells stripped of LOH that
-   still show extreme AF pattern are retained as per-clone `FP: ...` labels.
+4b. **Flag reverted LOH outliers** — cells stripped of LOH that still show
+   an extreme AF pattern are retained under per-clone ``FP: ...`` labels.
 
-5. **Results reconciliation** — prune ``state.results`` to match
+5. **Results reconciliation** — prune ``state.results`` to match the
    surviving labels.
 
-Call after Phase 2::
+Run after Phase 1 (Phase 2 is skipped in the current pipeline)::
 
-    from phase3 import run_phase3
+    from LOH_Pipeline.phase3 import run_phase3
     results = run_phase3(state)
 
-Controlled by ``cfg.skip_homogeneity_check``.
+When ``cfg.skip_homogeneity_check`` is True only step 5 runs.
+
+``loh_config`` helpers are imported inside each function (as in the original
+code) so that runtime lookups go through the ``loh_config`` module.
 """
 from __future__ import annotations
 
 import re
-import numpy as np
-import pandas as pd
 from collections import defaultdict
 from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
 
 if TYPE_CHECKING:
     from .loh_config import LOHConfig, PipelineState
@@ -352,8 +366,9 @@ def _per_cell_outlier_removal(state: "PipelineState", cfg: "LOHConfig") -> int:
     cells are removed only when r is below the absolute
     ``phase3_outlier_small_clone_abs_corr_floor`` (default 0.80).
 
-    For localized LOH clones (with cytoband annotation), uses only the
-    LOH-block variants for correlation.
+    Correlation uses the clone's LOH-block variants (persisted Phase-1 block,
+    else the cytoband range in the label) when ≥ 3 are available, otherwise
+    all variants of the clone's LOH arms.
 
     For clones with < 3 scoreable cells, skips entirely.
 
@@ -487,13 +502,17 @@ def _per_cell_outlier_removal(state: "PipelineState", cfg: "LOHConfig") -> int:
 
 def _rescue_merges(state: "PipelineState", cfg: "LOHConfig") -> int:
     """
-    Merge small LOH clones into a compatible LOH clone (same base,
-    arms ⊆ target; small→small allowed).
+    Merge small LOH clones into a compatible LOH clone.
 
-    Strict: source must match target mean on every target arm
-    (r ≥ post_merge_correlation_threshold).
+    A source (< ``min_final_clone_size`` cells) may merge into a target with
+    the same base genotype whose LOH arm set is a strict superset of the
+    source's (small→small allowed).  The source mean profile must correlate
+    with the target mean on every target arm (r ≥
+    ``post_merge_correlation_threshold``, ≥ max(3,
+    ``min_variants_per_arm_for_corr``) variants per arm); the target with the
+    highest mean r wins.  Merges are resolved transitively with union-find.
 
-    Returns number of source labels merged.
+    Returns the number of source labels merged.
     """
     from .loh_config import (
         vprint, get_base_clone, extract_chr_arms,
@@ -859,7 +878,8 @@ def _split_directional_failure(
             usable = (row != 0) & (sig != 0)
             scores.append(int(np.sum(row[usable] == sig[usable]) - np.sum(row[usable] != sig[usable])))
         if scores[0] == scores[1]:
-            # Preserve exact anchor evidence; unresolved cells remain FP.
+            # Tie: fall back to the anchor variant; cells with no anchor
+            # call stay unassigned (SUB/FP via the default assignment).
             if row[anchor_k] == -1:
                 groups[0].append(row_i)
             elif row[anchor_k] == 1:
@@ -910,7 +930,7 @@ def _split_directional_failure(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Step 3a: High-similarity multi-arm directional decomposition
+# Step 3a: Multi-arm clones — per-arm homogeneity
 # ═══════════════════════════════════════════════════════════════════
 
 def _multi_arm_loh_tokens(clone_label: str) -> list[tuple[str, str]]:
@@ -928,392 +948,6 @@ def _multi_arm_loh_tokens(clone_label: str) -> list[tuple[str, str]]:
         out.append((arm, full_token))
         seen.add(arm)
     return out
-
-
-def _multi_arm_block_for_arm(
-    *,
-    clone_label: str,
-    cells_in_df: list,
-    arm: str,
-    token: str,
-    state: "PipelineState",
-    cfg: "LOHConfig",
-    min_variants: int,
-) -> list[str]:
-    """Resolve a clone's persisted or cytoband-localised LOH block per arm."""
-    from .loh_config import arm_variants
-
-    arm_vars = [
-        str(v) for v in arm_variants(str(arm), state)
-        if str(v) in state.df_numeric.columns
-    ]
-    if not arm_vars:
-        return []
-    arm_set = set(arm_vars)
-
-    # First derive the dominant contiguous LOH core directly from the parent
-    # population. A pooled multi-arm block map can contain whole-arm variants;
-    # using only its local extreme core prevents irrelevant flank variants from
-    # manufacturing a directional failure during decomposition.
-    source_cells = [c for c in cells_in_df if c in state.df_numeric.index]
-    if source_cells:
-        arm_af = state.df_numeric.loc[source_cells, arm_vars].apply(pd.to_numeric, errors="coerce")
-        low_fraction = (arm_af <= float(cfg.low_allele_threshold)).mean(axis=0)
-        high_fraction = (arm_af >= float(cfg.high_allele_threshold)).mean(axis=0)
-        dominant_fraction = pd.concat([low_fraction, high_fraction], axis=1).max(axis=1)
-        core_threshold = float(
-            getattr(cfg, "phase3_multi_arm_decomposition_min_variant_extreme_fraction", 0.60)
-        )
-        passed = (dominant_fraction.reindex(arm_vars).fillna(0.0).to_numpy() >= core_threshold)
-        best = None
-        run_start = None
-        for i, value in enumerate(passed):
-            if value and run_start is None:
-                run_start = i
-            if (not value or i == len(passed) - 1) and run_start is not None:
-                run_end = i if value and i == len(passed) - 1 else i - 1
-                run_vars = arm_vars[run_start:run_end + 1]
-                if len(run_vars) >= int(min_variants):
-                    score = float(dominant_fraction.reindex(run_vars).mean())
-                    candidate = (len(run_vars), score, run_start, run_vars)
-                    if best is None or candidate[:3] > best[:3]:
-                        best = candidate
-                run_start = None
-        if best is not None:
-            return list(best[3])
-
-    persisted = [
-        str(v)
-        for v in (getattr(state, "clone_block_variants", {}) or {}).get(str(clone_label), [])
-        if str(v) in arm_set
-    ]
-    persisted = list(dict.fromkeys(persisted))
-    if len(persisted) >= int(min_variants):
-        return persisted
-
-    # Parse the arm-specific token itself so a multi-arm persisted map cannot
-    # obscure a valid cytoband-localised block for this one arm.
-    parsed = _loh_block_variants(str(token), state) or []
-    parsed = list(dict.fromkeys(str(v) for v in parsed if str(v) in arm_set))
-    if len(parsed) >= int(min_variants):
-        return parsed
-
-    # Conservative fallback: use the full available arm only when Phase 1 did
-    # not persist enough block-specific variants. The later per-arm QC remains
-    # strict, so this does not relax calling criteria.
-    return arm_vars
-
-
-def _multi_arm_consensus_support(
-    X: np.ndarray,
-    *,
-    low_thr: float,
-    high_thr: float,
-    min_called: int,
-    min_extreme_fraction: float,
-    min_direction_match_fraction: float,
-    min_consensus_variants: int,
-) -> tuple[np.ndarray, list[dict], np.ndarray]:
-    """Call per-cell support for one LOH arm against its clone consensus.
-
-    Consensus is learnt independently for each variant as its dominant extreme
-    direction. A cell supports the arm only when it has enough callable
-    variants, is LOH-extreme across the arm block, and agrees with the
-    variant-wise direction signature. Mid-range calls count against support;
-    missing values do not.
-    """
-    X = np.asarray(X, dtype=float)
-    if X.ndim != 2 or X.shape[1] == 0:
-        return np.zeros(X.shape[0] if X.ndim == 2 else 0, dtype=bool), [], np.zeros(0, dtype=np.int8)
-
-    states = np.zeros(X.shape, dtype=np.int8)
-    states[np.isfinite(X) & (X <= float(low_thr))] = -1
-    states[np.isfinite(X) & (X >= float(high_thr))] = 1
-
-    consensus = np.zeros(X.shape[1], dtype=np.int8)
-    for j in range(X.shape[1]):
-        n_low = int(np.sum(states[:, j] == -1))
-        n_high = int(np.sum(states[:, j] == 1))
-        if n_low == 0 and n_high == 0:
-            continue
-        consensus[j] = -1 if n_low >= n_high else 1
-
-    usable_consensus = consensus != 0
-    if int(usable_consensus.sum()) < int(min_consensus_variants):
-        return np.zeros(X.shape[0], dtype=bool), [
-            {
-                "n_called": int(np.isfinite(X[i]).sum()),
-                "extreme_fraction": float("nan"),
-                "direction_match_fraction": float("nan"),
-                "n_consensus_called": 0,
-                "support": False,
-            }
-            for i in range(X.shape[0])
-        ], consensus
-
-    support = np.zeros(X.shape[0], dtype=bool)
-    metrics: list[dict] = []
-    for i in range(X.shape[0]):
-        finite = np.isfinite(X[i])
-        n_called = int(finite.sum())
-        n_extreme = int(np.sum(states[i, finite] != 0))
-        extreme_fraction = float(n_extreme / n_called) if n_called else float("nan")
-        direction_mask = finite & usable_consensus
-        n_direction = int(direction_mask.sum())
-        if n_direction:
-            direction_match = float(np.mean(states[i, direction_mask] == consensus[direction_mask]))
-        else:
-            direction_match = float("nan")
-        passes = (
-            n_called >= int(min_called)
-            and n_direction >= int(min_called)
-            and np.isfinite(extreme_fraction)
-            and extreme_fraction >= float(min_extreme_fraction)
-            and np.isfinite(direction_match)
-            and direction_match >= float(min_direction_match_fraction)
-        )
-        support[i] = bool(passes)
-        metrics.append({
-            "n_called": n_called,
-            "extreme_fraction": extreme_fraction,
-            "direction_match_fraction": direction_match,
-            "n_consensus_called": n_direction,
-            "support": bool(passes),
-        })
-    return support, metrics, consensus
-
-
-def _existing_or_composed_multi_arm_label(
-    *,
-    base: str,
-    combo_arms: tuple[str, ...],
-    ordered_tokens: list[tuple[str, str]],
-    state: "PipelineState",
-) -> str:
-    """Reuse an exact active arm-set label when available, otherwise compose one."""
-    from .loh_config import extract_chr_arms, get_base_clone
-
-    combo_set = set(combo_arms)
-    matches = [
-        str(label)
-        for label, cells in state.clone_to_cells.items()
-        if str(get_base_clone(str(label))) == str(base)
-        and set(extract_chr_arms(str(label))) == combo_set
-        and len(cells) > 0
-    ]
-    if len(matches) == 1:
-        return matches[0]
-
-    tokens = [token for arm, token in ordered_tokens if arm in combo_set]
-    return f"{base} {' '.join(tokens)}".strip()
-
-
-def _decompose_high_similarity_multi_arm_failure(
-    *,
-    clone_label: str,
-    cells_in_df: list,
-    X: np.ndarray,
-    state: "PipelineState",
-    cfg: "LOHConfig",
-    parent_metrics: dict,
-) -> tuple[dict[object, str], dict, list[dict]]:
-    """Resolve a coherent directional-failing multi-arm clone arm by arm.
-
-    A pooled directional failure does not automatically imply a false clone.
-    When the clone has a high cell-to-centroid similarity, arm support is
-    evaluated independently for every cell. The resulting arm-combination
-    groups are retained only after each represented arm passes its own
-    homogeneity/directional QC. Unsupported or undersized combinations remain
-    in the original FP label.
-    """
-    from .loh_config import get_base_clone, make_fp_label, sort_chromosome_arms
-
-    fp_label = make_fp_label(clone_label)
-    default_assignment = {cell: fp_label for cell in cells_in_df}
-    info = {
-        "attempted": False,
-        "reason": "",
-        "n_recovered_groups": 0,
-        "n_fp": len(cells_in_df),
-        "arms": [],
-        "groups": [],
-        "audit_rows": [],
-        "block_updates": {},
-    }
-
-    if not bool(getattr(cfg, "phase3_multi_arm_decomposition_enabled", True)):
-        info["reason"] = "multi_arm_decomposition_disabled"
-        return default_assignment, info, []
-
-    parent_mean_r = float(parent_metrics.get("mean_r", float("nan")))
-    min_parent_r = float(getattr(cfg, "phase3_multi_arm_decomposition_min_parent_mean_r", 0.90))
-    if not np.isfinite(parent_mean_r) or parent_mean_r < min_parent_r:
-        info["reason"] = f"parent_mean_r_below_gate:{parent_mean_r:.3f}<{min_parent_r:.3f}"
-        return default_assignment, info, []
-
-    ordered_tokens = _multi_arm_loh_tokens(clone_label)
-    min_arms = int(getattr(cfg, "phase3_multi_arm_decomposition_min_arms", 2))
-    if len(ordered_tokens) < min_arms:
-        info["reason"] = "not_multi_arm"
-        return default_assignment, info, []
-
-    min_block = int(getattr(cfg, "phase3_multi_arm_decomposition_min_block_variants", 4))
-    arm_blocks: dict[str, list[str]] = {}
-    arm_support: dict[str, np.ndarray] = {}
-    arm_support_metrics: dict[str, list[dict]] = {}
-    arm_qc: dict[str, dict] = {}
-
-    for arm, token in ordered_tokens:
-        block = _multi_arm_block_for_arm(
-            clone_label=clone_label,
-            cells_in_df=cells_in_df,
-            arm=arm,
-            token=token,
-            state=state,
-            cfg=cfg,
-            min_variants=min_block,
-        )
-        if len(block) < min_block:
-            info["reason"] = f"{arm}:block_too_short:{len(block)}<{min_block}"
-            return default_assignment, info, []
-        arm_X = state.df_numeric.loc[cells_in_df, block].values.astype(float)
-        support, per_cell_metrics, consensus = _multi_arm_consensus_support(
-            arm_X,
-            low_thr=cfg.low_allele_threshold,
-            high_thr=cfg.high_allele_threshold,
-            min_called=min_block,
-            min_extreme_fraction=float(getattr(cfg, "phase3_multi_arm_decomposition_min_cell_extreme_fraction", 0.70)),
-            min_direction_match_fraction=float(getattr(cfg, "phase3_multi_arm_decomposition_min_direction_match_fraction", 0.75)),
-            min_consensus_variants=int(getattr(cfg, "phase3_multi_arm_decomposition_min_consensus_variants", min_block)),
-        )
-        arm_blocks[arm] = block
-        arm_support[arm] = support
-        arm_support_metrics[arm] = per_cell_metrics
-        arm_qc[arm] = {
-            "token": token,
-            "n_block_variants": len(block),
-            "n_consensus_variants": int(np.sum(consensus != 0)),
-            "n_support": int(np.sum(support)),
-        }
-
-    info["attempted"] = True
-    info["arms"] = [arm for arm, _ in ordered_tokens]
-
-    # Partition cells by their complete supported-arm set. No arm is silently
-    # dropped: cells that support no arm are retained as possible LOH / FP.
-    grouped_rows: dict[tuple[str, ...], list[int]] = defaultdict(list)
-    arm_order = [arm for arm, _ in ordered_tokens]
-    for i in range(len(cells_in_df)):
-        combo = tuple(arm for arm in arm_order if bool(arm_support[arm][i]))
-        grouped_rows[combo].append(i)
-
-    base = get_base_clone(clone_label)
-    min_cells_cfg = getattr(cfg, "phase3_multi_arm_decomposition_min_cells", None)
-    min_cells = int(cfg.min_final_clone_size if min_cells_cfg is None else min_cells_cfg)
-    require_arm_homogeneity = bool(
-        getattr(cfg, "phase3_multi_arm_decomposition_require_per_arm_homogeneity", True)
-    )
-
-    assignments = dict(default_assignment)
-    recovered_groups: list[dict] = []
-    lineage_records: list[dict] = []
-
-    for combo, row_idx in sorted(grouped_rows.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        group_cells = [cells_in_df[i] for i in row_idx]
-        status = "retain_fp_no_arm_support"
-        new_label = fp_label
-        validation: dict[str, dict] = {}
-
-        if combo and len(group_cells) >= min_cells:
-            arm_passes = True
-            union_block: list[str] = []
-            for arm in combo:
-                arm_X = state.df_numeric.loc[group_cells, arm_blocks[arm]].values.astype(float)
-                metrics = _homogeneity_metrics(
-                    arm_X,
-                    arm_blocks[arm],
-                    state,
-                    cfg,
-                    min_vars=min(3, len(arm_blocks[arm])),
-                )
-                validation[arm] = metrics
-                union_block.extend(arm_blocks[arm])
-                if require_arm_homogeneity and not bool(metrics.get("passes", False)):
-                    arm_passes = False
-
-            if arm_passes:
-                combo_sorted = tuple(sort_chromosome_arms(list(combo)))
-                new_label = _existing_or_composed_multi_arm_label(
-                    base=base,
-                    combo_arms=combo_sorted,
-                    ordered_tokens=ordered_tokens,
-                    state=state,
-                )
-                for cell in group_cells:
-                    assignments[cell] = new_label
-                union_block = list(dict.fromkeys(str(v) for v in union_block))
-                info["block_updates"][new_label] = union_block
-                recovered_groups.append({
-                    "label": new_label,
-                    "arms": combo_sorted,
-                    "n_cells": len(group_cells),
-                    "block_variants": union_block,
-                    "validation": validation,
-                })
-                status = "recovered_arm_combination"
-            else:
-                status = "retain_fp_per_arm_homogeneity_fail"
-        elif combo:
-            status = f"retain_fp_group_too_small:{len(group_cells)}<{min_cells}"
-
-        for i in row_idx:
-            cell = cells_in_df[i]
-            row = {
-                "source_label": str(clone_label),
-                "cell_id": str(cell),
-                "assignment": status,
-                "new_label": new_label,
-                "supported_arms": ";".join(combo),
-                "n_supported_arms": len(combo),
-                "parent_mean_r": parent_mean_r,
-            }
-            for arm in arm_order:
-                metric = arm_support_metrics[arm][i]
-                row[f"{arm}_support"] = bool(metric["support"])
-                row[f"{arm}_n_called"] = int(metric["n_called"])
-                row[f"{arm}_extreme_fraction"] = metric["extreme_fraction"]
-                row[f"{arm}_direction_match"] = metric["direction_match_fraction"]
-            info["audit_rows"].append(row)
-
-    # Mark parent→child arm-subset relations, so generic Phase 4d cannot
-    # collapse a validated parent into its child on a later iterative pass.
-    seen_lineages: set[tuple[str, str]] = set()
-    for parent in recovered_groups:
-        parent_set = set(parent["arms"])
-        for child in recovered_groups:
-            child_set = set(child["arms"])
-            if parent["label"] == child["label"] or not parent_set < child_set:
-                continue
-            pair = (str(parent["label"]), str(child["label"]))
-            if pair in seen_lineages:
-                continue
-            seen_lineages.add(pair)
-            lineage_records.append({
-                "parent_label": pair[0],
-                "child_label": pair[1],
-                "shared_arms": sorted(parent_set),
-                "child_only_arms": sorted(child_set - parent_set),
-                "n_parent": int(parent["n_cells"]),
-                "n_child": int(child["n_cells"]),
-                "discovery": "phase3a_multi_arm_decomposition",
-            })
-
-    info["groups"] = recovered_groups
-    info["n_recovered_groups"] = len(recovered_groups)
-    info["n_fp"] = int(sum(1 for x in assignments.values() if x == fp_label))
-    info["reason"] = "decomposed" if recovered_groups else "no_arm_combination_passed_retest"
-    return assignments, info, lineage_records
-
 
 
 def _longest_contiguous_variant_run(
@@ -2536,7 +2170,35 @@ def run_phase3(
     state: "PipelineState",
     cfg: "LOHConfig | None" = None,
 ) -> dict:
-    """Phase 3: LOH clone QC."""
+    """
+    Phase 3: LOH clone QC on the labels produced by Phase 1.
+
+    Parameters
+    ----------
+    state : PipelineState
+        Shared mutable state.  Clone labels in ``state.Sample`` are rewritten
+        in place (stripped, merged, split, ``FP:``/``SUB:``-labelled or
+        reverted); ``state.clone_block_variants`` is updated for split and
+        nested-rescue clones; ``state.results`` is pruned.
+    cfg : LOHConfig, optional
+        Configuration; defaults to ``state.config``.
+
+    Returns
+    -------
+    dict
+        ``state.results`` (the same object), pruned to arms whose cells still
+        carry active LOH.  When nested rescue produced an audit table it is
+        stored under ``results["phase3_nested_loh_rescue"]``.
+
+    Notes
+    -----
+    * Seeds the global ``numpy.random`` and ``random`` generators with 123
+      on every call.
+    * If ``cfg.skip_homogeneity_check`` is True only results reconciliation
+      (step 5) is performed.
+    * Prints progress and a summary of active LOH, ``SUB:`` and ``FP:``
+      clones through ``vprint``.
+    """
     from .loh_config import vprint
 
     if cfg is None:

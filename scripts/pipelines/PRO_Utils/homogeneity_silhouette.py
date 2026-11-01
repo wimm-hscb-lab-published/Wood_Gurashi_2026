@@ -1,10 +1,22 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+"""Per-label silhouette QC for protein clusters / cell-type labels.
 
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+Main entry point
+----------------
+plot_protein_homogeneity_silhouette
+    Per-cell silhouette scores on (optionally z-scored) protein features,
+    summarised per label, with a bar plot and a box + strip plot.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
 from sklearn.metrics import homogeneity_score, silhouette_samples
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 
 def plot_protein_homogeneity_silhouette(
@@ -18,77 +30,82 @@ def plot_protein_homogeneity_silhouette(
     csv_path: str = None,
     show_plot: bool = True,
     verbose: bool = True,
-):
-    """
-    Compute per-label silhouette scores on protein data and plot two figures:
+) -> tuple[pd.DataFrame, float]:
+    """Compute per-label silhouette scores on protein data and plot them.
 
-      1) Homogeneity-like score per label (mean silhouette clipped at >= 0)
-      2) Silhouette per label (box + strip)
+    Two matplotlib figures are drawn: (1) a "homogeneity-like" bar per label
+    (mean silhouette clipped at 0) and (2) the per-cell silhouette
+    distribution per label (box plot without fliers plus a strip plot).
 
     Parameters
     ----------
     df_PRO : pd.DataFrame
-        Protein expression dataframe with cells as rows. Must contain a
-        column named *label_col*; all other columns are treated as features.
+        Cells × features table. Must contain ``label_col``; every other column
+        is treated as a feature.
     label_col : str
-        Column containing cell-type / cluster labels (default: ``'label'``).
+        Column of cell-type / cluster labels (default ``'label'``). Labels are
+        cast to ``str``.
     scale : bool
-        Whether to z-score features before computing silhouette (default: True).
+        Z-score features with ``StandardScaler`` before computing silhouette
+        (default True).
     figsize : tuple
-        Size of each matplotlib figure (default: ``(7, 4)``).
+        Size of each figure (default ``(7, 4)``).
     drop_duplicate_columns_after_str_cast : bool
-        Safety flag – after casting column names to ``str``, drop any
-        duplicate columns that may arise (default: True).
+        After casting feature names to ``str``, keep only the first of any
+        duplicated names (default True).
     save_csv : bool
-        If True, export per-label stats to *csv_path* (default: False).
+        Export ``label, mean, std, count`` per label to ``csv_path``
+        (default False).
     csv_path : str, optional
-        Destination path for the exported CSV.  Required when *save_csv* is
-        True.
+        CSV destination; required when ``save_csv`` is True. Its parent
+        directory is created.
     show_plot : bool
-        Whether to call ``plt.show()`` (default: True).  Set to False when
-        running non-interactively.
+        Call ``plt.show()`` after each figure (default True). Figures are not
+        closed when False.
     verbose : bool
-        Print progress messages (default: True).
+        Print progress and the per-label table (default True).
 
     Returns
     -------
     per_label : pd.DataFrame
-        Label-level silhouette summary (mean, median, std, count,
-        homogeneity_like).
+        Columns ``label, mean, median, std, count, homogeneity_like``, sorted
+        by ``mean`` descending.
     global_homogeneity : float
-        ``homogeneity_score(y, y)`` – always 1.0; included for interface
-        completeness.
+        ``homogeneity_score(y, y)`` — always 1.0; kept for interface
+        compatibility.
 
     Raises
     ------
     KeyError
-        If *label_col* is not present in *df_PRO*.
+        If ``label_col`` is not a column of ``df_PRO``.
     ValueError
-        If fewer than 2 labels or 2 rows are present.
+        If there are fewer than 2 unique labels or 2 rows, or if
+        ``save_csv=True`` without ``csv_path``.
 
-    Example
-    -------
-    >>> from PRO_pipeline import plot_protein_homogeneity_silhouette
+    Notes
+    -----
+    Features are coerced with ``pd.to_numeric(errors='coerce')`` and NaNs
+    filled with 0 before scaling. Silhouette uses sklearn's default Euclidean
+    metric. The CSV is written after both figures have been drawn, and
+    ``os.makedirs(os.path.dirname(csv_path))`` fails for a bare filename
+    (empty dirname).
+
+    Examples
+    --------
     >>> per_label, gh = plot_protein_homogeneity_silhouette(
     ...     df_PRO, label_col="label", scale=True
     ... )
     """
-    import sys
-
     def vprint(msg):
         if verbose:
             print(msg)
             sys.stdout.flush()
 
-    # ------------------------------------------------------------------
-    # Validate inputs
-    # ------------------------------------------------------------------
+    # ── Validate inputs ──
     if label_col not in df_PRO.columns:
         raise KeyError(f"df_PRO must contain '{label_col}'")
 
-    # ------------------------------------------------------------------
-    # Prepare feature matrix
-    # ------------------------------------------------------------------
+    # ── Prepare feature matrix ──
     X_df = df_PRO.drop(columns=[label_col]).copy()
 
     # sklearn requires uniform feature-name dtype; force to str
@@ -111,13 +128,10 @@ def plot_protein_homogeneity_silhouette(
     else:
         X = X_df.to_numpy()
 
-    # Encode labels
     le = LabelEncoder()
     y = le.fit_transform(labels)
 
-    # ------------------------------------------------------------------
-    # Scores
-    # ------------------------------------------------------------------
+    # ── Scores ──
     global_homogeneity = homogeneity_score(y, y)
 
     vprint(f"  Computing silhouette for {len(labels)} cells, "
@@ -130,9 +144,7 @@ def plot_protein_homogeneity_silhouette(
         "silhouette": sil_vals,
     })
 
-    # ------------------------------------------------------------------
-    # Per-label summaries
-    # ------------------------------------------------------------------
+    # ── Per-label summaries ──
     per_label = (
         sil_df
         .groupby("label")["silhouette"]
@@ -145,9 +157,7 @@ def plot_protein_homogeneity_silhouette(
     vprint("  Per-label silhouette stats:")
     vprint(per_label[["label", "mean", "std", "count"]].to_string(index=False))
 
-    # ------------------------------------------------------------------
-    # Figure 1 – Homogeneity per label
-    # ------------------------------------------------------------------
+    # ── Figure 1 – Homogeneity per label ──
     fig1, ax1 = plt.subplots(figsize=figsize)
     sns.barplot(data=per_label, x="label", y="homogeneity_like",
                 color="steelblue", ax=ax1)
@@ -161,9 +171,7 @@ def plot_protein_homogeneity_silhouette(
     if show_plot:
         plt.show()
 
-    # ------------------------------------------------------------------
-    # Figure 2 – Silhouette per label
-    # ------------------------------------------------------------------
+    # ── Figure 2 – Silhouette per label ──
     fig2, ax2 = plt.subplots(figsize=figsize)
     sns.boxplot(data=sil_df, x="label", y="silhouette",
                 showfliers=False, ax=ax2)
@@ -178,13 +186,10 @@ def plot_protein_homogeneity_silhouette(
     if show_plot:
         plt.show()
 
-    # ------------------------------------------------------------------
-    # Optional CSV export
-    # ------------------------------------------------------------------
+    # ── Optional CSV export ──
     if save_csv:
         if csv_path is None:
             raise ValueError("csv_path must be provided when save_csv=True")
-        import os
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         export_df = per_label[["label", "mean", "std", "count"]]
         export_df.to_csv(csv_path, index=False)

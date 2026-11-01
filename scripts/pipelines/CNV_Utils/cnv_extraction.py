@@ -1,6 +1,61 @@
+"""Extract per-cell and per-clone CNV ploidy tables from a Mosaic sample.
+
+Main entry points
+-----------------
+get_cnv_info
+    Build cell x amplicon ploidy, clone x amplicon median ploidy and
+    (optionally) cell x variant ploidy tables in genomic order.
+extract_cnv_data
+    End-to-end wrapper: optional barcode restriction, ploidy computation from
+    diploid reference cells, DNA/CNV barcode syncing, label transfer,
+    ``get_cnv_info`` and CSV export.
+"""
+
+import os
+import sys
+
 import numpy as np
 import pandas as pd
-import os
+
+# Sort ranks for non-numeric chromosomes; anything unparseable sorts last.
+_CHROM_RANK_X = 23
+_CHROM_RANK_Y = 24
+_CHROM_RANK_MT = 25
+_CHROM_RANK_UNKNOWN = 999
+
+
+def _make_vprint(verbose):
+    """Return a ``print`` + ``stdout.flush`` function that is silent unless ``verbose``."""
+
+    def vprint(msg):
+        if verbose:
+            print(msg)
+            sys.stdout.flush()
+
+    return vprint
+
+
+def _chrom_to_int(chrom):
+    """Map a chromosome name ('chr1', '1', 'X', 'MT', ...) to a sortable integer."""
+    chrom_str = str(chrom).upper().replace('CHR', '')
+    if chrom_str == 'X':
+        return _CHROM_RANK_X
+    elif chrom_str == 'Y':
+        return _CHROM_RANK_Y
+    elif chrom_str == 'M' or chrom_str == 'MT':
+        return _CHROM_RANK_MT
+    else:
+        try:
+            return int(chrom_str)
+        except ValueError:
+            return _CHROM_RANK_UNKNOWN
+
+
+def _chrom_sort_key(col):
+    """``sort_values`` key: numeric chromosome order for 'CHROM', identity otherwise."""
+    if col.name != 'CHROM':
+        return col
+    return col.map(_chrom_to_int)
 
 
 def get_cnv_info(
@@ -10,13 +65,12 @@ def get_cnv_info(
     verbose: bool = True
 ) -> tuple:
     """
-    Extract and process CNV information from Sample object.
-    
-    Creates three DataFrames:
-    1. df_cnv: CNV ploidy data with cells as rows, amplicons as columns
-    2. df_cnv_grouped: Median ploidy per clone, sorted by genomic order
-    3. df_cnv_vars: CNV data mapped to variants (optional, requires df_mut_to_amplicon)
-    
+    Extract and process CNV information from a Sample object.
+
+    Builds the cell-level ploidy table, the clone-level median ploidy table,
+    and optionally a cell-level table with one column per variant (copied
+    from the variant's amplicon).
+
     Parameters
     ----------
     Sample : object
@@ -49,40 +103,25 @@ def get_cnv_info(
         Variant-level CNV data: rows = cells, columns = ['label'] + variants
         Only returned if df_mut_to_amplicon is provided
     cnv_info : pd.DataFrame
-        Amplicon annotation sorted by genomic order
-        Columns: 'id', 'CHROM', 'start_pos', etc.
+        De-duplicated ``Sample.cnv.col_attrs`` sorted by chromosome
+        (1..22, X, Y, M/MT, then unparseable) and numeric ``start_pos``.
+
+    Raises
+    ------
+    KeyError
+        If ``Sample.cnv.col_attrs`` lacks any of 'CHROM', 'start_pos', 'id'.
+
+    Notes
+    -----
+    ``df_cnv`` is passed through ``drop_duplicates()``, so cells with an
+    identical label + ploidy profile are collapsed into one row. Clone medians
+    are ``np.nanmedian`` over all ``Sample.cnv`` cells with that label; the
+    grouped table is then row-de-duplicated, duplicate probe IDs are
+    median-collapsed, and rows are reindexed to the sorted amplicon order
+    (amplicons removed by de-duplication come back as NaN rows).
     """
-    
-    import pandas as pd
-    import numpy as np
-    
-    def vprint(msg):
-        if verbose:
-            print(msg)
-            import sys
-            sys.stdout.flush()
-    
-    def chrom_key(col):
-        """Sort key for chromosome names"""
-        if col.name != 'CHROM':
-            return col
-        
-        def chrom_to_int(chrom):
-            chrom_str = str(chrom).upper().replace('CHR', '')
-            if chrom_str == 'X':
-                return 23
-            elif chrom_str == 'Y':
-                return 24
-            elif chrom_str == 'M' or chrom_str == 'MT':
-                return 25
-            else:
-                try:
-                    return int(chrom_str)
-                except ValueError:
-                    return 999
-        
-        return col.map(chrom_to_int)
-    
+    vprint = _make_vprint(verbose)
+
     vprint("\n" + "="*60)
     vprint("EXTRACTING CNV INFORMATION")
     vprint("="*60)
@@ -133,7 +172,7 @@ def get_cnv_info(
     # Sort by CHROM then start_pos
     cnv_info_sorted = cnv_info.sort_values(
         by=['CHROM', 'start_pos'],
-        key=chrom_key
+        key=_chrom_sort_key
     )
     
     vprint(f"    ✓ Sorted {len(cnv_info_sorted)} amplicons by genomic position")
@@ -149,8 +188,9 @@ def get_cnv_info(
     # =========================================================================
     vprint("\n  Step 3: Creating clone-level grouped CNV data...")
     
-    # CRITICAL FIX: Use Sample.cnv column IDs directly (not cnv_info_sorted)
-    # because Sample.cnv may have MORE columns than amplicons
+    # Use Sample.cnv column IDs directly (not cnv_info_sorted): the medians
+    # below have one value per Sample.cnv column, which may outnumber the
+    # de-duplicated amplicon annotation.
     probe_ids = pd.Index(Sample.cnv.col_attrs['id'])
     df_cnv_grouped = pd.DataFrame(index=probe_ids)
     
@@ -186,15 +226,13 @@ def get_cnv_info(
     # Reindex columns in desired order
     df_cnv_grouped = df_cnv_grouped.reindex(columns=unique_labels)
     
-    # NOW reindex rows to match sorted genomic order (from cnv_info_sorted)
-    # This filters to only the amplicons we want
+    # Collapse duplicate probe IDs, then reindex rows to the sorted genomic
+    # order (unique target IDs so the reindex is well defined).
     if df_cnv_grouped.index.has_duplicates:
         df_cnv_grouped = df_cnv_grouped.groupby(level=0).median()
 
-    # 2) ensure target index is unique + ordered
     target_ids = pd.Index(cnv_info_sorted["id"]).drop_duplicates(keep="first")
 
-    # 3) now reindex safely
     df_cnv_grouped = df_cnv_grouped.reindex(target_ids)
     
     vprint(f"    ✓ Created grouped CNV: {df_cnv_grouped.shape[0]} amplicons × {df_cnv_grouped.shape[1]} clones")
@@ -264,11 +302,9 @@ def get_cnv_info(
 
 
 def _sync_dna_cnv_by_barcode(sample_obj, amplicons=None):
-    """
-    Keep only cells present in both DNA and CNV assays.
+    """Subset ``sample_obj.dna``/``.cnv`` in place to shared barcodes (DNA order); optionally subset CNV columns.
 
-    Preserves DNA barcode order.
-    Optionally subsets CNV columns to supplied amplicons.
+    Returns the list of shared barcodes (as str).
     """
     dna_barcodes = np.asarray(sample_obj.dna.row_attrs["barcode"], dtype=str)
     cnv_barcodes = set(np.asarray(sample_obj.cnv.row_attrs["barcode"], dtype=str))
@@ -305,6 +341,28 @@ def _get_labeled_attribute(assay, attr):
     cols = df.columns.tolist()
     df.insert(0, "label", assay.get_labels())
     return df[["label"] + cols]
+
+
+def _compute_ploidy_from_diploid_cells(Sample, label_col, diploid_label, normalized_counts, vprint):
+    """Run ``Sample.cnv.compute_ploidy`` using DNA cells labelled ``diploid_label``; return their barcodes."""
+    if isinstance(diploid_label, str):
+        is_diploid = np.asarray(Sample.dna.row_attrs[label_col]) == diploid_label
+    else:
+        is_diploid = np.isin(np.asarray(Sample.dna.row_attrs[label_col]), diploid_label)
+
+    wt_cells = Sample.dna.barcodes()[is_diploid]
+    if len(wt_cells) == 0:
+        raise ValueError(
+            f"No cells with label(s) {diploid_label!r} found in '{label_col}'. "
+            "Cannot compute ploidy without diploid reference cells."
+        )
+    vprint(f"Diploid reference cells ({diploid_label}): {len(wt_cells)}")
+    Sample.cnv.compute_ploidy(
+        diploid_cells=wt_cells,
+        normalized_counts=normalized_counts,
+    )
+    return wt_cells
+
 
 def extract_cnv_data(
     Sample,
@@ -378,14 +436,27 @@ def extract_cnv_data(
         df_ploidy, df_ploidy_median,
         df_mut_to_amplicon_dataframe, df_mut_to_amplicon,
         variant_to_amp_dict,
-        df_cnv, df_cnv_grouped, df_cnv_vars, cnv_info.
-    """
+        df_cnv, df_cnv_grouped, df_cnv_vars, cnv_info,
+        and ``outputs`` ({filename: DataFrame} of the CSV tables).
 
-    def vprint(msg):
-        if verbose:
-            print(msg)
-            import sys
-            sys.stdout.flush()
+    Raises
+    ------
+    ValueError
+        If neither ``OUT_DIR`` nor all of ``wd``/``EXPERIMENT``/``PATIENT_ID``
+        are given, or (with ``compute_ploidy``) no diploid reference cell exists.
+
+    Notes
+    -----
+    Mutates ``Sample`` in place: ``Sample.dna``/``Sample.cnv`` are replaced by
+    barcode-synced (and optionally amplicon-subset) assays, CNV gains a
+    ``ploidy`` layer, and ``row_attrs[label_col]`` is overwritten by label
+    transfer. ``OUT_DIR`` is created even when ``save_outputs`` is False.
+    Default ``OUT_DIR`` is
+    ``{wd}/results/per_sample/{EXPERIMENT}/{PATIENT_ID}/dna_cnv/clonotypes/ploidy``.
+    If ``desired_plotting_order`` is None it becomes
+    ``sorted(set(Sample.dna.row_attrs['Clone']))``.
+    """
+    vprint = _make_vprint(verbose)
 
     if OUT_DIR is None:
         if wd is None or EXPERIMENT is None or PATIENT_ID is None:
@@ -416,21 +487,8 @@ def extract_cnv_data(
 
     # Workflow A: compute ploidy first, then sync (standard)
     if compute_ploidy and ploidy_before_sync:
-        if isinstance(diploid_label, str):
-            is_diploid = np.asarray(Sample.dna.row_attrs[label_col]) == diploid_label
-        else:
-            is_diploid = np.isin(np.asarray(Sample.dna.row_attrs[label_col]), diploid_label)
-
-        wt_cells = Sample.dna.barcodes()[is_diploid]
-        if len(wt_cells) == 0:
-            raise ValueError(
-                f"No cells with label(s) {diploid_label!r} found in '{label_col}'. "
-                "Cannot compute ploidy without diploid reference cells."
-            )
-        vprint(f"Diploid reference cells ({diploid_label}): {len(wt_cells)}")
-        Sample.cnv.compute_ploidy(
-            diploid_cells=wt_cells,
-            normalized_counts=normalized_counts,
+        wt_cells = _compute_ploidy_from_diploid_cells(
+            Sample, label_col, diploid_label, normalized_counts, vprint
         )
 
     variant_amplicons = None
@@ -459,21 +517,8 @@ def extract_cnv_data(
 
     # Workflow B: sync first, compute ploidy, then re-sync (all-variant)
     if compute_ploidy and not ploidy_before_sync:
-        if isinstance(diploid_label, str):
-            is_diploid = np.asarray(Sample.dna.row_attrs[label_col]) == diploid_label
-        else:
-            is_diploid = np.isin(np.asarray(Sample.dna.row_attrs[label_col]), diploid_label)
-
-        wt_cells = Sample.dna.barcodes()[is_diploid]
-        if len(wt_cells) == 0:
-            raise ValueError(
-                f"No cells with label(s) {diploid_label!r} found in '{label_col}'. "
-                "Cannot compute ploidy without diploid reference cells."
-            )
-        vprint(f"Diploid reference cells ({diploid_label}): {len(wt_cells)}")
-        Sample.cnv.compute_ploidy(
-            diploid_cells=wt_cells,
-            normalized_counts=normalized_counts,
+        wt_cells = _compute_ploidy_from_diploid_cells(
+            Sample, label_col, diploid_label, normalized_counts, vprint
         )
 
         shared_barcodes = _sync_dna_cnv_by_barcode(Sample, amplicons=variant_amplicons)

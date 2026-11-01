@@ -1,97 +1,109 @@
-"""Clone-level analyses: patient assignment, clone tables, VAF, and sizing."""
+"""Clone-level tables: clone genotype table, per-clone VAF and clone sizes.
+
+Main entry points
+-----------------
+:func:`clones_to_dataframe`
+    Wrap a Mosaic workflow's ``get_clones`` output in a tidy DataFrame.
+:func:`get_VAF`
+    Variant allele frequency (VAF %) of every variant in every clone.
+:func:`get_clones_size`
+    Cell count (and optional percentage) per clone, optionally after
+    excluding protein cell types.
+"""
+
+from __future__ import annotations
+
+import copy
+import os
 
 import numpy as np
 import pandas as pd
 
 from .utils import drop_scalar_row_attrs
 
+# Horizontal rule used in the verbose banners.
+_RULE = "=" * 60
 
-def assign_patients_from_whitelist(
-    dna_obj,
-    samples_whitelist: dict,
-    *,
-    af_attr: str = "AF",
-    label_key: str = "label",
-    af_cutoff: float = 10,
-) -> dict:
-    """Relabel clusters with Patient_IDs based on a variant whitelist.
 
-    Returns
-    -------
-    dict
-        ``{old_cluster_label: new_patient_id | 'Unknown'}``
+def _make_vprint(verbose: bool):
+    """Return a ``print`` that only prints when ``verbose`` is true."""
+    def vprint(msg):
+        if verbose:
+            print(msg)
+    return vprint
+
+
+def _flatten_variants(v) -> list:
+    """Turn a variant spec into a flat list of strings (one nesting level is flattened).
+
+    A string becomes ``[v]``; arrays and Series are flattened and stringified;
+    lists/tuples/sets have each element flattened the same way (deeper nested
+    lists are stringified as a whole); anything else becomes ``[str(v)]``.
     """
-    wl_sets = {
-        pid: {v.strip() for v in str(vlist).split(",") if v.strip()}
-        for pid, vlist in samples_whitelist.items()
-    }
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, np.ndarray):
+        return [str(x) for x in v.ravel().tolist()]
+    if isinstance(v, pd.Series):
+        return [str(x) for x in v.astype(str).tolist()]
+    if isinstance(v, (list, tuple, set)):
+        out = []
+        for x in v:
+            if isinstance(x, str):
+                out.append(x)
+            elif isinstance(x, np.ndarray):
+                out.extend([str(y) for y in x.ravel().tolist()])
+            elif isinstance(x, pd.Series):
+                out.extend([str(y) for y in x.astype(str).tolist()])
+            elif isinstance(x, (list, tuple, set)):
+                out.extend([str(y) for y in x])
+            else:
+                out.append(str(x))
+        return out
+    return [str(v)]
 
-    af = dna_obj.get_attribute(af_attr, constraint="row+col")
-    labels = dna_obj.row_attrs[label_key]
 
-    cluster_hits = {}
-    for cluster in np.unique(labels):
-        rows = labels == cluster
-        mean_af = af.loc[rows, :]
-        wl_cols = [v for s in wl_sets.values() for v in s if v in mean_af.columns]
-        mean_af_wl = mean_af.loc[:, wl_cols]
-        high_vars = mean_af_wl.mean(axis=0)[lambda s: s > af_cutoff].index.tolist()
-        cluster_hits[cluster] = high_vars
-
-    cluster_to_patient = {}
-    for cluster, hit_list in cluster_hits.items():
-        hit_set = set(hit_list)
-        best_pid, best_score = None, -1.0
-        for pid, var_set in wl_sets.items():
-            if not var_set:
-                continue
-            score = len(hit_set & var_set) / len(var_set)
-            if score > best_score or (
-                score == best_score
-                and len(var_set) > len(wl_sets.get(best_pid, set()))
-            ):
-                best_pid, best_score = pid, score
-        cluster_to_patient[cluster] = best_pid if best_score > 0 else "Unknown"
-
-    dna_obj.rename_labels(cluster_to_patient)
-    return cluster_to_patient
+def _unique_stripped(values) -> list:
+    """Strip each value, drop empty strings and ``None``, and de-duplicate keeping order."""
+    seen, clean = set(), []
+    for s in (x.strip() for x in values if x is not None):
+        if s and s not in seen:
+            seen.add(s)
+            clean.append(s)
+    return clean
 
 
 def clones_to_dataframe(wf, variants, max_ado_score: float = 0.8,
                         min_clone_size: int = 1) -> pd.DataFrame:
-    """Call ``wf.get_clones(…)`` and return a tidy DataFrame with display
-    column names and UI order preserved."""
+    """Call ``wf.get_clones`` and return its rows as a DataFrame with display names.
 
-    def _normalize(v):
-        if isinstance(v, str):
-            return [v]
-        if isinstance(v, np.ndarray):
-            return [str(x) for x in v.ravel().tolist()]
-        if isinstance(v, pd.Series):
-            return [str(x) for x in v.astype(str).tolist()]
-        if isinstance(v, (list, tuple, set)):
-            out = []
-            for x in v:
-                if isinstance(x, str):
-                    out.append(x)
-                elif isinstance(x, np.ndarray):
-                    out.extend([str(y) for y in x.ravel().tolist()])
-                elif isinstance(x, pd.Series):
-                    out.extend([str(y) for y in x.astype(str).tolist()])
-                elif isinstance(x, (list, tuple, set)):
-                    out.extend([str(y) for y in x])
-                else:
-                    out.append(str(x))
-            return out
-        return [str(v)]
+    Parameters
+    ----------
+    wf : Mosaic workflow
+        Object with ``get_clones(variants=..., max_ado_score=...,
+        min_clone_size=...)`` returning ``(rows, columns_meta, _)``.
+    variants : str, array-like, Series or (nested) list
+        Variant IDs. Flattened one level, stripped, empty strings removed and
+        de-duplicated (first occurrence kept) before being passed on.
+    max_ado_score : float
+        Passed to ``wf.get_clones``.
+    min_clone_size : int
+        Passed to ``wf.get_clones``.
 
-    variants = _normalize(variants)
-    seen, clean = set(), []
-    for s in (x.strip() for x in variants if x is not None):
-        if s and s not in seen:
-            seen.add(s)
-            clean.append(s)
-    variants = clean
+    Returns
+    -------
+    pd.DataFrame
+        One row per record; columns renamed from ``id`` to ``name`` using the
+        column metadata and ordered as in the metadata (columns not in the
+        metadata are dropped). Rows whose variant-name column
+        (``"Variant\\nname"``) is blank are removed and the index is reset.
+
+    Notes
+    -----
+    ``None`` entries are stringified to ``"None"`` while flattening, so the
+    later ``None`` filter never removes them.
+    """
+    variants = _unique_stripped(_flatten_variants(variants))
 
     rows, cols_meta, _ = wf.get_clones(
         variants=variants,
@@ -119,26 +131,43 @@ def clones_to_dataframe(wf, variants, max_ado_score: float = 0.8,
 def get_VAF(
     Sample,
     label_col: str = "label",
-    clone_order: list = None,
-    output_path: str = None,
+    clone_order: list | None = None,
+    output_path: str | None = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """Compute variant allele frequencies per clone.
+    """Compute variant allele frequencies (VAF %) per clone.
+
+    For each distinct value of ``Sample.dna.row_attrs[label_col]`` the dna
+    assay is subset to that clone's cells and Mosaic's
+    ``get_variant_bulk_metrics`` column ``"VAF by cell count"`` is taken.
+
+    Parameters
+    ----------
+    Sample : mosaic Sample
+        Sample with a dna assay. If the dna assay has no ``NGT_FILTERED``
+        layer it is created as the ``NGT`` layer (side effect).
+    label_col : str
+        Row attribute with clone labels.
+    clone_order : list, optional
+        Column order; clones not listed are appended in sorted order (and
+        reported when ``verbose``).
+    output_path : str, optional
+        If given, the table is written as CSV (index label ``"Variants"``);
+        the parent directory is created.
+    verbose : bool
+        Print progress.
 
     Returns
     -------
     df_vaf : pd.DataFrame
-        Variants (rows) × clones (columns), values are VAF %.
+        Variants (rows, as in the bulk-metrics index) × clones (columns).
+        Without ``clone_order`` the column order follows ``set`` iteration.
     """
-    import copy, os
+    vprint = _make_vprint(verbose)
 
-    def vprint(msg):
-        if verbose:
-            print(msg)
-
-    vprint("\n" + "=" * 60)
+    vprint("\n" + _RULE)
     vprint("COMPUTING VAF PER CLONE")
-    vprint("=" * 60)
+    vprint(_RULE)
 
     if "NGT_FILTERED" not in Sample.dna.layers:
         Sample.dna.layers["NGT_FILTERED"] = Sample.dna.layers["NGT"]
@@ -174,39 +203,57 @@ def get_VAF(
         df_vaf.to_csv(output_path, index=True, index_label="Variants")
         vprint(f"  ✓ Saved: {output_path}")
 
-    vprint("=" * 60 + "\n")
+    vprint(_RULE + "\n")
     return df_vaf
 
 
 def get_clones_size(
     Sample,
     label_col: str = "label",
-    desired_order: list = None,
-    exclude_celltypes: list = None,
+    desired_order: list | None = None,
+    exclude_celltypes: list | None = None,
     return_percentage: bool = False,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """Calculate absolute cell counts (and optional %) per clone.
+    """Count cells per clone, optionally excluding protein cell types first.
 
     Parameters
     ----------
+    Sample : mosaic Sample
+        Sample with a dna assay (and a protein assay if
+        ``exclude_celltypes`` is used).
+    label_col : str
+        Row attribute with clone labels.
+    desired_order : list, optional
+        Row order of the result; clones not listed are appended in sorted
+        order (and reported when ``verbose``). ``Clone`` becomes an ordered
+        Categorical.
     exclude_celltypes : list, optional
-        Protein labels to exclude before counting.
+        Protein labels (``Sample.protein.get_labels()``) whose cells are
+        removed before counting. Scalar row attributes are dropped from both
+        assays of ``Sample`` (side effect) and a new Mosaic ``Sample`` is built
+        from the kept barcodes.
+    return_percentage : bool
+        Add a ``Percentage`` column (count / total × 100).
+    verbose : bool
+        Print progress.
 
     Returns
     -------
     label_counts : pd.DataFrame
-        Columns: ``Clone``, ``Count`` (and optionally ``Percentage``).
+        Columns ``Clone``, ``Count`` (and ``Percentage``). Without
+        ``desired_order`` rows are in ``value_counts`` order.
+
+    Raises
+    ------
+    ValueError
+        If no cells remain after exclusion.
     """
-    import copy
+    vprint = _make_vprint(verbose)
 
-    def vprint(msg):
-        if verbose:
-            print(msg)
-
-    vprint("\n" + "=" * 60)
+    vprint("\n" + _RULE)
     vprint("CALCULATING CLONE SIZE")
-    vprint("=" * 60)
+    vprint(_RULE)
 
     if exclude_celltypes:
         vprint(f"  Excluding: {exclude_celltypes}")
@@ -221,6 +268,7 @@ def get_clones_size(
         drop_scalar_row_attrs(Sample.dna)
         drop_scalar_row_attrs(Sample.protein)
 
+        # Imported lazily: only needed for the exclusion path.
         from missionbio.mosaic.sample import Sample as MosaicSample
 
         dna_sub = copy.copy(Sample.dna)[bars_keep, :]
@@ -250,5 +298,5 @@ def get_clones_size(
         label_counts = label_counts.sort_values("Clone").reset_index(drop=True)
 
     vprint(f"  {len(label_counts)} clones, {total} total cells")
-    vprint("=" * 60 + "\n")
+    vprint(_RULE + "\n")
     return label_counts

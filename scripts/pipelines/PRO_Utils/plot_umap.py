@@ -1,4 +1,17 @@
+"""Protein UMAP scatter plot coloured by the canonical cell-type palette.
+
+Main entry point
+----------------
+plot_protein_umap
+    One plotly scatter trace per cell type, horizontal legend underneath,
+    optional PNG + PDF export.
+"""
+
+from __future__ import annotations
+
 import os
+import sys
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,40 +30,45 @@ def plot_protein_umap(
     height: int = 1000,
     show_plot: bool = True,
     verbose: bool = True
-) -> go.Figure:
-    """
-    Create a single protein UMAP plot with cell types coloured by a standard scheme.
-    Includes a horizontal legend at the bottom.
+) -> go.Figure | None:
+    """Plot the protein UMAP with cells coloured by cell type.
+
+    Each unique label (in ``np.unique`` order) becomes one ``go.Scatter``
+    trace coloured by :func:`~PRO_Utils.colors.get_celltype_color`; axes are
+    hidden, the aspect ratio is fixed 1:1 and the legend is horizontal below
+    the plot.
 
     Parameters
     ----------
     Sample : object
-        Sample object with protein attribute containing UMAP coordinates
+        Sample object whose ``protein`` assay holds UMAP coordinates.
     celltype_column : str
-        Name of the cell type column in Sample.protein.row_attrs (default: 'label')
+        Row attribute of ``Sample.protein`` with cell-type labels
+        (default ``'label'``).
     outdir : str, optional
-        Output directory for saving figure
+        Directory to save into (created if needed). None saves nothing.
     output_filename : str
-        Filename for saved figure (default: 'Protein_UMAP.png')
+        PNG filename (default ``'Protein_UMAP.png'``); a PDF is also written
+        with ``'.png'`` replaced by ``'.pdf'``.
     umap_attribute : str
-        Name of UMAP attribute in Sample.protein
+        Name of the UMAP attribute read with
+        ``get_attribute(umap_attribute, constraint='row')``.
     point_size : int
-        Size of points (default: 5)
-    width : int
-        Figure width in pixels
-    height : int
-        Figure height in pixels (default: 1000, includes space for legend)
+        Marker size (default 5).
+    width, height : int
+        Figure size in pixels (default 800 × 1000; the height includes room
+        for the legend). Images are written at ``scale=2``.
     show_plot : bool
-        Whether to display plot in notebook (default: True)
+        Call ``fig.show()`` (default True).
     verbose : bool
-        Print progress messages
+        Print progress and the colour mapping.
 
     Returns
     -------
-    fig : plotly.graph_objects.Figure
+    plotly.graph_objects.Figure or None
+        The figure, or None if the UMAP coordinates or the labels could not be
+        loaded (the error is printed when ``verbose``).
     """
-    import sys
-
     def vprint(msg):
         if verbose:
             print(msg)
@@ -60,7 +78,6 @@ def plot_protein_umap(
     vprint("CREATING PROTEIN UMAP PLOT")
     vprint("=" * 60)
 
-    # ---- UMAP coordinates ----
     try:
         umap_coords_df = Sample.protein.get_attribute(umap_attribute, constraint='row')
         umap_coords = (
@@ -73,7 +90,6 @@ def plot_protein_umap(
         vprint(f"  ❌ ERROR: Could not load UMAP coordinates: {e}")
         return None
 
-    # ---- Cell-type labels ----
     try:
         celltype_labels = np.array(Sample.protein.row_attrs[celltype_column])
         vprint(f"  ✓ Loaded cell type labels: {len(celltype_labels)} cells")
@@ -90,7 +106,6 @@ def plot_protein_umap(
         n_cells = int((celltype_labels == ct).sum())
         vprint(f"    {ct:20s} → {color} ({n_cells} cells)")
 
-    # ---- Build figure ----
     fig = go.Figure()
 
     for celltype in unique_celltypes:
@@ -127,7 +142,6 @@ def plot_protein_umap(
         ),
     )
 
-    # ---- Save ----
     if outdir is not None:
         os.makedirs(outdir, exist_ok=True)
         output_path = os.path.join(outdir, output_filename)

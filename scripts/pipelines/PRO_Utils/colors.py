@@ -1,7 +1,14 @@
-"""Shared colour maps and helpers for protein UMAP visualisations."""
+"""Canonical cell-type colours for protein UMAP visualisations.
 
+Main entry points
+-----------------
+CELLTYPE_COLOR_MAP
+    Cell-type name → hex colour.
+get_celltype_color
+    Look up a colour with exact, then normalised, matching and a grey fallback.
+"""
 
-# Canonical cell-type → hex colour mapping
+#: Canonical cell-type → hex colour mapping.
 CELLTYPE_COLOR_MAP = {
     'Erythroid':      '#E15759',
     'Pro-Myeloid':    '#F28E2D',
@@ -20,17 +27,35 @@ CELLTYPE_COLOR_MAP = {
     'cDC':            '#808080',
 }
 
+#: Colour returned for cell types not found in :data:`CELLTYPE_COLOR_MAP`.
 DEFAULT_COLOR = '#808080'
 
 
 def get_celltype_color(celltype_name: str) -> str:
-    """Return the hex colour for *celltype_name*, falling back to grey."""
+    """Return the hex colour for a cell-type name.
 
-    # Exact match
+    Parameters
+    ----------
+    celltype_name : str
+        Cell-type label, e.g. ``'CD14_monocyte'`` or ``'cd14 monocyte'``.
+
+    Returns
+    -------
+    str
+        Hex colour from :data:`CELLTYPE_COLOR_MAP`, or :data:`DEFAULT_COLOR`
+        when no key matches.
+
+    Notes
+    -----
+    An exact key match is tried first. Otherwise both the query and every key
+    are lower-cased with spaces and hyphens replaced by underscores, and the
+    first key (in mapping order) whose normalised form equals the normalised
+    query wins. ``celltype_name`` must support ``.lower()``; non-string labels
+    (e.g. numpy integers) raise ``AttributeError`` rather than falling back.
+    """
     if celltype_name in CELLTYPE_COLOR_MAP:
         return CELLTYPE_COLOR_MAP[celltype_name]
 
-    # Case-insensitive / normalised match
     normalised = celltype_name.lower().replace(' ', '_').replace('-', '_')
     for key, color in CELLTYPE_COLOR_MAP.items():
         if key.lower().replace(' ', '_').replace('-', '_') == normalised:

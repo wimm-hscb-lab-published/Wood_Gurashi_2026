@@ -4,6 +4,14 @@ ADO-combination probability scoring for LOH clones.
 This module asks whether an observed LOH-like subclone could plausibly arise
 from independent amplicon-level ADO events within the original/base clone.
 
+Main entry point: ``score_ado_combination``. Helpers:
+``normalise_amplicon_ado_rates``, ``poisson_binomial_tail_at_least``,
+``binomial_tail_at_least``.
+
+The default pipeline no longer runs this ADO-combination QC; the
+``ado_probability_*`` fields of ``LOHConfig`` are retained only for
+configuration compatibility.
+
 Example
 -------
 If a LOH block spans 3 independent amplicons, each with baseline ADO rate 5%,
@@ -13,8 +21,7 @@ Binomial.sf(k-1, X, 0.000125).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from math import prod
+from math import comb, prod
 from typing import Any, Iterable
 
 import numpy as np
@@ -26,48 +33,12 @@ except Exception:  # pragma: no cover
     binom = None
 
 
-@dataclass
-class ADOCombinationResult:
-    clone_label: str
-    base_clone: str
-    loh_arms: str
-    n_observed_cells: int
-    n_original_clone_cells: int
-    n_block_variants: int
-    n_block_amplicons: int
-    n_required_amplicons: int
-    single_cell_ado_probability: float
-    expected_ado_cells: float
-    p_at_least_observed: float
-    ado_enrichment: float
-    classification: str
-    block_amplicons: str
-    block_variants: str
-    missing_amplicon_rates: str
-
-
 def _variant_pos(v: str) -> int:
+    """Genomic position from ``chrN:POS[-END]:...``; 10**18 if unparsable (currently unused)."""
     try:
         return int(str(v).split(":")[1].split("-")[0])
     except Exception:
         return 10**18
-
-
-def _build_variant_to_amplicon_from_state(state) -> dict[str, str]:
-    """Return variant_id -> amplicon_id from Sample.dna.col_attrs, falling back to variant IDs."""
-    out: dict[str, str] = {}
-    try:
-        col_attrs = state.Sample.dna.col_attrs
-        ids = list(col_attrs.get("id", []))
-        amps = list(col_attrs.get("amplicon", []))
-        if len(ids) == len(amps) and len(ids) > 0:
-            out.update({str(i): str(a) for i, a in zip(ids, amps)})
-    except Exception:
-        pass
-
-    for v in getattr(state, "variant_cols", []):
-        out.setdefault(str(v), str(v))
-    return out
 
 
 def normalise_amplicon_ado_rates(
@@ -84,6 +55,39 @@ def normalise_amplicon_ado_rates(
       - dict {amplicon_id: rate}
       - pandas Series indexed by amplicon_id
       - pandas DataFrame with amplicon_col and rate_col
+
+    Parameters
+    ----------
+    amplicon_ado_rates : dict, pd.Series, pd.DataFrame or None
+        Rates per amplicon. None returns ``{}``.
+    rate_col : str, default "smooth_ado_any_rate"
+        DataFrame rate column. If missing, the first present of
+        ``smooth_ado_any_rate``, ``raw_ado_any_rate``, ``smooth_ado_low_rate``,
+        ``smooth_ado_high_rate``, ``ado_rate`` is used.
+    amplicon_col : str, default "amplicon_id"
+        DataFrame amplicon column. If missing and the index is named, the
+        index is reset and its first column is used.
+    default_rate : float or None
+        Parsed but not used in the result (see Notes).
+
+    Returns
+    -------
+    dict[str, float]
+        Amplicon id → probability. Non-numeric and non-finite rates are
+        skipped; values > 1 are divided by 100; results are clipped to [0, 1].
+
+    Raises
+    ------
+    ValueError
+        If a DataFrame has no usable rate column, or no amplicon column and an
+        unnamed index.
+    TypeError
+        If the input type is not supported.
+
+    Notes
+    -----
+    *default_rate* is normalised locally but never applied to the returned
+    mapping; callers fill missing amplicons themselves.
     """
     if amplicon_ado_rates is None:
         return {}
@@ -146,7 +150,22 @@ def normalise_amplicon_ado_rates(
 
 
 def poisson_binomial_tail_at_least(probs: Iterable[float], k: int) -> float:
-    """P(sum Bernoulli(probs) >= k) via dynamic programming."""
+    """P(sum of independent Bernoulli(probs) >= k), by dynamic programming.
+
+    Parameters
+    ----------
+    probs : iterable of float
+        Success probabilities; non-finite values are dropped, the rest are
+        clipped to [0, 1].
+    k : int
+        Minimum number of successes.
+
+    Returns
+    -------
+    float
+        NaN if no probabilities remain, 1.0 if ``k <= 0``, 0.0 if ``k`` exceeds
+        the number of trials.
+    """
     probs = [min(max(float(p), 0.0), 1.0) for p in probs if np.isfinite(float(p))]
     m = len(probs)
     if m == 0:
@@ -168,7 +187,24 @@ def poisson_binomial_tail_at_least(probs: Iterable[float], k: int) -> float:
 
 
 def binomial_tail_at_least(n: int, k: int, p: float) -> float:
-    """P(Binomial(n, p) >= k)."""
+    """P(Binomial(n, p) >= k).
+
+    Parameters
+    ----------
+    n : int
+        Trials.
+    k : int
+        Minimum successes.
+    p : float
+        Success probability (clipped to [0, 1]).
+
+    Returns
+    -------
+    float
+        1.0 if ``k <= 0``; 0.0 if ``n <= 0`` or ``k > n``; otherwise
+        ``scipy.stats.binom.sf(k - 1, n, p)``, or an exact sum when SciPy is
+        unavailable.
+    """
     n = int(n)
     k = int(k)
     p = min(max(float(p), 0.0), 1.0)
@@ -179,8 +215,7 @@ def binomial_tail_at_least(n: int, k: int, p: float) -> float:
     if binom is not None:
         return float(binom.sf(k - 1, n, p))
 
-    # Fallback; fine for modest n.
-    from math import comb
+    # Exact-sum fallback when SciPy is unavailable; fine for modest n.
     return float(sum(comb(n, i) * (p ** i) * ((1.0 - p) ** (n - i)) for i in range(k, n + 1)))
 
 
@@ -199,10 +234,37 @@ def score_ado_combination(
     """
     Score whether a LOH block is expected by chance from amplicon ADO.
 
-    Returns a dictionary with:
-      - single_cell_ado_probability: probability one cell matches the block
-      - expected_ado_cells: original_clone_size * p
-      - p_at_least_observed: P(>= observed_subclone_size matching cells)
+    Parameters
+    ----------
+    block_amplicons : iterable of str
+        Amplicons in the LOH block; de-duplicated in order, and ``""``,
+        ``"nan"``, ``"None"`` are dropped.
+    amplicon_ado_rates : dict, pd.Series, pd.DataFrame or None
+        Per-amplicon ADO rates (see ``normalise_amplicon_ado_rates``).
+    original_clone_size : int
+        Cells in the original/base clone (binomial trials).
+    observed_subclone_size : int
+        Observed LOH-like cells.
+    required_amplicons : int or None
+        Amplicons that must drop out together in one cell; None = all.
+    rate_col, amplicon_col : str
+        Forwarded to ``normalise_amplicon_ado_rates``.
+    default_amplicon_ado_rate : float, default 0.01
+        Rate used for amplicons missing from the table.
+    pvalue_threshold : float, default 0.05
+        ``p_at_least_observed >= threshold`` → ``ADO_COMPATIBLE``.
+
+    Returns
+    -------
+    dict
+        ``n_block_amplicons``, ``n_required_amplicons``,
+        ``single_cell_ado_probability`` (product of rates when all amplicons
+        are required, else a Poisson-binomial tail), ``expected_ado_cells``
+        (``original_clone_size * p``), ``p_at_least_observed``
+        (P(>= observed cells)), ``ado_enrichment`` (observed / expected, inf if
+        expected is 0/NaN), ``classification`` (``ADO_NOT_SCORED``,
+        ``ADO_COMPATIBLE`` or ``ADO_UNLIKELY``), ``block_amplicons`` and
+        ``missing_amplicon_rates``.
     """
     amps = [str(a) for a in dict.fromkeys(block_amplicons) if str(a) not in {"", "nan", "None"}]
     rates = normalise_amplicon_ado_rates(
@@ -254,206 +316,7 @@ def score_ado_combination(
     }
 
 
-def infer_loh_block_variants_for_clone(state, clone_label: str) -> list[str]:
-    """
-    Infer the current best LOH block variants for a clone.
-
-    Uses state.clone_block_variants when present; otherwise reconstructs from
-    each LOH arm by taking contiguous extreme runs in the clone mean AF profile.
-    """
-    from .loh_config import LOH_TAG, arm_variants, extract_chr_arms, is_loh_label
-    from scipy.ndimage import label as ndimage_label
-
-    block_map = getattr(state, "clone_block_variants", {}) or {}
-    if clone_label in block_map:
-        return [v for v in block_map[clone_label] if v in state.df_numeric.columns]
-
-    cfg = state.config
-    if not is_loh_label(clone_label):
-        return []
-    cells = [c for c in state.clone_to_cells.get(clone_label, []) if c in state.df_numeric.index]
-    if not cells:
-        return []
-
-    all_block_vars: list[str] = []
-    for arm in extract_chr_arms(clone_label):
-        vars_arm = [v for v in arm_variants(arm, state) if v in state.df_numeric.columns]
-        vars_sorted = sorted(vars_arm, key=_variant_pos)
-        if not vars_sorted:
-            continue
-        vals = state.df_numeric.loc[cells, vars_sorted].values.astype(float)
-        mu = np.nanmean(vals, axis=0)
-        extreme = ((mu <= cfg.low_allele_threshold) | (mu >= cfg.high_allele_threshold)).astype(int)
-        lab, nruns = ndimage_label(extreme)
-        best_idx: list[int] = []
-        best_ext = -1.0
-        for rid in range(1, nruns + 1):
-            idx = np.where(lab == rid)[0]
-            if len(idx) == 0:
-                continue
-            blk = vals[:, idx]
-            fin = np.isfinite(blk)
-            if not fin.any():
-                continue
-            ext = float(((blk[fin] <= cfg.low_allele_threshold) | (blk[fin] >= cfg.high_allele_threshold)).mean())
-            if len(idx) > len(best_idx) or (len(idx) == len(best_idx) and ext > best_ext):
-                best_idx = list(map(int, idx))
-                best_ext = ext
-        all_block_vars.extend([vars_sorted[i] for i in best_idx])
-
-    return list(dict.fromkeys(all_block_vars))
-
-
-def original_clone_size_for_label(state, clone_label: str) -> int:
-    """Current total cells sharing the same base clone, including LOH subclones."""
-    from .loh_config import get_base_clone
-
-    base = get_base_clone(clone_label)
-    n = 0
-    for lbl, cells in state.clone_to_cells.items():
-        if get_base_clone(str(lbl)) == base:
-            n += len(cells)
-    return int(n)
-
-
-def score_loh_clone_ado_probability(
-    state,
-    clone_label: str,
-    amplicon_ado_rates: Any,
-    *,
-    required_amplicons: int | None = None,
-    rate_col: str = "smooth_ado_any_rate",
-    amplicon_col: str = "amplicon_id",
-    default_amplicon_ado_rate: float = 0.01,
-    pvalue_threshold: float = 0.05,
-) -> dict[str, Any]:
-    from .loh_config import extract_chr_arms, get_base_clone
-
-    v2a = _build_variant_to_amplicon_from_state(state)
-    block_vars = infer_loh_block_variants_for_clone(state, clone_label)
-    amps = [v2a.get(v, v) for v in block_vars]
-    amps = list(dict.fromkeys([str(a) for a in amps if str(a) not in {"", "nan", "None"}]))
-
-    n_obs = len(state.clone_to_cells.get(clone_label, []))
-    n_orig = original_clone_size_for_label(state, clone_label)
-
-    scored = score_ado_combination(
-        block_amplicons=amps,
-        amplicon_ado_rates=amplicon_ado_rates,
-        original_clone_size=n_orig,
-        observed_subclone_size=n_obs,
-        required_amplicons=required_amplicons,
-        rate_col=rate_col,
-        amplicon_col=amplicon_col,
-        default_amplicon_ado_rate=default_amplicon_ado_rate,
-        pvalue_threshold=pvalue_threshold,
-    )
-
-    return {
-        "clone_label": clone_label,
-        "base_clone": get_base_clone(clone_label),
-        "loh_arms": ", ".join(extract_chr_arms(clone_label)),
-        "n_observed_cells": int(n_obs),
-        "n_original_clone_cells": int(n_orig),
-        "n_block_variants": int(len(block_vars)),
-        "n_block_amplicons": int(scored["n_block_amplicons"]),
-        "n_required_amplicons": int(scored["n_required_amplicons"]),
-        "single_cell_ado_probability": float(scored["single_cell_ado_probability"]) if np.isfinite(scored["single_cell_ado_probability"]) else np.nan,
-        "expected_ado_cells": float(scored["expected_ado_cells"]) if np.isfinite(scored["expected_ado_cells"]) else np.nan,
-        "p_at_least_observed": float(scored["p_at_least_observed"]) if np.isfinite(scored["p_at_least_observed"]) else np.nan,
-        "ado_enrichment": float(scored["ado_enrichment"]) if np.isfinite(scored["ado_enrichment"]) else np.inf,
-        "classification": scored["classification"],
-        "block_amplicons": ",".join(scored["block_amplicons"]),
-        "block_variants": ",".join(block_vars),
-        "missing_amplicon_rates": ",".join(scored["missing_amplicon_rates"]),
-    }
-
-
-def run_ado_probability_qc(state, amplicon_ado_rates: Any | None = None) -> pd.DataFrame:
-    """Score all current LOH clones for ADO-combination probability."""
-    from .loh_config import LOH_TAG, vprint, is_loh_label
-
-    cfg = state.config
-    enabled = bool(getattr(cfg, "ado_probability_qc_enabled", False))
-    if not enabled:
-        state.ado_probability = pd.DataFrame()
-        return state.ado_probability
-
-    if amplicon_ado_rates is None:
-        amplicon_ado_rates = getattr(cfg, "amplicon_ado_rates", None)
-    if amplicon_ado_rates is None:
-        msg = "ADO-combination probability QC requires cfg.amplicon_ado_rates, but none were provided."
-        if bool(getattr(cfg, "ado_probability_require_rates", False)):
-            raise ValueError(msg)
-        vprint("\n  ADO-combination probability QC skipped: no amplicon_ado_rates provided.", cfg)
-        state.ado_probability = pd.DataFrame()
-        return state.ado_probability
-
-    rate_col = str(getattr(cfg, "ado_probability_rate_col", "smooth_ado_any_rate"))
-    amplicon_col = str(getattr(cfg, "ado_probability_amplicon_col", "amplicon_id"))
-    default_rate = float(getattr(cfg, "ado_probability_default_amplicon_rate", 0.01))
-    pthr = float(getattr(cfg, "ado_probability_pvalue_threshold", 0.05))
-    required = getattr(cfg, "ado_probability_required_amplicons", None)
-    if required is not None:
-        required = int(required)
-
-    rows = []
-    state.refresh()
-    for lbl, cells in sorted(state.clone_to_cells.items(), key=lambda kv: -len(kv[1])):
-        if not is_loh_label(lbl) or len(cells) == 0:
-            continue
-        rows.append(
-            score_loh_clone_ado_probability(
-                state,
-                str(lbl),
-                amplicon_ado_rates,
-                required_amplicons=required,
-                rate_col=rate_col,
-                amplicon_col=amplicon_col,
-                default_amplicon_ado_rate=default_rate,
-                pvalue_threshold=pthr,
-            )
-        )
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.sort_values(
-            ["p_at_least_observed", "expected_ado_cells"],
-            ascending=[True, True],
-            na_position="last",
-        ).reset_index(drop=True)
-
-    state.ado_probability = out
-    state.results["ado_probability_qc"] = out
-
-    vprint("\n" + "-" * 60, cfg)
-    vprint("ADO-combination probability QC", cfg)
-    vprint("-" * 60, cfg)
-    if out.empty:
-        vprint("  No LOH clones available for ADO probability scoring.", cfg)
-    else:
-        vprint(
-            "  Interprets p_at_least_observed as: P(>= observed LOH-like cells "
-            "within original/base clone under amplicon-specific ADO).",
-            cfg,
-        )
-        for _, r in out.iterrows():
-            vprint(
-                f"  • {r['clone_label']}  n={int(r['n_observed_cells'])}/{int(r['n_original_clone_cells'])}  "
-                f"amps={int(r['n_block_amplicons'])}  "
-                f"p_cell={r['single_cell_ado_probability']:.3g}  "
-                f"E={r['expected_ado_cells']:.3g}  "
-                f"P≥obs={r['p_at_least_observed']:.3g}  "
-                f"{r['classification']}",
-                cfg,
-            )
-
-    return out
-
-
 __all__ = [
     "score_ado_combination",
-    "score_loh_clone_ado_probability",
-    "run_ado_probability_qc",
     "normalise_amplicon_ado_rates",
 ]

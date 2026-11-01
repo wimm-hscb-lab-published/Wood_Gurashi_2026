@@ -1,18 +1,24 @@
 """
-LOH Pipeline – Phase 0: Setup baseline clone labels & pre-check variant availability.
+LOH Pipeline – Phase 0: resolve arms, pre-check variant availability, build state.
 
-Returns a PipelineState ready for Phase 1, or None if nothing can be processed.
+Main entry points
+-----------------
+- ``run_phase0``: sort the requested arms, drop arms with too few variants and
+  return a ``PipelineState`` ready for Phase 1 (or None if nothing can be
+  processed).
+- ``precheck_variant_availability``: the per-arm variant-count gate.
 """
 from __future__ import annotations
 
-import pandas as pd
 from typing import Optional
+
+import pandas as pd
 
 from .loh_config import (
     LOHConfig,
     PipelineState,
-    vprint,
     sort_chromosome_arms,
+    vprint,
 )
 
 
@@ -32,6 +38,17 @@ def precheck_variant_availability(
       - It has zero variants in df, OR
       - It has fewer variants than ``cfg.min_contiguous_variants_initial``
         (the minimum contiguous run required to call an LOH segment).
+
+    Parameters
+    ----------
+    grouped_by_chr_arm : dict
+        Arm → variant names.
+    df : pd.DataFrame
+        AF table; only variants present as columns are counted.
+    chr_arms : list[str]
+        Arms to check, in the order they are reported.
+    cfg : LOHConfig
+        Supplies ``min_contiguous_variants_initial`` and ``verbose``.
 
     Returns
     -------
@@ -89,13 +106,34 @@ def run_phase0(
     df_dp: pd.DataFrame | None = None,
 ) -> Optional[PipelineState]:
     """
-    Full Phase 0:
-      1. Resolve which chromosome arms to process.
-      2. Pre-check variant availability.
-      3. Build and return a ``PipelineState``.
+    Run Phase 0 and build the shared ``PipelineState``.
 
-    Returns ``None`` if there are no processable arms or no variant
-    columns, signalling the caller to exit early.
+    Steps:
+      1. Resolve which chromosome arms to process (all keys of
+         *grouped_by_chr_arm* when *chr_arms* is None), sorted naturally.
+      2. Pre-check variant availability.
+      3. Build and return a ``PipelineState`` over the available arms.
+
+    Parameters
+    ----------
+    Sample : missionbio.mosaic Sample
+        Passed to ``PipelineState``.
+    df : pd.DataFrame
+        Cells × variants AF table.
+    grouped_by_chr_arm : dict
+        Arm → variant names.
+    chr_arms : list[str] or None
+        Arms requested.
+    cfg : LOHConfig
+        Run configuration.
+    df_dp : pd.DataFrame or None
+        Optional depth matrix forwarded to ``PipelineState``.
+
+    Returns
+    -------
+    PipelineState or None
+        ``None`` if there are no processable arms or no variant columns,
+        signalling the caller to exit early.
     """
     vprint("\n" + "=" * 60, cfg)
     vprint("MULTI-CHROMOSOME LOH DETECTION", cfg)

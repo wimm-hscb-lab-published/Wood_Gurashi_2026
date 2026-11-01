@@ -1,109 +1,45 @@
-import os
-import sys
-import numpy as np
-import pandas as pd
-from typing import Dict, List, Optional, Union
-from scipy.stats import ranksums, binomtest, beta
+"""Germline-marker informativeness testing for clone-level allelic (LOH) events.
 
-# vN+20: propagate custom WT/reference labels through relaxed expansion and
-# guarantee stable empty-candidate QC output columns/threshold metadata.
-# vN+17: low-read near-zero candidates (as low as 20 total clone reads)
-# are never standalone calls. They require exact pooled depletion evidence and
-# a phase-invariant match to independent high-confidence LOH anchors on the
-# same chromosome arm.
+This module decides which germline heterozygous variants are *informative*
+markers for a clone, i.e. show a clone-specific allelic imbalance relative to
+the WT/reference population that is consistent with loss of heterozygosity
+(deletion, copy-neutral LOH or amplification).
 
+Main entry points
+-----------------
+test_variant_informativeness
+    Per chromosome arm, compare every non-WT clone with the WT/reference cells
+    for each variant and classify it through a hierarchy of decision paths
+    (direct near-zero allele call, low-depth corroborated call, strict
+    statistical fallback, LOH-arm pattern rescue, cross-Hem anti-phase rescue).
+    Writes one ``wilcoxon_results_<arm>_enhanced.csv`` per arm.
+expand_informative_variants
+    Reload the raw H5 with relaxed variant filtering, rerun
+    ``test_variant_informativeness`` on the same cells, quality-gate newly
+    found informative variants and return an expanded ``Sample`` object.
 
-def _normalize_wt_labels(
-    wt_labels: Optional[Union[str, List[str]]],
-) -> List[str]:
-    """
-    Normalize WT/reference labels to a list of exact clone labels.
+Notes
+-----
+``test_variant_informativeness`` is a library function despite its ``test_``
+prefix; import it via the module/package object in test code so that pytest
+does not try to collect it.
 
-    Default is the clone called exactly 'WT'.
-    """
-    if wt_labels is None:
-        return ["WT"]
-
-    if isinstance(wt_labels, str):
-        return [wt_labels]
-
-    return list(wt_labels)
-
-
-def _build_wt_mask(labels: pd.Series, wt_labels: Optional[Union[str, List[str]]]) -> pd.Series:
-    """
-    Build a boolean mask that is True for cells whose label exactly matches
-    one of the WT/reference labels.
-
-    Default behavior:
-        wt_labels=None -> ['WT']
-
-    This intentionally uses exact matching, not prefix matching, so labels like
-    'WT LOH-C2 chr7q:q22.1' are not treated as WT unless explicitly included.
-    """
-    wt_labels = _normalize_wt_labels(wt_labels)
-    return labels.astype(str).str.strip().isin(wt_labels)
-
-
-def _is_wt_label(label: str, wt_labels: Optional[Union[str, List[str]]]) -> bool:
-    """
-    Return True if label exactly matches one of the WT/reference labels.
-    """
-    wt_labels = _normalize_wt_labels(wt_labels)
-    return str(label).strip() in wt_labels
-
-
-"""
-Drop-in replacement for test_variant_informativeness.
-
-Change vs the previous version
-------------------------------
-The old informative rule used only the clone's own deviation from 0.5:
-
-    has_imbalance = abs(mean_af_clone/100 - 0.5) > baf_deviation_threshold
-
-That is blind to the WT reference, so it called variants informative when the
-clone sits away from 50% even though it does NOT differ from WT, e.g.:
-  * germline sites skewed in everyone (WT ~80%, clone ~80%), and
-  * homozygous-in-both sites (WT ~97%, clone ~99%),
-both of which pass on large-n Wilcoxon significance with a trivial difference.
-
-The fix adds a required clone-vs-WT allelic shift:
-
-    baf_shift_vs_wt = abs(mean_af_clone - mean_af_wt) / 100
-    has_shift_vs_wt = baf_shift_vs_wt > min_baf_shift_vs_wt
-    has_imbalance   = clone_imbalanced and has_shift_vs_wt   (when require_shift_vs_wt)
-
-This also acts as an effect-size floor so a near-identical clone/WT pair cannot
-be called informative just because n is large enough to make p tiny.
-
-A second gate encodes the read-level signature of a real germline LOH marker:
-the clone has lost one allele, so in most clone cells either ALT or REF reads
-are ~0. Operationally, a variant must have a high fraction of clone cells whose
-minor-allele read fraction is near zero (require_allele_dropout, default True).
-This is more robust than the mean AF (which a few dropout cells can fake) and
-excludes amplifications and partial shifts, which keep both alleles present.
-
-Backward compatibility: require_shift_vs_wt=False and require_allele_dropout=
-False reproduces the old behaviour exactly (has_imbalance == clone_imbalanced).
-
-New output columns: baf_shift_vs_wt, clone_imbalanced, has_shift_vs_wt,
-clone_minor_allele_fraction, clone_dropout_fraction, allele_dropout.
-
-The three helpers and imports below are identical to those already in your
-module and are included only so this file is self-contained. When splicing into
-informativeness.py, keep just test_variant_informativeness.
+WT/reference labels are always matched *exactly* (after ``str.strip``), never
+by prefix, so a label such as ``'WT LOH-C2 chr7q:q22.1'`` is not treated as WT
+unless it is listed explicitly.
 """
 
 import os
 import sys
+from typing import Dict, List, Optional, Union
+
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Union
-from scipy.stats import ranksums
+from scipy.stats import beta, binomtest, ranksums
 
 
 def _normalize_wt_labels(wt_labels: Optional[Union[str, List[str]]]) -> List[str]:
+    """Return WT/reference labels as a list (``None`` -> ``['WT']``, str -> ``[str]``)."""
     if wt_labels is None:
         return ["WT"]
     if isinstance(wt_labels, str):
@@ -112,19 +48,16 @@ def _normalize_wt_labels(wt_labels: Optional[Union[str, List[str]]]) -> List[str
 
 
 def _build_wt_mask(labels: pd.Series, wt_labels: Optional[Union[str, List[str]]]) -> pd.Series:
+    """Boolean mask of cells whose stripped label exactly matches a WT/reference label."""
     wt_labels = _normalize_wt_labels(wt_labels)
     return labels.astype(str).str.strip().isin(wt_labels)
 
 
 def _is_wt_label(label: str, wt_labels: Optional[Union[str, List[str]]]) -> bool:
+    """Return True if ``label`` (stripped) exactly matches a WT/reference label."""
     wt_labels = _normalize_wt_labels(wt_labels)
     return str(label).strip() in wt_labels
 
-
-# vN+15: direct near-zero evidence is split into high-confidence calls and
-# low-depth candidates. Low-depth candidates are not rejected solely for coverage;
-# they require exact pooled allele-depletion evidence plus independent LOH anchors
-# from other amplicons on the same chromosome arm before they are promoted.
 
 def test_variant_informativeness(
     df_AF: pd.DataFrame,
@@ -235,42 +168,215 @@ def test_variant_informativeness(
 ) -> Dict[str, pd.DataFrame]:
     """Identify germline markers informative for clone-level allelic events.
 
-    Decision hierarchy:
-      1. High-confidence direct near-zero allele path: when the clone-wide
-         plotted ALT or REF mean is near zero, its pooled minor-allele fraction
-         is low, and high aggregate/per-cell depth support is present, call the
-         marker informative immediately.
-      2. Low-depth near-zero candidate path: do not discard biologically
-         plausible events solely because they have about 5 cells × 10 reads.
-         Instead, require exact pooled depletion evidence relative to the WT
-         allele fraction, a one-sided upper bound on the depleted allele
-         fraction, and corroboration by high-confidence LOH anchors from
-         independent amplicons on the same chromosome arm. The candidate must
-         additionally match the anchors' phase-invariant pooled allelic
-         imbalance and minor-allele fraction. This permits a low-read marker
-         to be rescued by a bona fide arm-level LOH pattern, but not merely by
-         a zero count at an isolated locus.
-         A supplied germline_variants panel is used as the eligibility reference;
-         otherwise the current WT cells must support a clean heterozygote.
-         Neither direct path requires Wilcoxon significance, AF-IQR, or min_cells
-         cells that pass the per-cell depth filter used only for statistical testing.
-      3. Strict statistical fallback: only for variants that do not pass the
-         direct path, require Wilcoxon significance, a clone-vs-WT AF shift,
-         clone imbalance, AF consistency, and (when enabled) depth-weighted
-         allelic depletion.
-      4. Optional LOH-arm pattern rescue: an otherwise uncalled marker may be
-         promoted only when it is on an arm already supported by at least two
-         informative LOH anchors from independent amplicons and its
-         phase-invariant AF imbalance, pooled minor-allele fraction, and
-         depth ratio closely match those anchors. This path requires an
-         explicit variant-to-amplicon map by default.
-      5. Optional cross-Hem anti-phase rescue: for the same marker on the same
-         arm, an uncalled Hem clone may be promoted when an informative Hem
-         clone has an opposite signed clone-vs-WT AF shift and the candidate
-         independently has significant, consistent, allele-depleted evidence.
+    For every chromosome arm in ``grouped_by_chr_arm`` and every non-WT clone,
+    each variant is compared with the WT/reference cells and classified by a
+    hierarchy of decision paths (see Notes). One row per (variant, clone) is
+    produced, with all intermediate statistics and boolean gates as columns.
 
-    Optional pooled-depletion and generic arm-rescue paths remain available but
-    are disabled by default so they cannot create calls outside this hierarchy.
+    Parameters
+    ----------
+    df_AF : pd.DataFrame
+        Cells x variants allele frequencies in percent (0-100) plus a ``label``
+        column with clone labels. Index = cell barcodes.
+    df_ALT, df_REF : pd.DataFrame
+        Cells x variants ALT and REF read counts. Re-indexed to ``df_AF``'s
+        cells; a ``label`` column, if present, is dropped. Variants missing
+        from either table are handled with AF-only statistics.
+    grouped_by_chr_arm : dict
+        ``{arm_name: [variant_id, ...]}`` (e.g. from
+        ``group_informative_variants_by_chr_arm``). Arms are processed in dict
+        order; variants absent from ``df_AF`` are ignored.
+    output_dir : str
+        Directory for the per-arm CSV files (created only if any result exists).
+    p_threshold : float, default 0.01
+        Wilcoxon rank-sum p-value threshold of the statistical fallback.
+    baf_deviation_threshold : float, default 0.2
+        ``clone_imbalanced`` requires ``|mean_af_clone/100 - 0.5|`` above this.
+    min_baf_shift_vs_wt : float, default 0.10
+        ``has_shift_vs_wt`` requires ``|mean_af_clone - mean_af_wt|/100 >=`` this.
+    require_shift_vs_wt, require_clone_imbalance : bool, default True
+        Only shape the diagnostic ``has_imbalance`` column. The statistical
+        fallback always requires both ``has_shift_vs_wt`` and
+        ``clone_imbalanced`` regardless of these flags.
+    require_allele_dropout : bool, default True
+        Statistical fallback additionally requires ``allele_dropout``.
+    max_cell_minor_fraction : float, default 0.10
+        A cell counts as a strict dropout cell when its minor-allele read
+        fraction is below this value.
+    min_dropout_cell_fraction : float, default 0.60
+        Accepted but not used.
+    min_cell_depth_for_dropout : int, default 5
+        Per-cell depth (ALT+REF) required for a cell to enter the statistical
+        paths, and for counting "depth-qualified" cells in the direct paths.
+    max_minor_allele_fraction : float, default 0.10
+        Accepted but not used.
+    enable_direct_near_zero_allele_call : bool, default True
+        Enable the high-confidence direct near-zero path (and, with it, the
+        low-depth candidate path).
+    direct_near_zero_max_mean_allele_reads : float, default 2.0
+        Max clone-wide mean of the lower of ALT/REF reads per cell.
+    direct_near_zero_max_minor_allele_fraction : float, default 0.10
+        Max pooled clone minor-allele read fraction for the near-zero pattern.
+    direct_near_zero_min_mean_total_depth : float, default 15.0
+        High-confidence: min clone mean depth. Also used as the anchor and
+        candidate depth floor of the LOH-arm pattern rescue.
+    direct_near_zero_min_total_clone_reads : int, default 100
+        High-confidence: min pooled clone reads.
+    direct_near_zero_min_depth_qualified_cells : int, default 4
+        High-confidence: min clone cells with depth >= ``min_cell_depth_for_dropout``.
+    enable_low_depth_near_zero_rescue : bool, default True
+        Enable low-depth near-zero candidates and their same-arm corroboration.
+    low_depth_near_zero_min_mean_total_depth : float, default 5.0
+    low_depth_near_zero_min_total_clone_reads : int, default 20
+    low_depth_near_zero_min_depth_qualified_cells : int, default 3
+        Basic depth support a low-depth candidate must reach.
+    low_depth_near_zero_max_binom_p : float, default 1e-3
+        Max one-sided exact binomial p-value of the depleted-allele read count
+        under the WT allele fraction.
+    low_depth_near_zero_confidence_level : float, default 0.95
+        Confidence level of the one-sided upper bound on the depleted-allele
+        fraction (``beta.ppf(level, x + 1, n - x)``).
+    low_depth_near_zero_max_depleted_allele_upper_bound : float, default 0.15
+        Max allowed value of that upper bound.
+    low_depth_near_zero_min_anchor_variants : int, default 2
+    low_depth_near_zero_min_anchor_amplicons : int, default 2
+        Minimum high-confidence anchors (variants / distinct amplicons) on the
+        same arm and clone.
+    low_depth_near_zero_max_minor_fraction_distance : float, default 0.15
+    low_depth_near_zero_max_phase_invariant_imbalance_distance : float, default 0.20
+        Max distance of the candidate from the anchors' median pooled minor
+        fraction / median ``|ALT fraction - 0.5|``.
+    low_depth_near_zero_require_independent_amplicons : bool, default True
+        Anchors must come from amplicons other than the candidate's.
+    direct_near_zero_require_wt_clean_het : bool, default True
+        Without a ``germline_variants`` panel, direct paths require the WT to be
+        a clean heterozygote (see Notes).
+    enable_statistical_fallback : bool, default True
+        Enable the strict Wilcoxon-based fallback path.
+    max_pooled_minor_allele_fraction : float, default 0.25
+        ``pooled_depletion``: clone pooled minor-allele fraction <= this.
+    min_weighted_dropout_read_fraction : float, default 0.50
+        ``weighted_dropout``: share of clone reads in strict dropout cells >= this.
+    min_clone_total_reads : int, default 30
+        Read floor for the pooled-read rescue and the LOH-arm pattern rescue.
+    enable_dropout_rescue : bool, default False
+        Enable the optional pooled-read depletion rescue.
+    dropout_rescue_max_clone_cells : int, optional
+        If set, the pooled-read rescue applies only to clones with at most this
+        many statistically usable cells. Must be >= 1.
+    dropout_rescue_min_baf_shift_vs_wt : float, default 0.10
+    dropout_rescue_max_af_iqr : float, default 0.30
+    dropout_rescue_require_af_iqr : bool, default False
+    dropout_rescue_max_clone_minor_allele_fraction : float, default 0.20
+    dropout_rescue_max_cell_minor_fraction : float, default 0.20
+    dropout_rescue_min_cell_fraction : float, default 0.50
+        Thresholds of the pooled-read rescue (shift, optional IQR gate, strong
+        pooled depletion or broad depth-weighted near-dropout).
+    dropout_rescue_min_wt_minor_allele_fraction : float, default 0.25
+        WT pooled minor fraction required for the WT to count as a clean
+        heterozygote (used by several paths, not only the rescue).
+    depth_ratio_deletion, depth_ratio_amplification : float, default 0.7, 1.3
+        Clone/WT mean-depth ratio cut-offs for ``event_type``.
+    max_af_iqr : float, default 0.3
+        ``is_consistent``: clone AF IQR (as fraction) <= this.
+    min_cells : int, default 5
+        Minimum depth-qualified clone *and* WT cells for statistical paths.
+    wt_labels : str or list of str, optional
+        Exact WT/reference label(s); ``None`` means ``['WT']``.
+    variant_to_amplicon : dict or pd.DataFrame, optional
+        Variant -> amplicon map (DataFrame with variant/id/mutation and
+        amplicon/amplicon_id/amp columns). Variant IDs are canonicalised.
+    require_amplicon_mapping_for_corroboration : bool, default True
+        Skip the low-depth and LOH-arm corroboration when no mapping key
+        overlaps ``df_AF`` (and independent amplicons are required).
+    germline_variants : iterable of str, optional
+        Germline whitelist used instead of the WT clean-het check as the
+        eligibility reference for the direct and Hem paths.
+    enable_arm_rescue : bool, default False
+    arm_rescue_p_threshold : float, default 0.10
+    arm_rescue_min_baf_shift_vs_wt : float, default 0.15
+    arm_rescue_max_af_iqr : float, default 0.50
+    arm_rescue_min_unique_amplicons : int, default 2
+        Optional generic arm rescue of partial shifts supported by several
+        distinct amplicons in the same clone and arm.
+    enable_loh_arm_pattern_rescue : bool, default True
+    loh_arm_pattern_min_anchor_variants : int, default 2
+    loh_arm_pattern_min_anchor_amplicons : int, default 2
+    loh_arm_pattern_min_baf_shift_vs_wt : float, default 0.08
+    loh_arm_pattern_max_af_iqr : float, default 0.45
+    loh_arm_pattern_max_minor_allele_fraction : float, default 0.30
+    loh_arm_pattern_max_minor_fraction_distance : float, default 0.18
+    loh_arm_pattern_max_phase_invariant_imbalance_distance : float, default 0.15
+    loh_arm_pattern_max_depth_ratio_distance : float, default 0.35
+    loh_arm_pattern_require_independent_amplicons : bool, default True
+        LOH-arm pattern rescue settings (see Notes).
+    enable_hem_antiphase_rescue : bool, default True
+    hem_label_token : str, default "Hem"
+        Case-insensitive substring identifying Hem clones.
+    hem_antiphase_p_threshold : float, optional
+        Extra p-value bound for Hem candidates (default ``p_threshold``).
+    hem_antiphase_min_baf_shift_vs_wt : float, default 0.10
+    hem_antiphase_require_allele_dropout : bool, default True
+    hem_antiphase_require_statistical_cell_eligibility : bool, default False
+        Cross-Hem anti-phase rescue settings (see Notes).
+    verbose : bool, default True
+        Print parameters, per-arm counts and a summary.
+
+    Returns
+    -------
+    dict of str -> pd.DataFrame
+        ``{arm_name: results}`` for arms with at least one comparison; ``{}``
+        if none. Key columns: ``variant``, ``label``, ``amplicon``,
+        ``mean_af_clone``, ``mean_af_wt``, ``delta_af``, ``wilcoxon_p``,
+        ``depth_ratio``, one ``informative_*`` flag per path, ``informative``
+        (OR of all paths), ``informativeness_tier``, ``classification_reason``
+        and ``event_type`` (``DELETION``/``AMPLIFICATION``/``cnLOH``/
+        ``UNKNOWN`` for informative rows, ``""`` otherwise). Each table is also
+        written to ``output_dir/wilcoxon_results_<arm>_enhanced.csv``.
+
+    Raises
+    ------
+    ValueError
+        If ``dropout_rescue_max_clone_cells`` < 1, or no cell carries a WT label.
+    KeyError
+        If ``df_AF`` has no ``label`` column.
+
+    Notes
+    -----
+    Per (variant, clone), two sets of aggregates are computed: *plot-aligned*
+    ones over all clone cells (as shown in ALT/REF plots) and *statistical*
+    ones over cells with depth >= ``min_cell_depth_for_dropout``. Clone and WT
+    mean AF are read-weighted (``100 * sum(ALT) / sum(ALT+REF)``). The WT is a
+    *clean heterozygote* when its pooled minor fraction is >=
+    ``dropout_rescue_min_wt_minor_allele_fraction`` and its mean AF is in
+    [30, 70]. Decision hierarchy:
+
+    1. High-confidence direct near-zero: plot-aligned min(mean ALT, mean REF)
+       <= 2.0 reads and pooled minor fraction <= 0.10, with mean depth >= 15,
+       total reads >= 100 and >= 4 depth-qualified cells, and the reference
+       check passes (whitelist membership or WT clean het). Stand-alone call.
+    2. Low-depth near-zero candidate: same pattern with only basic depth
+       support (5 / 20 / 3), exact binomial p <= 1e-3 and depleted-allele
+       upper bound <= 0.15. Promoted only if, in the same clone and arm, at
+       least 2 anchors (paths 1, 3 or the pooled-read rescue) from at least 2
+       other amplicons exist and the candidate matches their median minor
+       fraction (<= 0.15) and phase-invariant imbalance (<= 0.20).
+    3. Strict statistical fallback (not path 1): both groups have >=
+       ``min_cells`` cells, Wilcoxon p < ``p_threshold``, shift vs WT >= 0.10,
+       clone imbalanced (> 0.2 from 0.5), AF IQR <= 0.3, and allele dropout
+       (pooled minor <= 0.25 and >= 50% of reads in cells with minor < 0.10).
+    4. LOH-arm pattern rescue: an uncalled row (w.r.t. paths 1, 3 and the
+       pooled-read rescue) is promoted when >= 2 anchors from >= 2 other
+       amplicons exist in the clone/arm and it passes eligibility (shift >=
+       0.08, IQR <= 0.45, mean depth >= 15, reads >= 30, minor <= 0.30, depth
+       ratio <= 1.3) and similarity (minor-fraction distance <= 0.18, imbalance
+       distance <= 0.15, depth-ratio distance <= 0.35) to the anchor medians.
+    5. Cross-Hem anti-phase rescue: for a variant, an uncalled Hem clone with
+       significant, consistent, allele-depleted evidence and shift >= 0.10 is
+       promoted when another Hem clone is already informative with an
+       opposite-signed ``delta_af`` (anchor = largest ``|delta_af|``).
+
+    The pooled-read rescue and the generic arm rescue are disabled by default.
     """
 
     wt_labels = _normalize_wt_labels(wt_labels)
@@ -1431,560 +1537,6 @@ def test_variant_informativeness(
     return out
 
 
-def test_cnv_informative_variants(
-    df_cnv_vars: pd.DataFrame,
-    df_ALT: pd.DataFrame,
-    df_REF: pd.DataFrame,
-    variant_to_amplicon,
-    grouped_by_chr_arm: dict,
-    output_dir: str,
-    p_threshold: float = 0.01,
-    min_ploidy_change: float = 0.5,
-    max_ploidy_iqr: float = 0.8,
-    min_cells: int = 5,
-    depth_ratio_deletion: float = 0.7,
-    depth_ratio_amplification: float = 1.3,
-    wt_labels: Optional[Union[str, List[str]]] = None,
-    verbose: bool = True,
-) -> dict:
-    """
-    Test CNV variants for informativeness using ploidy + depth ratio.
-
-    For each CNV variant × clone pair, computes:
-      1. Ploidy shift = abs(mean_ploidy_clone - mean_ploidy_WT)
-      2. Depth ratio  = mean_total_depth_clone / mean_total_depth_WT
-      3. Ploidy IQR   = within-clone ploidy consistency
-
-    A CNV variant is INFORMATIVE if ALL THREE criteria are met:
-      - Wilcoxon rank-sum p < p_threshold on ploidy
-      - Ploidy change >= min_ploidy_change
-      - Ploidy IQR within clone < max_ploidy_iqr
-
-    Informative variants are CLASSIFIED by event type using depth ratio:
-      - Depth ratio < depth_ratio_deletion      -> DELETION
-      - depth_ratio_deletion <= DR <= amp       -> cnLOH
-      - Depth ratio > depth_ratio_amplification -> AMPLIFICATION
-
-    Parameters
-    ----------
-    df_cnv_vars : pd.DataFrame
-        CNV ploidy data with cells as rows, CNV variants as columns,
-        and a 'label' column.
-    df_ALT : pd.DataFrame
-        ALT read counts. Same cell index. No 'label' column required.
-    df_REF : pd.DataFrame
-        REF read counts. Same cell index. No 'label' column required.
-    variant_to_amplicon : dict or pd.DataFrame
-        Mapping from variant ID to amplicon name.
-    grouped_by_chr_arm : dict
-        {chr_arm: [list of variant names]}
-    output_dir : str
-        Directory for result CSVs.
-    p_threshold : float
-        Wilcoxon p-value cutoff.
-    min_ploidy_change : float
-        Minimum absolute ploidy change from WT.
-    max_ploidy_iqr : float
-        Maximum IQR of ploidy within clone for consistency.
-    min_cells : int
-        Minimum cells to test.
-    depth_ratio_deletion : float
-        Depth ratio below this -> deletion.
-    depth_ratio_amplification : float
-        Depth ratio above this -> amplification.
-    wt_labels : list[str], str, or None
-        Exact clone labels to use as the WT/reference group.
-        Default None resolves to ['WT'], meaning only the clone called exactly
-        'WT' is used as reference.
-    verbose : bool
-        Print progress.
-
-    Returns
-    -------
-    dict
-        {chr_arm: pd.DataFrame} with one row per CNV variant-clone comparison.
-    """
-
-    wt_labels = _normalize_wt_labels(wt_labels)
-
-    def vprint(msg: str) -> None:
-        if verbose:
-            print(msg)
-            sys.stdout.flush()
-
-    vprint("\n" + "=" * 60)
-    vprint("CNV VARIANT INFORMATIVENESS TESTING")
-    vprint("Ploidy shift + Depth ratio + Cell-level consistency")
-    vprint("=" * 60)
-    vprint(f"  P-value threshold:           {p_threshold}")
-    vprint(f"  Min ploidy change:           ≥{min_ploidy_change}")
-    vprint(f"  Max ploidy IQR:              <{max_ploidy_iqr}")
-    vprint(f"  Min cells per clone:         {min_cells}")
-    vprint(f"  Depth ratio deletion:        <{depth_ratio_deletion}")
-    vprint(f"  Depth ratio amplification:   >{depth_ratio_amplification}")
-    vprint(f"  WT reference labels exact:   {wt_labels}")
-    vprint("\n  Informative = significant ploidy + magnitude + consistency")
-    vprint("  Event type  = classified by depth ratio")
-
-    # ── Validate inputs ─────────────────────────────────────────────────────
-    if "label" not in df_cnv_vars.columns:
-        vprint("\n❌ ERROR: 'label' column not found in df_cnv_vars")
-        return {}
-
-    # Work on copies and normalize labels
-    df_cnv_vars = df_cnv_vars.copy()
-    df_cnv_vars["label"] = df_cnv_vars["label"].astype(str).str.strip()
-
-    df_ALT = df_ALT.copy()
-    df_REF = df_REF.copy()
-
-    # Build barcode → label mapping
-    barcode_to_label = dict(zip(df_cnv_vars.index, df_cnv_vars["label"].values))
-
-    # Add label to ALT / REF
-    vprint("\n  Adding 'label' column to df_ALT and df_REF...")
-
-    df_ALT["label"] = df_ALT.index.map(lambda x: barcode_to_label.get(x, "Unknown"))
-    df_ALT["label"] = df_ALT["label"].astype(str).str.strip()
-
-    df_REF["label"] = df_REF.index.map(lambda x: barcode_to_label.get(x, "Unknown"))
-    df_REF["label"] = df_REF["label"].astype(str).str.strip()
-
-    vprint("    ✓ Added 'label' to df_ALT and df_REF")
-
-    # ── CNV variant columns ─────────────────────────────────────────────────
-    cnv_variants = [col for col in df_cnv_vars.columns if str(col).startswith("chr")]
-    vprint(f"\n  Total CNV variant columns: {len(cnv_variants)}")
-
-    # ── WT and clone labels ─────────────────────────────────────────────────
-    wt_mask_cnv = _build_wt_mask(df_cnv_vars["label"], wt_labels)
-    n_wt = int(wt_mask_cnv.sum())
-
-    if n_wt == 0:
-        vprint(f"\n⚠️  No WT/reference cells found using exact labels: {wt_labels}")
-        vprint("Available labels:")
-        for lab, count in df_cnv_vars["label"].value_counts().items():
-            vprint(f"  {repr(lab)}: {count}")
-        return {}
-
-    vprint(f"  WT/reference cells: {n_wt}  exact labels: {wt_labels}")
-
-    clone_labels = sorted(
-        [
-            lab
-            for lab in df_cnv_vars["label"].unique()
-            if not _is_wt_label(lab, wt_labels)
-        ]
-    )
-
-    vprint(f"  Clone labels ({len(clone_labels)}):")
-    for lab in clone_labels:
-        vprint(f"    {lab}: {int((df_cnv_vars['label'] == lab).sum())} cells")
-
-    # ── Build amplicon mapping ──────────────────────────────────────────────
-    vprint("\n  Building amplicon-to-variant mapping...")
-
-    if isinstance(variant_to_amplicon, pd.DataFrame):
-        variant_to_amplicon_dict = dict(
-            zip(variant_to_amplicon["variant"], variant_to_amplicon["amplicon"])
-        )
-    elif isinstance(variant_to_amplicon, dict):
-        variant_to_amplicon_dict = variant_to_amplicon
-    else:
-        vprint(f"    ERROR: Unsupported variant_to_amplicon type: {type(variant_to_amplicon)}")
-        return {}
-
-    amplicon_to_variants = {}
-
-    for variant, amplicon in variant_to_amplicon_dict.items():
-        amplicon_str = (
-            str(amplicon[0]) if isinstance(amplicon, np.ndarray) else str(amplicon)
-        )
-
-        if amplicon_str not in amplicon_to_variants:
-            amplicon_to_variants[amplicon_str] = []
-
-        amplicon_to_variants[amplicon_str].append(variant)
-
-    vprint(
-        f"    Mapped {len(variant_to_amplicon_dict)} variants "
-        f"to {len(amplicon_to_variants)} amplicons"
-    )
-
-    # ── Pre-compute WT masks ────────────────────────────────────────────────
-    wt_mask_alt = _build_wt_mask(df_ALT["label"], wt_labels)
-    wt_mask_ref = _build_wt_mask(df_REF["label"], wt_labels)
-
-    # ── Process each chromosome arm ─────────────────────────────────────────
-    wilcoxon_results_cnv = {}
-
-    vprint(f"\n  Processing {len(grouped_by_chr_arm)} chromosome arms...")
-
-    for chr_idx, (chr_arm, chr_variants) in enumerate(grouped_by_chr_arm.items(), 1):
-        chr_variants_in_cnv = [v for v in chr_variants if v in cnv_variants]
-
-        if not chr_variants_in_cnv:
-            continue
-
-        vprint(
-            f"\n  [{chr_idx}/{len(grouped_by_chr_arm)}] {chr_arm} "
-            f"({len(chr_variants_in_cnv)} CNV variants)..."
-        )
-
-        chr_results = []
-
-        for var_idx, cnv_variant in enumerate(chr_variants_in_cnv, 1):
-            if var_idx % 20 == 0:
-                vprint(f"      Progress: {var_idx}/{len(chr_variants_in_cnv)} variants...")
-
-            # Amplicon lookup
-            amplicon_name = variant_to_amplicon_dict.get(cnv_variant, "Unknown")
-            amplicon_name = (
-                str(amplicon_name[0])
-                if isinstance(amplicon_name, np.ndarray)
-                else str(amplicon_name)
-            )
-
-            if amplicon_name == "Unknown":
-                continue
-
-            # ── WT/reference ploidy ────────────────────────────────────────
-            wt_ploidy = pd.to_numeric(
-                df_cnv_vars.loc[wt_mask_cnv, cnv_variant],
-                errors="coerce",
-            ).dropna()
-
-            if len(wt_ploidy) < min_cells:
-                continue
-
-            mean_ploidy_wt = float(wt_ploidy.mean())
-
-            # ── WT/reference depth ─────────────────────────────────────────
-            has_alt = cnv_variant in df_ALT.columns
-            has_ref = cnv_variant in df_REF.columns
-
-            if has_alt and has_ref:
-                wt_alt = pd.to_numeric(
-                    df_ALT.loc[wt_mask_alt, cnv_variant],
-                    errors="coerce",
-                ).dropna()
-
-                wt_ref = pd.to_numeric(
-                    df_REF.loc[wt_mask_ref, cnv_variant],
-                    errors="coerce",
-                ).dropna()
-
-                wt_common = wt_alt.index.intersection(wt_ref.index)
-
-                if len(wt_common) > 0:
-                    mean_depth_wt = float(
-                        (wt_alt.loc[wt_common] + wt_ref.loc[wt_common]).mean()
-                    )
-                else:
-                    mean_depth_wt = np.nan
-            else:
-                mean_depth_wt = np.nan
-
-            # ── Test each clone ─────────────────────────────────────────────
-            for lab in clone_labels:
-                clone_ploidy = pd.to_numeric(
-                    df_cnv_vars.loc[df_cnv_vars["label"] == lab, cnv_variant],
-                    errors="coerce",
-                ).dropna()
-
-                if len(clone_ploidy) < min_cells:
-                    continue
-
-                n_cells = len(clone_ploidy)
-                mean_ploidy_clone = float(clone_ploidy.mean())
-                ploidy_difference = abs(mean_ploidy_clone - mean_ploidy_wt)
-
-                # Wilcoxon on ploidy
-                try:
-                    stat, p = ranksums(clone_ploidy, wt_ploidy)
-                    stat = float(stat)
-                    p = float(p)
-                    is_significant = bool(p < p_threshold)
-                except Exception:
-                    stat, p = np.nan, 1.0
-                    is_significant = False
-
-                # Ploidy change magnitude
-                ploidy_change_flag = bool(ploidy_difference >= min_ploidy_change)
-
-                # Ploidy IQR consistency
-                ploidy_iqr = float(
-                    clone_ploidy.quantile(0.75) - clone_ploidy.quantile(0.25)
-                )
-                is_consistent = bool(ploidy_iqr < max_ploidy_iqr)
-
-                # ── Depth ratio ────────────────────────────────────────────
-                clone_mask_alt = df_ALT["label"] == lab
-                clone_mask_ref = df_REF["label"] == lab
-
-                if has_alt and has_ref:
-                    clone_alt = pd.to_numeric(
-                        df_ALT.loc[clone_mask_alt, cnv_variant],
-                        errors="coerce",
-                    ).dropna()
-
-                    clone_ref = pd.to_numeric(
-                        df_REF.loc[clone_mask_ref, cnv_variant],
-                        errors="coerce",
-                    ).dropna()
-
-                    clone_common = clone_alt.index.intersection(clone_ref.index)
-
-                    if len(clone_common) > 0:
-                        mean_depth_clone = float(
-                            (
-                                clone_alt.loc[clone_common]
-                                + clone_ref.loc[clone_common]
-                            ).mean()
-                        )
-                    else:
-                        mean_depth_clone = np.nan
-                else:
-                    mean_depth_clone = np.nan
-
-                if (
-                    not np.isnan(mean_depth_clone)
-                    and not np.isnan(mean_depth_wt)
-                    and mean_depth_wt > 0
-                ):
-                    depth_ratio = mean_depth_clone / mean_depth_wt
-                else:
-                    depth_ratio = np.nan
-
-                # ── Informativeness ────────────────────────────────────────
-                informative = bool(
-                    is_significant and ploidy_change_flag and is_consistent
-                )
-
-                # ── Event classification ───────────────────────────────────
-                if informative and not np.isnan(depth_ratio):
-                    if depth_ratio < depth_ratio_deletion:
-                        event_type = "DELETION"
-                    elif depth_ratio > depth_ratio_amplification:
-                        event_type = "AMPLIFICATION"
-                    else:
-                        event_type = "cnLOH"
-                elif informative:
-                    if mean_ploidy_clone < mean_ploidy_wt:
-                        event_type = "LIKELY_DELETION"
-                    elif mean_ploidy_clone > mean_ploidy_wt:
-                        event_type = "LIKELY_AMPLIFICATION"
-                    else:
-                        event_type = "UNKNOWN"
-                else:
-                    event_type = ""
-
-                # ── Legacy AF-based columns ────────────────────────────────
-                n_cells_low_af = 0
-                n_cells_high_af = 0
-                n_cells_with_data = 0
-                af_direction_consistency = 0.0
-
-                if has_alt and has_ref:
-                    c_alt = pd.to_numeric(
-                        df_ALT.loc[clone_mask_alt, cnv_variant],
-                        errors="coerce",
-                    )
-
-                    c_ref = pd.to_numeric(
-                        df_REF.loc[clone_mask_ref, cnv_variant],
-                        errors="coerce",
-                    )
-
-                    common_idx = c_alt.dropna().index.intersection(c_ref.dropna().index)
-
-                    total_depth = c_alt.loc[common_idx] + c_ref.loc[common_idx]
-                    valid = total_depth > 0
-
-                    if valid.sum() > 0:
-                        cell_af = c_alt.loc[common_idx][valid] / total_depth[valid]
-                        n_cells_with_data = len(cell_af)
-                        n_cells_low_af = int((cell_af < 0.3).sum())
-                        n_cells_high_af = int((cell_af > 0.7).sum())
-                        n_signal = n_cells_low_af + n_cells_high_af
-
-                        if n_signal > 0:
-                            af_direction_consistency = (
-                                max(n_cells_low_af, n_cells_high_af)
-                                / n_cells_with_data
-                            )
-
-                n_cells_with_signal = n_cells_low_af + n_cells_high_af
-
-                chr_results.append(
-                    {
-                        "variant": cnv_variant,
-                        "label": lab,
-                        "mean_ploidy_clone": mean_ploidy_clone,
-                        "mean_ploidy_wt": mean_ploidy_wt,
-                        "ploidy_difference": ploidy_difference,
-                        "wilcoxon_stat": stat,
-                        "wilcoxon_p": p,
-                        "significant_p_lt_0.01": is_significant,
-                        "ploidy_change_flag": ploidy_change_flag,
-                        "n_cells_with_data": n_cells_with_data,
-                        "n_cells_low_af": n_cells_low_af,
-                        "n_cells_high_af": n_cells_high_af,
-                        "n_cells_with_signal": n_cells_with_signal,
-                        "cell_consistency_flag": is_consistent,
-                        "af_direction_consistency": af_direction_consistency,
-                        "af_consistency_flag": is_consistent,
-                        "informative": informative,
-                        "n_cells_ploidy": n_cells,
-                        "ploidy_iqr": ploidy_iqr,
-                        "is_consistent": is_consistent,
-                        "mean_depth_clone": mean_depth_clone,
-                        "mean_depth_wt": mean_depth_wt,
-                        "depth_ratio": depth_ratio,
-                        "event_type": event_type,
-                    }
-                )
-
-        if chr_results:
-            chr_df = pd.DataFrame(chr_results)
-            wilcoxon_results_cnv[chr_arm] = chr_df
-
-            n_inf = int(chr_df["informative"].sum())
-            vprint(f"    ✓ {chr_arm}: {len(chr_results)} comparisons, {n_inf} informative")
-
-    vprint("\n  Processing complete!")
-
-    if not wilcoxon_results_cnv:
-        vprint("\n⚠️  No results generated")
-        return {}
-
-    # ── Export ───────────────────────────────────────────────────────────────
-    os.makedirs(output_dir, exist_ok=True)
-
-    for chr_arm, res_df in wilcoxon_results_cnv.items():
-        output_path = os.path.join(output_dir, f"wilcoxon_results_cnv_{chr_arm}.csv")
-        res_df.to_csv(output_path, index=False)
-        vprint(f"  ✓ Exported results for {chr_arm}")
-
-    # ── Summary ─────────────────────────────────────────────────────────────
-    vprint("\n" + "=" * 60)
-    vprint("RESULTS SUMMARY")
-    vprint("=" * 60)
-
-    all_results = pd.concat(wilcoxon_results_cnv.values(), ignore_index=True)
-
-    total_comparisons = len(all_results)
-    total_significant = int(all_results["significant_p_lt_0.01"].sum())
-    total_ploidy_change = int(all_results["ploidy_change_flag"].sum())
-    total_consistent = int(all_results["is_consistent"].sum())
-    total_informative = int(all_results["informative"].sum())
-
-    vprint(f"\nTotal comparisons:            {total_comparisons}")
-    vprint(
-        f"Significant ploidy p<{p_threshold}: "
-        f"{total_significant} "
-        f"({100 * total_significant / total_comparisons:.1f}%)"
-    )
-    vprint(
-        f"Ploidy change ≥{min_ploidy_change}:        "
-        f"{total_ploidy_change} "
-        f"({100 * total_ploidy_change / total_comparisons:.1f}%)"
-    )
-    vprint(
-        f"Consistent IQR<{max_ploidy_iqr}:          "
-        f"{total_consistent} "
-        f"({100 * total_consistent / total_comparisons:.1f}%)"
-    )
-    vprint(
-        f"INFORMATIVE all 3:            "
-        f"{total_informative} "
-        f"({100 * total_informative / total_comparisons:.1f}%)"
-    )
-
-    # Filtering funnel
-    sig_and_ploidy = int(
-        (
-            all_results["significant_p_lt_0.01"]
-            & all_results["ploidy_change_flag"]
-        ).sum()
-    )
-
-    vprint("\nFiltering funnel:")
-    vprint(f"  Significant:                      {total_significant}")
-    vprint(f"  + Ploidy change:                  {sig_and_ploidy}")
-    vprint(f"  + Ploidy consistency FINAL:       {total_informative}")
-
-    # Event type breakdown
-    informative_df = all_results[all_results["informative"]]
-
-    if len(informative_df) > 0:
-        vprint("\nEvent type breakdown:")
-        for evt, count in informative_df["event_type"].value_counts().items():
-            vprint(f"  {evt}: {count}")
-
-    # Chromosome arm breakdown
-    vprint("\nChromosome arm breakdown:")
-
-    for chr_arm in sorted(wilcoxon_results_cnv.keys()):
-        df = wilcoxon_results_cnv[chr_arm]
-        n_inf = int(df["informative"].sum())
-
-        if n_inf > 0:
-            events = df[df["informative"]]["event_type"].value_counts()
-            evt_str = ", ".join(f"{e}={c}" for e, c in events.items())
-            vprint(
-                f"  {chr_arm}: {len(df)} comparisons, "
-                f"{n_inf} informative ({evt_str})"
-            )
-        else:
-            vprint(f"  {chr_arm}: {len(df)} comparisons, 0 informative")
-
-    # Clone breakdown
-    vprint("\nClone breakdown:")
-
-    for lab in sorted(all_results["label"].unique()):
-        label_data = all_results[all_results["label"] == lab]
-        n_inf = int(label_data["informative"].sum())
-
-        vprint(f"  {lab}: {len(label_data)} comparisons, {n_inf} informative")
-
-        if n_inf > 0:
-            for evt, count in (
-                label_data[label_data["informative"]]["event_type"]
-                .value_counts()
-                .items()
-            ):
-                vprint(f"    {evt}: {count}")
-
-    # Top informative
-    if len(informative_df) > 0:
-        vprint("\nTop 10 informative CNV variants by p-value:")
-
-        top = informative_df.sort_values("wilcoxon_p").head(10)
-
-        for _, row in top.iterrows():
-            dr_str = (
-                f"{row['depth_ratio']:.2f}"
-                if not np.isnan(row["depth_ratio"])
-                else "N/A"
-            )
-
-            vprint(
-                f"  {row['variant']} | {row['label']} | "
-                f"ploidy={row['mean_ploidy_clone']:.2f} "
-                f"(WT={row['mean_ploidy_wt']:.2f}, "
-                f"Δ={row['ploidy_difference']:.2f}) | "
-                f"IQR={row['ploidy_iqr']:.2f} | "
-                f"depth_ratio={dr_str} | "
-                f"p={row['wilcoxon_p']:.1e} | "
-                f"{row['event_type']}"
-            )
-
-    vprint("\n" + "=" * 60 + "\n")
-
-    return wilcoxon_results_cnv
-
-
 def expand_informative_variants(
     H5_PATH,
     Sample,
@@ -2134,8 +1686,41 @@ def expand_informative_variants(
     -------
     dict
         ``Sample_object`` is the expanded sample. ``Sample`` is provided as
-        an alias for convenient reassignment. The dictionary additionally
-        contains quality tables, selected variants, and final annotations.
+        an alias for convenient reassignment. Other keys: ``Sample_all``
+        (relaxed, cell-matched raw sample), ``wilcoxon_results`` (output of
+        ``test_variant_informativeness``), ``qc`` (per-variant quality of the
+        best informative call per variant), ``additional`` (candidate
+        additions with gate columns ``wt_af``, ``is_blacklisted``,
+        ``is_pathogenic``, ``kept``), ``new_kept``, ``final_variant_ids``,
+        ``missing_variant_ids``, ``thresholds``, ``variant_annotations``,
+        ``transferred_row_attributes`` and ``skipped_row_attributes``.
+
+    Raises
+    ------
+    ValueError
+        If ``wt_label`` is empty, no barcodes overlap, labels cannot be
+        transferred, no WT/reference cells are found, a percentile is outside
+        [0, 100], a cap is negative, ``wt_het_band`` is malformed, or
+        ``annotation_chunk_size`` < 1.
+    RuntimeError
+        If the relaxed DNA assay cannot be subset to the input barcodes.
+
+    Notes
+    -----
+    Steps: (1) ``ms.load`` the H5 with ``relaxed_filter_config`` (default
+    ``min_dp=5, min_gq=20, vaf_ref=5, vaf_hom=95, vaf_het=30,
+    min_prct_cells=30``, ``min_mut_prct_cells`` from 1% of raw cells clamped
+    to 5-20 cells); (2) keep the input cells and copy their labels;
+    (3) build AF/ALT/REF matrices (ALT = round(AF/100 * DP)) and run
+    ``test_variant_informativeness``; keep the lowest-p informative call per
+    variant; (4) compute clone call rate, genotyping rate, median/mean DP and
+    mean GQ; (5) gate variants not already in the panel by clone call rate
+    (``quality_percentile`` of the baseline), capped adaptive median DP / mean
+    GQ thresholds, optional hard floors, WT-HET band, blacklist overlap and
+    ClinVar pathogenicity; (6) build ``Sample_object`` = original panel +
+    kept additions on raw DNA with transferred row attributes; (7) optionally
+    annotate variants in chunks; (8) optionally plot with
+    ``visualise_variants_by_clone``.
     """
     import copy
     import inspect

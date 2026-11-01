@@ -1,10 +1,49 @@
-"""Cell-level QC flags: amplicon loss, spurious gain, and doublet-like AF shifts."""
+"""Cell-level QC for Tapestri DNA assays: doublets, low-quality cells and AF heatmaps.
 
+The functions here work on per-cell allele-frequency (AF) matrices, either a
+DataFrame of ``[label] + variant columns`` or a Mosaic ``Sample`` / dna assay.
+
+Main entry points
+-----------------
+Doublet detection
+    :func:`flag_doublet_change_cells` (per-cell doublet metrics),
+    :func:`piecewise_elbow_threshold` (two-line elbow on a sorted curve),
+    :func:`define_doublet_cutoff_per_donor` (per-donor elbow threshold with a
+    bootstrap CI) and :func:`apply_doublet_calls_with_corr_reassign`
+    (correlation-based resolution of borderline cells).
+Low-quality cells
+    :func:`flag_amplicon_loss_cells` (deviation from donor consensus at
+    germline-stable loci), :func:`flag_spurious_gain_cells` (AF spikes at
+    expected-silent loci) and :func:`apply_low_quality_qc` (gated relabelling
+    of cells to ``Low_quality`` on a Sample).
+Plotting
+    :func:`fast_af_heatmap` (rasterised, grouped/clustered matplotlib AF
+    heatmap) and :func:`palette_from_plotly_scatter`.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from itertools import combinations
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import os
 import seaborn as sns
-import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, TwoSlopeNorm
+
+
+# Scale factor turning a MAD into a normal-consistent SD estimate.
+_MAD_TO_SD = 1.4826
+# Scale factor of the Iglewicz–Hoaglin modified z-score.
+_ROBUST_Z_SCALE = 0.6745
+# Small constant added to MADs / variances to avoid division by zero.
+_EPS = 1e-12
+# Labels that are never treated as donors by the amplicon-loss scorer.
+_NON_DONOR_LABELS = frozenset({"Mixed", "Low_quality"})
+# Median AF from which a variant counts as "mutant-like" for AF dilution.
+_MUTANT_LIKE_MIN_AF = 0.30
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -12,8 +51,28 @@ import matplotlib.pyplot as plt
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _robust_z(x) -> np.ndarray:
+    """Modified z-score ``0.6745 * (x - median) / (MAD + 1e-12)``, NaN-aware."""
+    x = np.asarray(x, dtype=float)
+    medx = np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - medx)) + _EPS
+    return _ROBUST_Z_SCALE * (x - medx) / mad
+
+
+def _af_dataframe(assay, attribute="AF") -> pd.DataFrame:
+    """Return an assay attribute as a DataFrame regardless of Mosaic's return type."""
+    df = assay.get_attribute(attribute, constraint="row+col")
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
+    return df
+
+
 def _corr_complete_obs(x, y, min_shared=40):
-    """Correlation with complete observations only."""
+    """Pearson correlation over positions finite in both ``x`` and ``y``.
+
+    Returns NaN when fewer than ``min_shared`` positions are shared or either
+    vector is (near) constant on them.
+    """
     m = np.isfinite(x) & np.isfinite(y)
     if m.sum() < int(min_shared):
         return np.nan
@@ -29,73 +88,92 @@ def _corr_complete_obs(x, y, min_shared=40):
 
 
 def flag_doublet_change_cells(
-    df,
-    label_col="label",
-    af_change_cut=0.30,
-    min_variant_af=0.10,
-    max_variant_af=0.90,
-    z_k=3.5,
-    min_informative=30,
-    return_scores=True,
-    min_gain_frac=0.01,
-    min_loss_frac=0.01,
-    cross_donor_refs=None,
-    donor_name=None,
-    disc_af_diff=0.20,
-    min_disc_variants=5,
+    df: pd.DataFrame,
+    label_col: str = "label",
+    af_change_cut: float = 0.30,
+    min_variant_af: float = 0.10,
+    max_variant_af: float = 0.90,
+    z_k: float = 3.5,
+    min_informative: int = 30,
+    return_scores: bool = True,
+    min_gain_frac: float = 0.01,
+    min_loss_frac: float = 0.01,
+    cross_donor_refs: dict | None = None,
+    donor_name: str | None = None,
+    disc_af_diff: float = 0.20,
+    min_disc_variants: int = 5,
 ):
-    """
-    Flag cells with doublet-like AF profiles.
+    """Score cells of one donor for doublet-like AF profiles.
 
-    When cross_donor_refs is provided, computes frac_changed using only
-    donor-discriminating variants (where this donor's consensus differs
-    from at least one other donor by >= disc_af_diff). This concentrates
-    the metric on the variants that actually distinguish donors, preventing
-    dilution by shared germline.
+    Each cell's AF profile is compared with the donor's per-variant median
+    profile. Per active variant, a deviation ``>= +af_change_cut`` is a *gain*
+    and ``<= -af_change_cut`` a *loss*; per cell the fractions of gained, lost
+    and changed active variants are reported. Two flags are derived:
 
-    Falls back to all-informative-variant mode when:
-      - cross_donor_refs is None (single-donor or not provided)
-      - fewer than min_disc_variants discriminating variants found
+    * ``fail`` (returned first): a legacy score ``robust_z(frac_changed) +
+      robust_z(af_dilution)`` above ``median + z_k * 1.4826 * MAD`` of the score.
+    * ``qc["fail_bidir"]``: ``frac_changed_bidir = 2 * min(frac_gain,
+      frac_loss)`` at or above its median, with ``frac_gain >= min_gain_frac``
+      and ``frac_loss >= min_loss_frac``.
 
     Parameters
     ----------
-    df : DataFrame
-        [label_col] + AF variant columns. One row per cell.
+    df : pd.DataFrame
+        ``[label_col]`` + AF variant columns, one row per cell (all cells are
+        treated as one donor; ``label_col`` is only dropped).
     label_col : str
-        Column containing donor labels.
+        Name of the label column to drop before scoring.
     af_change_cut : float
-        Per-variant AF deviation threshold to count as "changed".
+        Per-variant absolute AF deviation from the median that counts as a
+        gain/loss.
     min_variant_af, max_variant_af : float
-        AF range for a variant to be considered informative.
+        Median-AF range for a variant to be informative.
     z_k : float
-        MAD-based cutoff strength for the legacy score threshold.
+        MAD multiplier for the legacy score threshold.
     min_informative : int
-        Minimum informative variants; if fewer, use all variants.
+        If fewer variants are informative, all variants are used.
+    return_scores : bool
+        Return ``(fail, qc)`` instead of only ``fail``.
     min_gain_frac, min_loss_frac : float
-        Minimum gain/loss fractions for the bidirectional gate.
+        Minimum gain/loss fractions for the bidirectional flag.
     cross_donor_refs : dict, optional
-        {donor_name: pd.Series} of median AF profiles for all donors.
+        ``{donor_name: pd.Series}`` median AF profiles of all donors. Enables
+        discriminating-variant mode when it has more than one entry.
     donor_name : str, optional
-        Which donor this subset belongs to.
+        Key of this donor in ``cross_donor_refs``.
     disc_af_diff : float
-        Minimum absolute AF difference between this donor and any other
-        to consider a variant discriminating.
+        Minimum absolute median-AF difference between this donor and any other
+        donor for a variant to be discriminating.
     min_disc_variants : int
-        Fall back to all-informative mode if fewer found.
+        Minimum number of discriminating variants (before and after
+        intersecting with the informative set) to use discriminating mode.
 
     Returns
     -------
-    fail : np.ndarray[bool]
-    qc : dict (if return_scores=True)
-        Keys: frac_changed, frac_gain, frac_loss, frac_changed_bidir,
-        af_dilution, change_score, threshold, fail_bidir,
-        n_disc_variants, used_discriminating.
+    fail : np.ndarray of bool
+        Legacy score flag.
+    qc : dict
+        Only if ``return_scores``. Keys ``frac_changed``, ``frac_gain``,
+        ``frac_loss``, ``frac_changed_bidir``, ``af_dilution``,
+        ``change_score`` (arrays), ``threshold`` (float), ``fail_bidir``
+        (bool array), ``n_disc_variants`` (number of active variants, in either
+        mode) and ``used_discriminating`` (bool).
+
+    Notes
+    -----
+    * Discriminating mode restricts the active variants to informative
+      variants whose AF differs from at least one other donor's consensus by
+      ``>= disc_af_diff``; otherwise all informative variants are active.
+    * ``af_dilution`` is the mean positive drop below the median at
+      "mutant-like" variants (median AF ``>= 0.30``, fixed, independent of
+      ``af_change_cut``); it is 0 when there are none.
+    * The thresholds assume a 0–1 AF scale; no rescaling of 0–100 AF is done.
     """
     af = df.drop(columns=[label_col]).astype(float)
     med = af.median(axis=0, skipna=True)
 
     informative = (med >= min_variant_af) & (med <= max_variant_af)
-    mutant_like = med >= 0.30
+    mutant_like = med >= _MUTANT_LIKE_MIN_AF
 
     if informative.sum() < min_informative:
         informative[:] = True
@@ -145,17 +223,11 @@ def flag_doublet_change_cells(
     else:
         af_dilution = pd.Series(0.0, index=af.index)
 
-    def robust_z(x):
-        x = np.asarray(x, dtype=float)
-        medx = np.nanmedian(x)
-        mad = np.nanmedian(np.abs(x - medx)) + 1e-12
-        return 0.6745 * (x - medx) / mad
-
-    score = robust_z(frac_changed.values) + robust_z(af_dilution.values)
+    score = _robust_z(frac_changed.values) + _robust_z(af_dilution.values)
 
     s_med = np.nanmedian(score)
-    s_mad = np.nanmedian(np.abs(score - s_med)) + 1e-12
-    thr = s_med + z_k * 1.4826 * s_mad
+    s_mad = np.nanmedian(np.abs(score - s_med)) + _EPS
+    thr = s_med + z_k * _MAD_TO_SD * s_mad
     fail = score > thr
 
     finite_bidir = np.isfinite(frac_changed_bidir)
@@ -185,11 +257,45 @@ def flag_doublet_change_cells(
     return (fail, qc) if return_scores else fail
 
 
-def piecewise_elbow_threshold(values, min_frac=0.02, max_frac=0.40, slope_ratio_min=3.0):
-    """
-    Find elbow on a descending curve by fitting two lines.
+def _two_line_fit(x, y, k):
+    """Fit separate lines to ``[:k]`` and ``[k:]``; return ``(m1, m2, sse)``."""
+    x1, y1 = x[:k], y[:k]
+    x2, y2 = x[k:], y[k:]
+    m1, b1 = np.polyfit(x1, y1, 1)
+    m2, b2 = np.polyfit(x2, y2, 1)
+    sse = np.sum((y1 - (m1 * x1 + b1)) ** 2) + np.sum((y2 - (m2 * x2 + b2)) ** 2)
+    return m1, m2, sse
 
-    Returns (threshold_value, split_index, info_dict).
+
+def piecewise_elbow_threshold(values, min_frac=0.02, max_frac=0.40, slope_ratio_min=3.0):
+    """Find the elbow of a descending curve by fitting two straight lines.
+
+    The finite values are sorted high→low and, for every split ``k`` in
+    ``[max(5, int(min_frac*n)), min(n-5, int(max_frac*n))]``, one line is fitted
+    to the first ``k`` points and one to the rest. Among splits where both
+    slopes are negative and ``|m1| / (|m2| + 1e-12) >= slope_ratio_min``, the
+    split with the lowest total squared error wins. If none qualifies, the
+    lowest-SSE split over all candidates is used.
+
+    Parameters
+    ----------
+    values : array-like
+        Values to threshold (NaN/inf are dropped after sorting).
+    min_frac, max_frac : float
+        Bounds of the candidate split position as fractions of ``n``.
+    slope_ratio_min : float
+        Minimum steep/shallow slope ratio for a preferred split.
+
+    Returns
+    -------
+    threshold : float
+        ``y_sorted[k]`` at the chosen split, or NaN.
+    k : int
+        Split index into the descending curve, or -1.
+    info : dict
+        ``{"k", "thr", "sse", "m1", "m2", "ratio"}`` of the chosen split, or
+        ``{}`` when fewer than 20 finite values remain or the candidate range
+        is empty.
     """
     y = np.sort(np.asarray(values, dtype=float))[::-1]
     y = y[np.isfinite(y)]
@@ -205,25 +311,17 @@ def piecewise_elbow_threshold(values, min_frac=0.02, max_frac=0.40, slope_ratio_
 
     best = None
     for k in range(kmin, kmax + 1):
-        x1, y1 = x[:k], y[:k]
-        x2, y2 = x[k:], y[k:]
-        m1, b1 = np.polyfit(x1, y1, 1)
-        m2, b2 = np.polyfit(x2, y2, 1)
-
+        m1, m2, sse = _two_line_fit(x, y, k)
         if m1 < 0 and m2 < 0:
             ratio = abs(m1) / (abs(m2) + 1e-12)
             if ratio >= slope_ratio_min:
-                sse = np.sum((y1 - (m1 * x1 + b1)) ** 2) + np.sum((y2 - (m2 * x2 + b2)) ** 2)
                 if (best is None) or (sse < best["sse"]):
                     best = {"k": k, "thr": y[k], "sse": sse, "m1": m1, "m2": m2, "ratio": ratio}
 
     if best is None:
+        # No split with a clear slope change: fall back to the best plain fit.
         for k in range(kmin, kmax + 1):
-            x1, y1 = x[:k], y[:k]
-            x2, y2 = x[k:], y[k:]
-            m1, b1 = np.polyfit(x1, y1, 1)
-            m2, b2 = np.polyfit(x2, y2, 1)
-            sse = np.sum((y1 - (m1 * x1 + b1)) ** 2) + np.sum((y2 - (m2 * x2 + b2)) ** 2)
+            m1, m2, sse = _two_line_fit(x, y, k)
             ratio = abs(m1) / (abs(m2) + 1e-12)
             if (best is None) or (sse < best["sse"]):
                 best = {"k": k, "thr": y[k], "sse": sse, "m1": m1, "m2": m2, "ratio": ratio}
@@ -231,65 +329,202 @@ def piecewise_elbow_threshold(values, min_frac=0.02, max_frac=0.40, slope_ratio_
     return best["thr"], best["k"], best
 
 
+def _draw_elbow_panel(ax, fc, thr, k, ci_low, ci_high, ci, title, metric_name, legend_fontsize):
+    """Draw the sorted-metric curve with threshold, CI band and elbow marker on ``ax``."""
+    y = np.sort(fc)[::-1]
+    x = np.arange(len(y))
+    ax.plot(x, y, lw=1.2)
+    ax.axhline(thr, color="red", ls="--", lw=1, label=f"thr={thr:.3f}")
+    if np.isfinite(ci_low) and np.isfinite(ci_high):
+        ax.axhspan(ci_low, ci_high, color="red", alpha=0.12,
+                   label=f"{int(ci * 100)}% CI")
+    if k >= 0:
+        ax.axvline(k, color="red", ls=":", lw=1)
+    ax.set_title(title)
+    ax.set_xlabel("cells (sorted high→low)")
+    ax.set_ylabel(metric_name)
+    ax.legend(fontsize=legend_fontsize, loc="best")
+
+
+def _tiny_heatmap_matrix(df_af, cell_ids, fc, heatmap_max_cells):
+    """Rows of ``df_af`` sorted by descending ``fc``, evenly thinned, NaN-imputed and column-clustered.
+
+    Returns ``(A, fc_sorted)``.
+    """
+    df_plot = df_af.reindex(cell_ids).copy()
+    row_order = np.argsort(-fc)
+    df_plot = df_plot.iloc[row_order, :]
+    fc_sorted = np.asarray(fc)[row_order]
+
+    if len(df_plot) > int(heatmap_max_cells):
+        keep = np.linspace(0, len(df_plot) - 1, int(heatmap_max_cells)).astype(int)
+        df_plot = df_plot.iloc[keep, :]
+        fc_sorted = fc_sorted[keep]
+
+    A = df_plot.to_numpy(dtype=float)
+    col_med = np.nanmedian(A, axis=0)
+    col_med[~np.isfinite(col_med)] = 0.0
+    bad = ~np.isfinite(A)
+    if bad.any():
+        A[bad] = np.take(col_med, np.where(bad)[1])
+
+    col_order = np.arange(A.shape[1])
+    try:
+        from scipy.cluster.hierarchy import linkage, leaves_list
+        from scipy.spatial.distance import pdist
+        Z = linkage(pdist(A.T, metric="euclidean"), method="average")
+        col_order = leaves_list(Z)
+    except Exception:
+        pass
+    return A[:, col_order], fc_sorted
+
+
+def _plot_doublet_elbow(
+    donor, fc, thr, k, ci_low, ci_high, ci, metric_name, disc_label, flagged, n,
+    figsize, plot_tiny_heatmap, df_af, cell_ids, heatmap_max_cells, heatmap_cmap,
+):
+    """Show the per-donor elbow plot, optionally with metric strip and AF heatmap."""
+    title = (
+        f"{donor} | {metric_name}{disc_label} | "
+        f"flagged {flagged}/{n} ({100 * flagged / max(n, 1):.1f}%)"
+    )
+
+    if not plot_tiny_heatmap:
+        plt.figure(figsize=figsize)
+        _draw_elbow_panel(plt.gca(), fc, thr, k, ci_low, ci_high, ci, title, metric_name,
+                          legend_fontsize=8)
+        plt.tight_layout()
+        plt.show()
+        return
+
+    A, fc_sorted = _tiny_heatmap_matrix(df_af, cell_ids, fc, heatmap_max_cells)
+
+    fig = plt.figure(figsize=(max(figsize[0], 7.0), figsize[1]))
+    gs = fig.add_gridspec(
+        1, 4, width_ratios=[1.2, 0.12, 0.18, 1.8], wspace=0.0,
+    )
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax1 = fig.add_subplot(gs[0, 2])
+    ax2 = fig.add_subplot(gs[0, 3])
+
+    _draw_elbow_panel(ax0, fc, thr, k, ci_low, ci_high, ci, title, metric_name,
+                      legend_fontsize=7)
+
+    sns.heatmap(
+        fc_sorted.reshape(-1, 1), ax=ax1, cmap="magma", cbar=False,
+        xticklabels=[metric_name], yticklabels=False, linewidths=0,
+    )
+    ax1.tick_params(axis="x", labelrotation=90, labelsize=7)
+    ax1.set_ylabel("")
+
+    sns.heatmap(
+        A, ax=ax2, cmap=heatmap_cmap, cbar=False,
+        xticklabels=False, yticklabels=False, linewidths=0,
+    )
+    ax2.set_title(f"cells ordered by {metric_name}", fontsize=8)
+    fig.subplots_adjust(
+        left=0.06, right=0.98, top=0.90, bottom=0.18, wspace=0.0,
+    )
+    plt.show()
+
+
 def define_doublet_cutoff_per_donor(
     sample_qc,
-    label_key="label",
+    label_key: str = "label",
     exclude_labels=("Mixed", "Low_quality"),
-    min_frac=0.01,
-    max_frac=0.55,
-    slope_ratio_min=3.0,
-    n_boot=200,
-    ci=0.95,
-    near_ci_mult=1.0,
-    plot=True,
+    min_frac: float = 0.01,
+    max_frac: float = 0.55,
+    slope_ratio_min: float = 3.0,
+    n_boot: int = 200,
+    ci: float = 0.95,
+    near_ci_mult: float = 1.0,
+    plot: bool = True,
     figsize=(5.0, 2.6),
-    plot_tiny_heatmap=False,
-    heatmap_max_cells=250,
+    plot_tiny_heatmap: bool = False,
+    heatmap_max_cells: int = 250,
     heatmap_cmap="viridis",
-    use_bidirectional=True,
-    min_gain_frac=0.01,
-    min_loss_frac=0.01,
-    disc_af_diff=0.20,
-    min_disc_variants=5,
+    use_bidirectional: bool = True,
+    min_gain_frac: float = 0.01,
+    min_loss_frac: float = 0.01,
+    disc_af_diff: float = 0.20,
+    min_disc_variants: int = 5,
 ):
-    """
-    Per-donor doublet detection with data-driven thresholds.
+    """Per-donor doublet calls from an elbow threshold with a bootstrap CI.
 
-    Builds cross-donor consensus AF profiles, identifies discriminating
-    variants, then computes per-cell doublet metrics restricted to those
-    variants. Falls back to all-informative mode when donors share too
-    many variants (< min_disc_variants discriminating).
+    For every donor label (sorted, excluding ``exclude_labels``) the AF matrix
+    of that donor's cells is scored with :func:`flag_doublet_change_cells`
+    (with its own default cut-offs) and the chosen metric is thresholded with
+    :func:`piecewise_elbow_threshold`. Cells near the threshold are marked
+    borderline using the width of a bootstrap CI of the threshold.
 
     Parameters
     ----------
     sample_qc : mosaic Sample
-        Sample with dna assay and row_attrs[label_key] set.
+        Sample whose ``dna.row_attrs[label_key]`` holds donor labels.
     label_key : str
         Row attribute containing donor labels.
     exclude_labels : tuple
-        Labels to skip (e.g. "Mixed", "Low_quality").
-    disc_af_diff : float
-        Minimum AF difference between donors for a variant to be
-        considered discriminating.
-    min_disc_variants : int
-        Minimum discriminating variants to use discriminating mode.
-    [other params]
-        See flag_doublet_change_cells and piecewise_elbow_threshold.
+        Labels that are not processed as donors.
+    min_frac, max_frac, slope_ratio_min : float
+        Passed to :func:`piecewise_elbow_threshold`.
+    n_boot : int
+        Number of bootstrap resamples of the metric (RNG seed fixed at 42 per
+        donor).
+    ci : float
+        Bootstrap confidence level.
+    near_ci_mult : float
+        Cells with ``|metric - thr| <= near_ci_mult * max(CI half-width, 1e-6)``
+        are borderline.
+    plot : bool
+        Show one elbow plot per donor.
+    figsize : tuple
+        Elbow-plot size (width is raised to at least 7 with the tiny heatmap).
+    plot_tiny_heatmap : bool
+        Add a metric strip and an AF heatmap (cells sorted by metric, at most
+        ``heatmap_max_cells`` rows, columns clustered) next to the elbow plot.
+    heatmap_max_cells : int
+        Row cap of the tiny heatmap.
+    heatmap_cmap : str
+        Colormap of the tiny heatmap.
+    use_bidirectional : bool
+        Threshold ``frac_changed_bidir`` (True) or ``frac_changed`` (False).
+    min_gain_frac, min_loss_frac, disc_af_diff, min_disc_variants
+        Passed to :func:`flag_doublet_change_cells`.
 
     Returns
     -------
     summary_df : pd.DataFrame
-        Per-donor summary with thresholds, flagged counts, etc.
+        One row per donor, sorted by donor: ``donor, n_cells, threshold,
+        ci_low, ci_high, n_flagged, pct_flagged, n_borderline, metric,
+        n_disc_variants, used_discriminating``.
     donor_calls : dict
-        Per-donor detailed results for apply_doublet_calls_with_corr_reassign.
+        ``{donor: dict}`` with ``cell_ids``, ``frac_changed`` / ``metric_values``
+        (the thresholded metric, finite cells only), ``metric_name``,
+        ``threshold``, ``k``, ``ci_low``, ``ci_high``, counts, boolean
+        ``fail`` / ``borderline``, ``class_label`` (``Doublet_HighConf``,
+        ``Doublet_Borderline``, ``Singlet_Borderline``, ``Singlet_HighConf``),
+        ``info`` and ``boot_thresholds``; plus ``frac_gain`` / ``frac_loss``
+        for donors with at least 20 finite cells. Input for
+        :func:`apply_doublet_calls_with_corr_reassign`.
+
+    Notes
+    -----
+    * Cross-donor consensus profiles (median AF) are built for donors with at
+      least 10 cells; discriminating mode is only enabled when at least two
+      such donors exist. The number of discriminating variants over all donor
+      pairs and, per donor, the number with consensus AF ``< 0.05`` ("silent")
+      are printed.
+    * Donors with fewer than 20 finite metric values get a NaN threshold and
+      no flagged cells.
+    * Fewer than 10 finite bootstrap thresholds collapse the CI to the point
+      threshold.
+    * A cell is flagged when ``metric >= threshold``.
     """
     donors = sorted([d for d in set(sample_qc.dna.row_attrs[label_key])
                      if d not in set(exclude_labels)])
 
     # ── Build cross-donor consensus profiles ──
-    all_af = sample_qc.dna.get_attribute("AF", constraint="row+col")
-    if not isinstance(all_af, pd.DataFrame):
-        all_af = pd.DataFrame(all_af)
+    all_af = _af_dataframe(sample_qc.dna)
     all_labels = pd.Series(
         np.asarray(sample_qc.dna.row_attrs[label_key]).astype(str),
         index=all_af.index,
@@ -304,7 +539,6 @@ def define_doublet_cutoff_per_donor(
     n_donors_with_ref = len(cross_donor_refs)
 
     if n_donors_with_ref > 1:
-        from itertools import combinations
         all_disc = set()
         for d1, d2 in combinations(cross_donor_refs.keys(), 2):
             common = cross_donor_refs[d1].index.intersection(cross_donor_refs[d2].index)
@@ -326,9 +560,7 @@ def define_doublet_cutoff_per_donor(
         donor_mask = sample_qc.dna.row_attrs[label_key] == donor
         assay = sample_qc.dna[donor_mask, :]
 
-        df_af = assay.get_attribute("AF", constraint="row+col")
-        if not isinstance(df_af, pd.DataFrame):
-            df_af = pd.DataFrame(df_af)
+        df_af = _af_dataframe(assay)
 
         labels = pd.Series(
             np.asarray(assay.get_labels(), dtype=object),
@@ -468,97 +700,12 @@ def define_doublet_cutoff_per_donor(
         }
 
         if plot:
-            y = np.sort(fc)[::-1]
-            x = np.arange(len(y))
-
             disc_label = (f" [{qc['n_disc_variants']} disc. vars]"
                           if qc.get("used_discriminating") else "")
-
-            if plot_tiny_heatmap:
-                df_plot = df_af.reindex(cell_ids).copy()
-                row_order = np.argsort(-fc)
-                df_plot = df_plot.iloc[row_order, :]
-                fc_sorted = np.asarray(fc)[row_order]
-
-                if len(df_plot) > int(heatmap_max_cells):
-                    keep = np.linspace(0, len(df_plot) - 1, int(heatmap_max_cells)).astype(int)
-                    df_plot = df_plot.iloc[keep, :]
-                    fc_sorted = fc_sorted[keep]
-
-                A = df_plot.to_numpy(dtype=float)
-                col_med = np.nanmedian(A, axis=0)
-                col_med[~np.isfinite(col_med)] = 0.0
-                bad = ~np.isfinite(A)
-                if bad.any():
-                    A[bad] = np.take(col_med, np.where(bad)[1])
-
-                col_order = np.arange(A.shape[1])
-                try:
-                    from scipy.cluster.hierarchy import linkage, leaves_list
-                    from scipy.spatial.distance import pdist
-                    Z = linkage(pdist(A.T, metric="euclidean"), method="average")
-                    col_order = leaves_list(Z)
-                except Exception:
-                    pass
-                A = A[:, col_order]
-
-                fig = plt.figure(figsize=(max(figsize[0], 7.0), figsize[1]))
-                gs = fig.add_gridspec(
-                    1, 4, width_ratios=[1.2, 0.12, 0.18, 1.8], wspace=0.0,
-                )
-                ax0 = fig.add_subplot(gs[0, 0])
-                ax1 = fig.add_subplot(gs[0, 2])
-                ax2 = fig.add_subplot(gs[0, 3])
-
-                ax0.plot(x, y, lw=1.2)
-                ax0.axhline(thr, color="red", ls="--", lw=1, label=f"thr={thr:.3f}")
-                if np.isfinite(ci_low) and np.isfinite(ci_high):
-                    ax0.axhspan(ci_low, ci_high, color="red", alpha=0.12,
-                                label=f"{int(ci * 100)}% CI")
-                if k >= 0:
-                    ax0.axvline(k, color="red", ls=":", lw=1)
-                ax0.set_title(
-                    f"{donor} | {metric_name}{disc_label} | "
-                    f"flagged {flagged}/{n} ({100 * flagged / max(n, 1):.1f}%)"
-                )
-                ax0.set_xlabel("cells (sorted high→low)")
-                ax0.set_ylabel(metric_name)
-                ax0.legend(fontsize=7, loc="best")
-
-                sns.heatmap(
-                    fc_sorted.reshape(-1, 1), ax=ax1, cmap="magma", cbar=False,
-                    xticklabels=[metric_name], yticklabels=False, linewidths=0,
-                )
-                ax1.tick_params(axis="x", labelrotation=90, labelsize=7)
-                ax1.set_ylabel("")
-
-                sns.heatmap(
-                    A, ax=ax2, cmap=heatmap_cmap, cbar=False,
-                    xticklabels=False, yticklabels=False, linewidths=0,
-                )
-                ax2.set_title(f"cells ordered by {metric_name}", fontsize=8)
-                fig.subplots_adjust(
-                    left=0.06, right=0.98, top=0.90, bottom=0.18, wspace=0.0,
-                )
-                plt.show()
-            else:
-                plt.figure(figsize=figsize)
-                plt.plot(x, y, lw=1.2)
-                plt.axhline(thr, color="red", ls="--", lw=1, label=f"thr={thr:.3f}")
-                if np.isfinite(ci_low) and np.isfinite(ci_high):
-                    plt.axhspan(ci_low, ci_high, color="red", alpha=0.12,
-                                label=f"{int(ci * 100)}% CI")
-                if k >= 0:
-                    plt.axvline(k, color="red", ls=":", lw=1)
-                plt.title(
-                    f"{donor} | {metric_name}{disc_label} | "
-                    f"flagged {flagged}/{n} ({100 * flagged / max(n, 1):.1f}%)"
-                )
-                plt.xlabel("cells (sorted high→low)")
-                plt.ylabel(metric_name)
-                plt.legend(fontsize=8, loc="best")
-                plt.tight_layout()
-                plt.show()
+            _plot_doublet_elbow(
+                donor, fc, thr, k, ci_low, ci_high, ci, metric_name, disc_label, flagged, n,
+                figsize, plot_tiny_heatmap, df_af, cell_ids, heatmap_max_cells, heatmap_cmap,
+            )
 
     summary_df = pd.DataFrame(summary_rows).sort_values("donor").reset_index(drop=True)
     return summary_df, donor_calls
@@ -566,34 +713,75 @@ def define_doublet_cutoff_per_donor(
 
 def apply_doublet_calls_with_corr_reassign(
     sample_qc,
-    donor_calls,
+    donor_calls: dict,
     donors=None,
-    label_key="label",
-    band=0.02,
-    min_shared=40,
-    delta_corr=0.00,
-    mixed_label="Mixed",
-    write_back=True,
+    label_key: str = "label",
+    band: float = 0.02,
+    min_shared: int = 40,
+    delta_corr: float = 0.00,
+    mixed_label: str = "Mixed",
+    write_back: bool = True,
 ):
-    """
-    Reassign borderline cells using AF-profile correlation.
+    """Finalise doublet calls, resolving cells near the threshold by correlation.
 
-    Note: write_back=True writes labels into the returned subset assays,
-    NOT into sample_qc directly. The caller must propagate labels back
-    into sample_qc manually (e.g. via barcode matching).
+    For each donor in ``donor_calls`` (from
+    :func:`define_doublet_cutoff_per_donor`), cells are split by the stored
+    metric into *low* (``< thr - band``), *high* (``>= thr + band``) and *mid*
+    (the band around the threshold). High cells are doublets, low cells are
+    not. Each mid cell's AF profile is correlated (complete observations,
+    at least ``min_shared`` shared variants) with the donor's median profile
+    and with the global median profile of ``mixed_label`` cells; it becomes a
+    doublet when ``corr_mixed - corr_donor >= delta_corr``, when only the Mixed
+    correlation is finite, and never when the Mixed correlation is NaN
+    (including when no ``mixed_label`` cells exist).
+
+    Parameters
+    ----------
+    sample_qc : mosaic Sample
+        Sample whose ``dna.row_attrs[label_key]`` holds donor labels.
+    donor_calls : dict
+        Per-donor results with ``threshold``, ``cell_ids`` and
+        ``metric_values`` / ``frac_changed`` (and optionally ``metric_name``).
+    donors : list, optional
+        Donors to process (default: sorted keys of ``donor_calls``); donors
+        missing from ``donor_calls`` are skipped.
+    label_key : str
+        Row attribute with donor labels.
+    band : float
+        Half-width of the borderline band around the threshold.
+    min_shared : int
+        Minimum shared finite variants for a correlation.
+    delta_corr : float
+        Required correlation advantage of Mixed over donor.
+    mixed_label : str
+        Label of Mixed cells and of cells called doublets.
+    write_back : bool
+        Write labels into the per-donor subset assays (see Notes).
 
     Returns
     -------
     reassign_results : dict[str, pd.DataFrame]
-    final_doublet_calls : dict[str, np.ndarray[bool]]
+        Per donor, indexed by cell id: the metric, ``threshold``, ``group``
+        (``LowChange``, ``HighChange``, ``Borderline→Donor``,
+        ``Borderline→Mixed``), ``fail_final``, ``corr_donor``, ``corr_mixed``.
+    final_doublet_calls : dict[str, np.ndarray of bool]
+        ``fail_final`` per donor, ordered as ``cell_ids``.
     sample_subsets : dict[str, assay]
+        Per-donor dna sub-assays.
+
+    Notes
+    -----
+    With ``write_back=True`` the subset assays get ``label_original`` (copy
+    of their labels, only if absent), ``label_key`` (doublets set to
+    ``mixed_label``) and ``doublet_group``. ``sample_qc`` itself is NOT
+    modified; the caller must propagate the labels back (e.g. by barcode).
+    The write-back indexes the subset's labels with ``fail_final`` by
+    position, so it assumes ``cell_ids`` lists every subset row in order.
     """
     if donors is None:
         donors = sorted(list(donor_calls.keys()))
 
-    all_af = sample_qc.dna.get_attribute("AF", constraint="row+col")
-    if not isinstance(all_af, pd.DataFrame):
-        all_af = pd.DataFrame(all_af)
+    all_af = _af_dataframe(sample_qc.dna)
     all_labels = pd.Series(
         np.asarray(sample_qc.dna.row_attrs[label_key]).astype(str),
         index=all_af.index,
@@ -618,9 +806,7 @@ def apply_doublet_calls_with_corr_reassign(
         donor_mask = sample_qc.dna.row_attrs[label_key] == donor
         assay = sample_qc.dna[donor_mask, :]
 
-        df_af = assay.get_attribute("AF", constraint="row+col")
-        if not isinstance(df_af, pd.DataFrame):
-            df_af = pd.DataFrame(df_af)
+        df_af = _af_dataframe(assay)
 
         cell_ids = pd.Index(dc["cell_ids"])
         df_af = df_af.reindex(cell_ids)
@@ -708,40 +894,77 @@ def apply_doublet_calls_with_corr_reassign(
 
 
 def flag_amplicon_loss_cells(
-    df,
-    label_col="label",
+    df: pd.DataFrame,
+    label_col: str = "label",
     informative_range=(0.10, 0.90),
-    stability_quantile=0.35,
-    min_stable_loci=25,
-    fallback_quantile=0.50,
-    min_shared_corr=20,
+    stability_quantile: float = 0.35,
+    min_stable_loci: int = 25,
+    fallback_quantile: float = 0.50,
+    min_shared_corr: int = 20,
     score_weights=(1.0, 1.0, 0.7),
-    k_mad=5.0,
-    q=0.995,
-    min_cells=20,
-    return_scores=True,
+    k_mad: float = 5.0,
+    q: float = 0.995,
+    min_cells: int = 20,
+    return_scores: bool = True,
 ):
-    """
-    Flag low-quality cells by measuring deviation from donor consensus
-    at germline-stable loci.
+    """Flag noisy / low-quality cells by deviation from donor consensus at stable loci.
 
-    For each donor, identifies stable loci (informative AF range, lowest
-    variance) and computes three per-cell metrics:
-      1. Median absolute deviation from consensus at stable loci
-      2. 1 − Pearson correlation with consensus profile
-      3. NaN fraction across stable loci
+    For each donor label (``Mixed`` and ``Low_quality`` are skipped, as are
+    donors with fewer than ``min_cells`` cells), the per-variant median AF is
+    the consensus. *Stable* loci are informative variants (median within
+    ``informative_range``) whose per-variant MAD is at or below the
+    ``stability_quantile`` of those MADs; if fewer than ``min_stable_loci``
+    result, all variants with MAD at or below the ``fallback_quantile`` are
+    used. Per cell, on the stable loci:
 
-    Each metric is robust-Z normalised and combined into a weighted
-    composite score. Cells exceeding an adaptive MAD-based threshold
-    per donor are flagged. Mixed and Low_quality labels are excluded
-    from donor processing.
+    1. ``noise_mad``: median absolute deviation from the consensus,
+    2. ``one_minus_corr``: 1 − Pearson correlation with the consensus
+       (non-finite values are replaced by the donor median, or 1.0),
+    3. ``nan_frac``: fraction of non-finite AF values.
+
+    The composite score is ``w_dev*z(1) + w_corr*z(2) + w_nan*z(3)`` with
+    robust z-scores; cells with ``score >= threshold`` are flagged.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        ``[label_col]`` + AF variant columns, one row per cell. AF on a 0–100
+        scale (99th percentile > 1.5) is divided by 100.
+    label_col : str
+        Donor label column.
+    informative_range : tuple(float, float)
+        Median-AF range (0–1 scale) for informative variants.
+    stability_quantile, fallback_quantile : float
+        Quantiles of per-variant MAD used to select stable loci.
+    min_stable_loci : int
+        Minimum stable loci before the fallback selection is used. Donors with
+        fewer than 3 stable loci are skipped.
+    min_shared_corr : int
+        Minimum shared finite loci for the correlation.
+    score_weights : tuple(float, float, float)
+        Weights of deviation, correlation and NaN-fraction z-scores.
+    k_mad, q : float
+        Threshold ``max(median + k_mad*1.4826*MAD, quantile(q))`` of the
+        donor's finite scores (when at least ``min_cells`` are finite;
+        otherwise ``nanmedian + 5*nanstd``).
+    min_cells : int
+        Minimum donor size.
+    return_scores : bool
+        Also return the per-cell score table.
 
     Returns
     -------
-    fail : np.ndarray[bool]
-    scores : pd.DataFrame (if return_scores=True)
-        Columns: noise_mad, one_minus_corr, nan_frac, composite_score,
-        threshold, n_stable_loci.
+    fail : np.ndarray of bool
+        Flag per row of ``df`` (False for skipped donors).
+    scores : pd.DataFrame
+        Only if ``return_scores``. Indexed like ``df``; columns
+        ``noise_mad``, ``one_minus_corr``, ``nan_frac``, ``composite_score``,
+        ``threshold`` (NaN for skipped rows) and ``n_stable_loci`` (0).
+
+    Raises
+    ------
+    AssertionError
+        If ``label_col`` is not a column of ``df``.
     """
     assert label_col in df.columns, f"'{label_col}' not found in columns"
 
@@ -753,8 +976,7 @@ def flag_amplicon_loss_cells(
     if np.isfinite(p99) and p99 > 1.5:
         af = af / 100.0
 
-    exclude = {"Mixed", "Low_quality"}
-    donors = sorted(d for d in labels.unique() if d not in exclude)
+    donors = sorted(d for d in labels.unique() if d not in _NON_DONOR_LABELS)
     lo_af, hi_af = informative_range
     w_dev, w_corr, w_nan = score_weights
 
@@ -767,18 +989,12 @@ def flag_amplicon_loss_cells(
     thr_out = np.full(n_total, np.nan)
     n_stable_out = np.zeros(n_total, dtype=int)
 
-    def _robust_z(x):
-        x = np.asarray(x, dtype=float)
-        med = np.nanmedian(x)
-        mad = np.nanmedian(np.abs(x - med)) + 1e-12
-        return 0.6745 * (x - med) / mad
-
     def _corr(x, y):
         m = np.isfinite(x) & np.isfinite(y)
         if m.sum() < min_shared_corr:
             return np.nan
         xv, yv = x[m], y[m]
-        if np.std(xv) < 1e-12 or np.std(yv) < 1e-12:
+        if np.std(xv) < _EPS or np.std(yv) < _EPS:
             return np.nan
         return float(np.corrcoef(xv, yv)[0, 1])
 
@@ -832,8 +1048,8 @@ def flag_amplicon_loss_cells(
         s = score[np.isfinite(score)]
         if len(s) >= min_cells:
             s_med = np.nanmedian(s)
-            s_mad = np.nanmedian(np.abs(s - s_med)) + 1e-12
-            thr = max(s_med + k_mad * 1.4826 * s_mad, np.nanquantile(s, q))
+            s_mad = np.nanmedian(np.abs(s - s_med)) + _EPS
+            thr = max(s_med + k_mad * _MAD_TO_SD * s_mad, np.nanquantile(s, q))
         else:
             thr = np.nanmedian(score) + 5.0 * np.nanstd(score)
 
@@ -869,16 +1085,48 @@ def flag_amplicon_loss_cells(
 
 
 def flag_spurious_gain_cells(
-    df,
-    label_col="label",
-    silent_max=0.02,
-    k_mad=5.0,
-    high_floor=0.15,
-    frac_spike_threshold=0.30,
-    min_silent=10,
-    return_scores=True,
+    df: pd.DataFrame,
+    label_col: str = "label",
+    silent_max: float = 0.02,
+    k_mad: float = 5.0,
+    high_floor: float = 0.15,
+    frac_spike_threshold: float = 0.30,
+    min_silent: int = 10,
+    return_scores: bool = True,
 ):
-    """Flag cells with spurious AF spikes in variants expected to be silent."""
+    """Flag cells with spurious AF spikes in variants expected to be silent.
+
+    Per label group, a variant is *expected silent* for a cell when the
+    group's median AF is ``< silent_max``. A spike is an AF above
+    ``clip(median + k_mad*1.4826*MAD, high_floor, 1.0)`` (group median and MAD
+    per variant) at an expected-silent variant. Cells whose fraction of spiking
+    silent variants is ``>= frac_spike_threshold`` and that have at least
+    ``min_silent`` silent variants are flagged.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        ``[label_col]`` + AF variant columns. AF whose maximum exceeds 1.8 is
+        divided by 100.
+    label_col : str
+        Group label column (all labels, including Mixed, are used as groups).
+    silent_max, k_mad, high_floor, frac_spike_threshold, min_silent
+        See above.
+    return_scores : bool
+        Also return the score table.
+
+    Returns
+    -------
+    fail : np.ndarray of bool
+    scores : pd.DataFrame
+        Only if ``return_scores``; columns ``frac_spike_vs_silent``,
+        ``silent_count``, ``flag_fail``, indexed like ``df``.
+
+    Raises
+    ------
+    AssertionError
+        If ``label_col`` is not a column of ``df``.
+    """
     assert label_col in df.columns, f"'{label_col}' not found"
     labels = df[label_col].astype(str)
     af = df.drop(columns=[label_col]).apply(pd.to_numeric, errors="coerce")
@@ -927,102 +1175,8 @@ def flag_spurious_gain_cells(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXAMPLE / DEMO
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def doublets_example(
-    seed=42,
-    n_variants=80,
-    n_singlet=120,
-    n_doublet=30,
-    af_change_cut=0.30,
-    figsize=(10, 3.5),
-    return_data=True,
-):
-    """Mock example illustrating frac_changed for singlets vs doublets."""
-    np.random.seed(seed)
-
-    consensus = np.concatenate([
-        np.random.normal(0.05, 0.02, 25),
-        np.random.normal(0.50, 0.05, 35),
-        np.random.normal(0.95, 0.02, 20),
-    ])
-
-    if n_variants != 80:
-        x_old = np.linspace(0, 1, len(consensus))
-        x_new = np.linspace(0, 1, n_variants)
-        consensus = np.interp(x_new, x_old, consensus)
-
-    consensus = np.clip(consensus, 0, 1)
-
-    singlets = consensus + np.random.normal(0, 0.04, (n_singlet, n_variants))
-    singlets = np.clip(singlets, 0, 1)
-
-    doublets = consensus + np.random.normal(0, 0.10, (n_doublet, n_variants))
-    shift_mask = np.random.rand(n_doublet, n_variants) < 0.35
-    doublets[shift_mask] += np.random.choice([-0.35, 0.35], size=shift_mask.sum())
-    doublets = np.clip(doublets, 0, 1)
-
-    X = np.vstack([singlets, doublets])
-    cell_type = np.array(["Singlet"] * n_singlet + ["Doublet"] * n_doublet)
-
-    df_af = pd.DataFrame(X, columns=[f"V{i + 1}" for i in range(n_variants)])
-
-    med = df_af.median(axis=0)
-    informative = (med >= 0.10) & (med <= 0.90)
-    delta = (df_af.sub(med, axis=1)).abs()
-    changed = delta.loc[:, informative] >= af_change_cut
-    frac_changed = changed.sum(axis=1) / max(1, int(informative.sum()))
-
-    out = pd.DataFrame({"cell_type": cell_type, "frac_changed": frac_changed})
-    summary = out.groupby("cell_type")["frac_changed"].describe()[["count", "mean", "50%", "std"]]
-    print(summary)
-
-    row_order = np.argsort(-frac_changed.values)
-    mat = df_af.iloc[row_order, :]
-    ann = pd.Series(cell_type[row_order]).map({"Singlet": 0, "Doublet": 1}).values.reshape(-1, 1)
-
-    fig, axes = plt.subplots(1, 3, figsize=figsize, gridspec_kw={"width_ratios": [1.2, 0.15, 6]})
-
-    axes[0].plot(frac_changed.values[row_order], np.arange(len(row_order)), lw=1)
-    axes[0].invert_yaxis()
-    axes[0].set_title("frac_changed")
-    axes[0].set_xlabel("value")
-    axes[0].set_ylabel("cells (sorted)")
-
-    sns.heatmap(
-        ann, ax=axes[1], cbar=False,
-        cmap=sns.color_palette(["#1f77b4", "#d62728"], as_cmap=True),
-        xticklabels=False, yticklabels=False,
-    )
-    axes[1].set_title("type")
-
-    sns.heatmap(mat, ax=axes[2], cmap="viridis", xticklabels=False, yticklabels=False, cbar=True)
-    axes[2].set_title("Mock AF matrix (cells x variants)")
-
-    plt.tight_layout()
-    plt.show()
-
-    if return_data:
-        return {
-            "df_af": df_af,
-            "summary": summary,
-            "out": out,
-            "consensus": consensus,
-        }
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # FAST AF HEATMAP (matplotlib, rasterized) — drop-in for sample.dna.heatmap()
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _af_dataframe(assay, attribute="AF"):
-    """Return an assay attribute as a DataFrame regardless of Mosaic's return type."""
-    df = assay.get_attribute(attribute, constraint="row+col")
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
-    return df
 
 
 def _prep_for_clustering(A, axis="column"):
@@ -1340,7 +1494,7 @@ def _auto_scatterplot_palette(sample_or_assay, label_key="label", labels=None, a
     return {}
 
 
-
+# Default AF colour ramp: white/grey for low AF through yellow/orange to dark red.
 AF_HEATMAP_CMAP_COLORS = [
     "#ffffff",
     "#f5f3f4",
@@ -1360,7 +1514,6 @@ AF_HEATMAP_CMAP_COLORS = [
 
 def _default_af_heatmap_cmap():
     """Default AF heatmap colormap: white/grey low values to red/dark high values."""
-    from matplotlib.colors import ListedColormap
     return ListedColormap(AF_HEATMAP_CMAP_COLORS, name="tapestri_af_white_to_red")
 
 
@@ -1380,6 +1533,7 @@ def _resolve_cmap(cmap, nan_color="#dcdcdc"):
     except Exception:
         pass
     return base_cmap
+
 
 def _auto_heatmap_figsize(
     n_rows,
@@ -1411,6 +1565,105 @@ def _auto_heatmap_figsize(
         height = float(np.clip(height, min_height, max_height))
 
     return float(width), float(height)
+
+
+def _af_colour_limits(vals, clip_percentiles, center_af):
+    """Colour limits ``(vmin, vmax, vcenter)`` for an AF matrix.
+
+    The scale is 0–100 when the 99th percentile exceeds 1.5, else 0–1. Limits
+    are the ``clip_percentiles`` when finite and increasing, otherwise the full
+    scale; with ``center_af`` they are widened to include the centre (50 or 0.5).
+    """
+    with np.errstate(all="ignore"):
+        p99 = np.nanpercentile(vals, 99)
+    is_percent = np.isfinite(p99) and p99 > 1.5
+
+    # Full AF range is 0-1 or 0-100; clipping improves contrast in noisy panels.
+    full_vmin, full_vmax = (0.0, 100.0) if is_percent else (0.0, 1.0)
+    vmin, vmax = full_vmin, full_vmax
+    if clip_percentiles is not None:
+        with np.errstate(all="ignore"):
+            lo, hi = np.nanpercentile(vals, list(clip_percentiles))
+        if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
+            vmin, vmax = float(lo), float(hi)
+
+    # Keep the diverging center meaningful even if percentile clipping would
+    # otherwise exclude it.
+    vcenter = 50.0 if is_percent else 0.5
+    if center_af:
+        vmin = min(vmin, vcenter)
+        vmax = max(vmax, vcenter)
+    return vmin, vmax, vcenter
+
+
+def _grouped_row_order(
+    df, labels, groups, per_group_cap, sort_vals, cluster_cells_within_group,
+    row_cluster_max_cells, cluster_metric, cluster_method,
+):
+    """Rendered row labels and ``(start, end, group, n_available)`` blocks, group by group.
+
+    Within a group rows are sorted by ``sort_vals`` (descending) and thinned,
+    or clustered (thinned to ``min(per_group_cap, row_cluster_max_cells)``),
+    or only thinned, to at most ``per_group_cap`` rows.
+    """
+    row_index, group_bounds, cursor = [], [], 0
+    for g in groups:
+        idx = labels.index[labels == g]
+        if len(idx) == 0:
+            continue
+
+        n_avail = len(idx)
+        if sort_vals is not None:
+            idx = sort_vals.reindex(idx).sort_values(ascending=False).index
+            if len(idx) > per_group_cap:
+                idx = idx[np.linspace(0, len(idx) - 1, per_group_cap).astype(int)]
+        elif cluster_cells_within_group:
+            df_g = df.loc[idx]
+            idx = _cluster_row_index(
+                df_g,
+                max_cells=min(per_group_cap, row_cluster_max_cells),
+                metric=cluster_metric,
+                method=cluster_method,
+            )
+        else:
+            if len(idx) > per_group_cap:
+                idx = idx[np.linspace(0, len(idx) - 1, per_group_cap).astype(int)]
+
+        row_index.extend(list(idx))
+        group_bounds.append((cursor, cursor + len(idx), g, n_avail))
+        cursor += len(idx)
+    return row_index, group_bounds
+
+
+def _draw_label_strip(
+    ax_lab, group_bounds, n_rows, palette_map, yticks, yticklabels,
+    label_fontsize, separator_color, separator_lw,
+):
+    """Draw the categorical label strip (one colour per group block) with group ticks."""
+    gidx = np.full(n_rows, -1, dtype=int)
+    group_to_i = {g: i for i, (_s, _e, g, _n) in enumerate(group_bounds)}
+    strip_colors = []
+    for (_s, _e, g, _n) in group_bounds:
+        strip_colors.append(palette_map.get(str(g), "#808080"))
+    for (start, end, g, _n) in group_bounds:
+        gidx[start:end] = group_to_i[g]
+
+    strip_cmap = ListedColormap(strip_colors if strip_colors else ["#808080"])
+    ax_lab.imshow(
+        gidx.reshape(-1, 1),
+        aspect="auto",
+        cmap=strip_cmap,
+        interpolation="nearest",
+        origin="upper",
+        vmin=0,
+        vmax=max(0, len(group_bounds) - 1),
+    )
+    ax_lab.set_xticks([])
+    ax_lab.set_yticks(yticks)
+    ax_lab.set_yticklabels(yticklabels, fontsize=label_fontsize)
+    ax_lab.tick_params(length=0)
+    for (start, _end, _g, _n) in group_bounds[1:]:
+        ax_lab.axhline(start - 0.5, color=separator_color, lw=separator_lw)
 
 
 def fast_af_heatmap(
@@ -1478,8 +1731,11 @@ def fast_af_heatmap(
         Explicit top-to-bottom group order. If omitted, groups are naturally
         sorted and then optionally clustered by median AF profile.
     max_cells_per_group, max_total_cells : int
-        Per-group and total caps on rendered cells. Large groups are evenly
-        subsampled before within-group clustering.
+        Per-group and total caps on rendered cells. Each group is capped at
+        ``min(max_cells_per_group, max(50, max_total_cells // n_groups))``
+        rows (so the total can exceed ``max_total_cells`` when there are many
+        groups). Large groups are evenly subsampled before within-group
+        clustering.
     cluster_variants : bool
         Cluster variant columns by AF pattern across cells.
     cluster_groups : bool
@@ -1550,8 +1806,6 @@ def fast_af_heatmap(
     matplotlib.figure.Figure
         The rendered figure, optionally with row/column order metadata.
     """
-    from matplotlib.colors import ListedColormap, TwoSlopeNorm
-
     assay = getattr(sample_or_assay, "dna", sample_or_assay)
     df = _af_dataframe(assay, attribute=attribute)
 
@@ -1576,25 +1830,7 @@ def fast_af_heatmap(
 
     # ── Colour scale ──
     vals = df.to_numpy(dtype=float)
-    with np.errstate(all="ignore"):
-        p99 = np.nanpercentile(vals, 99)
-    is_percent = np.isfinite(p99) and p99 > 1.5
-
-    # Full AF range is 0-1 or 0-100; clipping improves contrast in noisy panels.
-    full_vmin, full_vmax = (0.0, 100.0) if is_percent else (0.0, 1.0)
-    vmin, vmax = full_vmin, full_vmax
-    if clip_percentiles is not None:
-        with np.errstate(all="ignore"):
-            lo, hi = np.nanpercentile(vals, list(clip_percentiles))
-        if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
-            vmin, vmax = float(lo), float(hi)
-
-    # Keep the diverging center meaningful even if percentile clipping would
-    # otherwise exclude it.
-    vcenter = 50.0 if is_percent else 0.5
-    if center_af:
-        vmin = min(vmin, vcenter)
-        vmax = max(vmax, vcenter)
+    vmin, vmax, vcenter = _af_colour_limits(vals, clip_percentiles, center_af)
 
     # ── Group order ──
     if group_order is None:
@@ -1620,32 +1856,10 @@ def fast_af_heatmap(
         sort_vals = pd.Series(np.asarray(sort_within_group_by, dtype=float), index=df.index)
 
     # ── Row order with per-group downsampling/clustering ──
-    row_index, group_bounds, cursor = [], [], 0
-    for g in groups:
-        idx = labels.index[labels == g]
-        if len(idx) == 0:
-            continue
-
-        n_avail = len(idx)
-        if sort_vals is not None:
-            idx = sort_vals.reindex(idx).sort_values(ascending=False).index
-            if len(idx) > per_group_cap:
-                idx = idx[np.linspace(0, len(idx) - 1, per_group_cap).astype(int)]
-        elif cluster_cells_within_group:
-            df_g = df.loc[idx]
-            idx = _cluster_row_index(
-                df_g,
-                max_cells=min(per_group_cap, row_cluster_max_cells),
-                metric=cluster_metric,
-                method=cluster_method,
-            )
-        else:
-            if len(idx) > per_group_cap:
-                idx = idx[np.linspace(0, len(idx) - 1, per_group_cap).astype(int)]
-
-        row_index.extend(list(idx))
-        group_bounds.append((cursor, cursor + len(idx), g, n_avail))
-        cursor += len(idx)
+    row_index, group_bounds = _grouped_row_order(
+        df, labels, groups, per_group_cap, sort_vals, cluster_cells_within_group,
+        row_cluster_max_cells, cluster_metric, cluster_method,
+    )
 
     rendered_index = pd.Index(row_index)
     pos = df.index.get_indexer(rendered_index)
@@ -1756,30 +1970,10 @@ def fast_af_heatmap(
     label_fontsize = max(4, min(9, int(420 / max(1, n_groups))))
 
     if show_label_strip:
-        gidx = np.full(n_rows, -1, dtype=int)
-        group_to_i = {g: i for i, (_s, _e, g, _n) in enumerate(group_bounds)}
-        strip_colors = []
-        for (_s, _e, g, _n) in group_bounds:
-            strip_colors.append(palette_map.get(str(g), "#808080"))
-        for (start, end, g, _n) in group_bounds:
-            gidx[start:end] = group_to_i[g]
-
-        strip_cmap = ListedColormap(strip_colors if strip_colors else ["#808080"])
-        ax_lab.imshow(
-            gidx.reshape(-1, 1),
-            aspect="auto",
-            cmap=strip_cmap,
-            interpolation="nearest",
-            origin="upper",
-            vmin=0,
-            vmax=max(0, len(group_bounds) - 1),
+        _draw_label_strip(
+            ax_lab, group_bounds, n_rows, palette_map, yticks, yticklabels,
+            label_fontsize, separator_color, separator_lw,
         )
-        ax_lab.set_xticks([])
-        ax_lab.set_yticks(yticks)
-        ax_lab.set_yticklabels(yticklabels, fontsize=label_fontsize)
-        ax_lab.tick_params(length=0)
-        for (start, _end, _g, _n) in group_bounds[1:]:
-            ax_lab.axhline(start - 0.5, color=separator_color, lw=separator_lw)
         plt.setp(ax.get_yticklabels(), visible=False)
         ax.tick_params(axis="y", length=0)
     else:
@@ -1812,324 +2006,245 @@ def fast_af_heatmap(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _get_assay_labels(assay, label_key="label"):
-    """Return row labels from ``row_attrs[label_key]`` with a safe fallback."""
-    if hasattr(assay, "row_attrs") and label_key in assay.row_attrs:
-        return np.asarray(assay.row_attrs[label_key]).astype(str)
-    try:
-        return np.asarray(assay.get_labels()).astype(str)
-    except Exception as exc:
-        raise KeyError(
-            f"Could not find labels in assay.row_attrs[{label_key!r}] or assay.get_labels()."
-        ) from exc
+def _donor_label_list(labels, mixed_label, lowq_label):
+    """Sorted unique labels excluding ``mixed_label`` and ``lowq_label``."""
+    return sorted(x for x in labels.unique() if x not in (mixed_label, lowq_label))
 
 
-def _set_assay_labels(assay, labels, label_key="label"):
-    """Set Mosaic labels and row_attrs label_key consistently."""
-    labels = np.asarray(labels).astype(object)
-    try:
-        assay.set_labels(clusters=labels)
-    except Exception:
-        # Some Mosaic assay objects expose row_attrs but not set_labels.
-        pass
-    try:
-        assay.row_attrs[label_key] = labels
-    except Exception:
-        pass
-    return labels
+def _mad_or_quantile_threshold(values, k_mad, q):
+    """``min(median + k_mad * 1.4826 * MAD, quantile(q))`` of ``values`` (NaN-aware)."""
+    med = np.nanmedian(values)
+    mad = np.nanmedian(np.abs(values - med)) + _EPS
+    return min(med + k_mad * _MAD_TO_SD * mad, np.nanquantile(values, q))
 
 
-def _cluster_mean_af(sample_or_assay, label_key="label", attribute="AF"):
-    """Return AF dataframe, labels series, and per-label mean AF profiles."""
-    assay = getattr(sample_or_assay, "dna", sample_or_assay)
-    af = _af_dataframe(assay, attribute=attribute).apply(pd.to_numeric, errors="coerce")
-    labels = pd.Series(_get_assay_labels(assay, label_key=label_key), index=af.index, name=label_key)
-    grouped_means = af.groupby(labels, sort=False).mean()
-    return af, labels, grouped_means
+def _binomial_se(p, n):
+    """Binomial standard error ``sqrt(max(p * (1 - p) / n, 1e-12))``."""
+    return np.sqrt(np.maximum(p * (1.0 - p) / n, _EPS))
 
 
-def _safe_profile_corr(grouped_means):
-    """Correlation between row profiles, robust to NaNs and zero-variance rows."""
-    if grouped_means.shape[0] == 0:
-        return pd.DataFrame()
-    if grouped_means.shape[0] == 1:
-        return pd.DataFrame([[1.0]], index=grouped_means.index, columns=grouped_means.index)
+def _low_af_fraction(af_vals, informative, low_af_cut):
+    """Per-cell fraction of informative loci that are missing or below ``low_af_cut``.
 
-    A = grouped_means.apply(pd.to_numeric, errors="coerce").copy()
-    col_med = A.median(axis=0, skipna=True)
-    A = A.fillna(col_med).fillna(0.0)
-
-    arr = A.to_numpy(dtype=float)
-    corr = np.corrcoef(arr)
-    corr = np.asarray(corr, dtype=float)
-    corr = np.nan_to_num(corr, nan=-1.0, posinf=1.0, neginf=-1.0)
-    corr = np.clip(corr, -1.0, 1.0)
-    np.fill_diagonal(corr, 1.0)
-    return pd.DataFrame(corr, index=grouped_means.index, columns=grouped_means.index)
+    Returns ``(low_af_frac, n_info)`` where ``n_info`` counts finite informative loci.
+    """
+    low_af_frac = np.mean(
+        (~np.isfinite(af_vals[:, informative])) | (af_vals[:, informative] < low_af_cut),
+        axis=1,
+    )
+    n_info = np.sum(np.isfinite(af_vals[:, informative]), axis=1)
+    return low_af_frac, n_info
 
 
-def merge_correlated_af_clusters(
-    sample_qc,
-    IS_MULTIPLEXED=True,
-    N_DONORS=None,
-    label_key="label",
-    attribute="AF",
-    corr_threshold=0.90,
-    merge_margin=0.02,
-    max_iter=10,
-    target_extra=2,
-    plot_corr=True,
-    corr_figsize=(16, 16),
-    corr_annot=True,
-    corr_save_dir=None,
-    final_heatmap=True,
-    heatmap_title="AF after cluster merge",
-    heatmap_save_path=None,
-    show=True,
+def _extract_chrom(name):
+    """Chromosome token (``"1"``–``"99"``, ``X``, ``Y``, ``M``) from a variant name, or None.
+
+    Matches ``chr<token>`` anywhere first, then a leading ``<token>`` followed
+    by ``:``, ``_`` or ``-``.
+    """
+    s = str(name)
+    m = re.search(r"chr\s*([0-9]{1,2}|[XYM])", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    m = re.match(r"\s*([0-9]{1,2}|[XYM])[:_\-]", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def _localized_loh_mask(
+    af, af_vals, labels, mixed_label, lowq_label, min_donor_cells, is_percent_scale,
+    loh_shift, loh_concentration, loh_max_chromosomes, loh_min_loci_per_chr,
+    loh_min_total_loci,
 ):
+    """Boolean mask of cells whose AF shifts look like localized (few-chromosome) LOH.
+
+    Per donor with at least ``min_donor_cells`` cells, informative loci have a
+    donor-median AF in [0.20, 0.80] (or [20, 80]) and a parsable chromosome.
+    Per cell and chromosome (with at least ``loh_min_loci_per_chr`` such loci),
+    hits are loci with ``|AF - donor median| >= loh_shift``. A cell is
+    LOH-like when it has ``>= loh_min_total_loci`` hits, at least
+    ``loh_concentration`` of them on one chromosome, and at most
+    ``loh_max_chromosomes`` chromosomes with ``>= loh_min_loci_per_chr`` hits.
     """
-    Iteratively merge highly correlated AF clusters, then draw the fast AF heatmap.
+    loh_protected_mask = np.zeros(len(labels), dtype=bool)
+    col_names = pd.Index(af.columns).astype(str)
 
-    This replaces the older notebook block that repeatedly computed cluster mean
-    AF correlations and ended with ``sample_qc.dna.heatmap(...)``. It keeps the
-    same logic, but is safer around missing AF values, writes labels back to both
-    ``set_labels`` and ``row_attrs[label_key]``, and uses ``fast_af_heatmap`` for
-    the final plot.
+    chrom = np.array([_extract_chrom(c) for c in col_names], dtype=object)
+    valid_chrom = pd.notna(chrom)
 
-    Parameters
-    ----------
-    sample_qc : mosaic Sample
-        Sample containing ``.dna`` assay.
-    IS_MULTIPLEXED : bool
-        If False, demultiplexing/merging is skipped and only a message is printed.
-    N_DONORS : int, optional
-        Expected number of donors. If provided, merging stops once the cluster
-        count is <= ``N_DONORS + target_extra``.
-    label_key, attribute : str
-        Label row attribute and DNA assay attribute to use.
-    corr_threshold : float
-        Merge only while the maximum off-diagonal cluster correlation is at least
-        this value.
-    merge_margin : float
-        On each iteration, merge clusters with correlation at least
-        ``max(corr_threshold, max_corr - merge_margin)``. This collapses the most
-        similar cluster block without aggressively over-merging.
-    max_iter : int
-        Maximum merge iterations.
-    target_extra : int
-        Allowed extra clusters above ``N_DONORS`` before stopping.
-    plot_corr : bool
-        Draw a correlation clustermap after each merge.
-    corr_save_dir : str, optional
-        Directory to save per-iteration correlation plots.
-    final_heatmap : bool
-        Draw a final ``fast_af_heatmap``.
-    heatmap_save_path : str, optional
-        Path for the final heatmap PNG.
-    show : bool
-        Whether to display plots.
+    if not valid_chrom.any():
+        return loh_protected_mask
 
-    Returns
-    -------
-    history : pandas.DataFrame
-        One row per merge iteration with cluster counts and thresholds.
-    heatmap_fig : matplotlib.figure.Figure or None
-        Final AF heatmap figure if ``final_heatmap=True``.
-    """
-    if not IS_MULTIPLEXED:
-        print("Single donor — demultiplexing skipped")
-        return pd.DataFrame(), None
+    uniq_chrom = [c for c in pd.unique(chrom[valid_chrom]) if c is not None]
 
-    if N_DONORS is None:
-        target_max = None
-    else:
-        target_max = int(N_DONORS) + int(target_extra)
+    for d in _donor_label_list(labels, mixed_label, lowq_label):
+        m = (labels == d).values
+        if m.sum() < min_donor_cells:
+            continue
 
-    assay = sample_qc.dna
-    history = []
-
-    for iteration in range(int(max_iter)):
-        _af, labels, grouped_means = _cluster_mean_af(
-            sample_qc,
-            label_key=label_key,
-            attribute=attribute,
+        donor_med = np.nanmedian(af_vals[m], axis=0)
+        donor_mid = (donor_med >= (0.20 if not is_percent_scale else 20.0)) & (
+            donor_med <= (0.80 if not is_percent_scale else 80.0)
         )
+        informative_loci = donor_mid & valid_chrom
+        if informative_loci.sum() < int(loh_min_total_loci):
+            continue
 
-        n_before = int(grouped_means.shape[0])
-        if n_before <= 1:
-            print(f"All clusters merged after {iteration} iterations")
-            break
+        cell_idx = np.where(m)[0]
+        if len(cell_idx) == 0:
+            continue
 
-        corr_df = _safe_profile_corr(grouped_means)
-        corr_vals = corr_df.to_numpy(dtype=float).copy()
-        np.fill_diagonal(corr_vals, -1.0)
-        max_corr = float(np.nanmax(corr_vals))
+        hit_counts = np.zeros((len(cell_idx), len(uniq_chrom)), dtype=float)
+        for ci, ch in enumerate(uniq_chrom):
+            use = informative_loci & (chrom == ch)
+            if use.sum() < int(loh_min_loci_per_chr):
+                continue
+            D = np.abs(af_vals[cell_idx][:, use] - donor_med[use][None, :])
+            hit_counts[:, ci] = np.sum(np.isfinite(D) & (D >= float(loh_shift)), axis=1)
 
-        if not np.isfinite(max_corr) or max_corr < float(corr_threshold):
-            print(
-                f"Converged after {iteration + 1} iterations "
-                f"({n_before} clusters, max off-diag corr={max_corr:.3f})"
-            )
-            break
+        total_hits = hit_counts.sum(axis=1)
+        max_hits = hit_counts.max(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            concentration = max_hits / np.maximum(total_hits, 1.0)
+        n_affected = np.sum(hit_counts >= float(loh_min_loci_per_chr), axis=1)
 
-        # Merge the most correlated block, not every moderately similar cluster.
-        merge_corr = max(float(corr_threshold), max_corr - float(merge_margin))
-        merge_dist = 1.0 - merge_corr
-
-        try:
-            import scipy.cluster.hierarchy as sch
-            from scipy.spatial.distance import squareform
-        except Exception as exc:
-            raise ImportError("merge_correlated_af_clusters requires scipy.") from exc
-
-        dist = 1.0 - corr_df.to_numpy(dtype=float)
-        dist = np.nan_to_num(dist, nan=2.0, posinf=2.0, neginf=0.0)
-        dist = np.clip(dist, 0.0, 2.0)
-        dist = (dist + dist.T) / 2.0
-        np.fill_diagonal(dist, 0.0)
-
-        Z = sch.linkage(squareform(dist, checks=False), method="average")
-        cluster_ids = sch.fcluster(Z, t=merge_dist, criterion="distance")
-
-        # Stable relabeling: C1, C2, ... in the order returned for grouped_means.
-        merge_guide = {
-            str(old_label): f"C{int(new_label)}"
-            for old_label, new_label in zip(grouped_means.index.astype(str), cluster_ids)
-        }
-        new_labels = labels.astype(str).map(merge_guide).fillna(labels.astype(str)).to_numpy(dtype=object)
-        _set_assay_labels(assay, new_labels, label_key=label_key)
-
-        # Recompute after merge for reporting/plotting.
-        _af2, labels2, grouped_means2 = _cluster_mean_af(
-            sample_qc,
-            label_key=label_key,
-            attribute=attribute,
+        donor_loh_like = (
+            (total_hits >= float(loh_min_total_loci))
+            & (concentration >= float(loh_concentration))
+            & (n_affected <= int(loh_max_chromosomes))
         )
-        n_after = int(grouped_means2.shape[0])
+        loh_protected_mask[cell_idx] = donor_loh_like
+    return loh_protected_mask
 
-        history.append({
-            "iteration": int(iteration + 1),
-            "n_clusters_before": n_before,
-            "n_clusters_after": n_after,
-            "max_corr_before": max_corr,
-            "merge_corr_threshold": merge_corr,
-            "merge_dist_threshold": merge_dist,
-        })
-
-        print(
-            f"  Iteration {iteration + 1}: {n_before} → {n_after} clusters "
-            f"(merged at corr>{merge_corr:.3f}; max={max_corr:.3f})"
-        )
-
-        if plot_corr and n_after > 1:
-            corr_df_plot = _safe_profile_corr(grouped_means2)
-            cg = sns.clustermap(
-                corr_df_plot,
-                annot=bool(corr_annot),
-                cmap="coolwarm",
-                vmin=-1,
-                vmax=1,
-                center=0,
-                annot_kws={"size": 6},
-                figsize=corr_figsize,
-            )
-            cg.ax_heatmap.set_title(
-                f"Cluster correlation (iteration {iteration + 1}, n={n_after})",
-                pad=20,
-            )
-            if corr_save_dir:
-                os.makedirs(corr_save_dir, exist_ok=True)
-                cg.fig.savefig(
-                    os.path.join(corr_save_dir, f"cluster_corr_iteration_{iteration + 1:02d}.png"),
-                    dpi=150,
-                    bbox_inches="tight",
-                )
-            if show:
-                plt.show()
-            else:
-                plt.close(cg.fig)
-
-        if target_max is not None and n_after <= target_max:
-            print(f"Reached {n_after} clusters (target ≤{target_max})")
-            break
-
-        if N_DONORS is not None and n_after < int(N_DONORS):
-            print(f"Warning: over-merged to {n_after} clusters (expected {N_DONORS})")
-            break
-
-    heatmap_fig = None
-    if final_heatmap:
-        heatmap_fig = fast_af_heatmap(
-            sample_qc,
-            label_key=label_key,
-            attribute=attribute,
-            title=heatmap_title,
-            save_path=heatmap_save_path,
-            show=show,
-        )
-
-    return pd.DataFrame(history), heatmap_fig
 
 def apply_low_quality_qc(
     sample_qc,
     DNA_Utils,
     sample_subsets=None,
-    IS_MULTIPLEXED=False,
-    label_key="label",
-    mixed_label="Mixed",
-    lowq_label="Low_quality",
-    k_mad=3.75,
-    q=0.975,
-    min_donor_cells=20,
+    IS_MULTIPLEXED: bool = False,
+    label_key: str = "label",
+    mixed_label: str = "Mixed",
+    lowq_label: str = "Low_quality",
+    k_mad: float = 3.75,
+    q: float = 0.975,
+    min_donor_cells: int = 20,
     abs_global_dropout=0.50,
     abs_low_af_info=0.50,
-    depth_adaptive=True,
-    abs_floor_quantile=0.98,
-    use_global_dropout_gate=True,
-    use_low_af_gate=False,
-    use_combined_gate=True,
-    combined_quantile=0.95,
+    depth_adaptive: bool = True,
+    abs_floor_quantile: float = 0.98,
+    use_global_dropout_gate: bool = True,
+    use_low_af_gate: bool = False,
+    use_combined_gate: bool = True,
+    combined_quantile: float = 0.95,
     min_effect_size=2,
-    protect_localized_loh=False,
-    loh_shift=0.35,
-    loh_concentration=0.75,
-    loh_max_chromosomes=2,
-    loh_min_loci_per_chr=4,
-    loh_min_total_loci=10,
-    show_global_heatmap=True,
-    show_subset_heatmaps=True,
+    protect_localized_loh: bool = False,
+    loh_shift: float = 0.35,
+    loh_concentration: float = 0.75,
+    loh_max_chromosomes: int = 2,
+    loh_min_loci_per_chr: int = 4,
+    loh_min_total_loci: int = 10,
+    show_global_heatmap: bool = True,
+    show_subset_heatmaps: bool = True,
     heatmap_save_dir=None,
 ):
-    """
-    Apply low-quality QC on top of existing labels and optionally plot heatmaps.
+    """Relabel low-quality cells to ``lowq_label`` with a sequence of gates.
 
-    Depth handling
-    --------------
-    The relative gates (per-donor MAD/quantile + binomial effect size) adapt to
-    sample depth on their own. The *absolute* floors ``abs_global_dropout`` and
-    ``abs_low_af_info`` do not — on a low-depth sample the median cell can already
-    exceed 0.50 dropout, so a fixed 0.50 floor flags almost everything.
+    The gates are OR-ed (a cell flagged by an earlier gate stays flagged):
 
-    With ``depth_adaptive=True`` (default) each absolute floor floats up to
-    ``max(abs_floor, per_donor_quantile(abs_floor_quantile))`` so it only ever
-    catches the donor's extreme tail. On high-quality donors the donor quantile
-    sits below the floor, so behaviour is unchanged. Set either ``abs_*`` to
-    ``None`` to disable that absolute gate entirely.
+    1. **Amplicon loss**: ``DNA_Utils.flag_amplicon_loss_cells(df,
+       label_col=label_key)`` with that function's own defaults.
+    2. **Global dropout** (``use_global_dropout_gate``): per donor, a cell's
+       dropout (fraction of loci missing or with AF ``<= 0.01`` / ``1.0`` %)
+       above ``min(median + k_mad*1.4826*MAD, quantile(q))`` with a binomial
+       effect size ``>= min_effect_size``, or above an absolute floor.
+       Donors smaller than ``min_donor_cells`` use the threshold of all
+       non-Mixed/non-Low_quality cells pooled.
+    3. **Low AF at informative loci** (``use_low_af_gate``): the same rule on
+       the fraction of donor-informative loci (donor median AF ``>= 0.10`` /
+       10) that are missing or below 0.05 / 5.
+    4. **Combined** (``use_combined_gate``): both metrics at or above their
+       donor ``combined_quantile`` with effect size ``>= min_effect_size``.
 
-    Heatmaps now use ``fast_af_heatmap`` (rasterized matplotlib) instead of the
-    Plotly-based ``sample.dna.heatmap``, which scales to large cell/variant counts.
-    Pass ``heatmap_save_dir`` to also write PNGs.
+    Optionally (``protect_localized_loh``) cells with localized-LOH-like AF
+    shifts are un-flagged at the end. Labels other than ``mixed_label`` are
+    then set to ``lowq_label`` for flagged cells, and global / per-subset AF
+    heatmaps are shown with :func:`fast_af_heatmap`.
+
+    Parameters
+    ----------
+    sample_qc : mosaic Sample
+        Sample with ``dna.row_attrs[label_key]`` (modified in place).
+    DNA_Utils : module
+        Module providing ``flag_amplicon_loss_cells`` (normally the
+        ``DNA_Utils`` package).
+    sample_subsets : dict, optional
+        ``{name: dna assay}``; with ``IS_MULTIPLEXED`` and
+        ``show_subset_heatmaps`` their labels are updated from ``sample_qc``
+        by row id (missing ids get the subset name) and a heatmap is drawn per
+        subset.
+    IS_MULTIPLEXED : bool
+        Whether to process ``sample_subsets``.
+    label_key, mixed_label, lowq_label : str
+        Label attribute, Mixed label (never relabelled) and low-quality label.
+    k_mad, q : float
+        MAD multiplier and quantile of gates 2 and 3 (not used by gate 1).
+    min_donor_cells : int
+        Minimum donor size for per-donor thresholds (gates 2–4, LOH).
+    abs_global_dropout, abs_low_af_info : float or None
+        Absolute floors of gates 2 and 3; None disables that absolute rule.
+    depth_adaptive : bool
+        Raise each absolute floor to ``max(floor, donor quantile
+        abs_floor_quantile)``.
+    abs_floor_quantile : float
+        Donor quantile used by ``depth_adaptive``.
+    use_global_dropout_gate, use_low_af_gate, use_combined_gate : bool
+        Enable gates 2, 3 and 4.
+    combined_quantile : float
+        Donor quantile of both metrics in gate 4.
+    min_effect_size : float
+        Minimum ``(value - threshold) / binomial SE``.
+    protect_localized_loh : bool
+        Rescue localized-LOH-like cells from relabelling.
+    loh_shift, loh_concentration, loh_max_chromosomes, loh_min_loci_per_chr, loh_min_total_loci
+        Localized-LOH rule parameters (see Notes).
+    show_global_heatmap, show_subset_heatmaps : bool
+        Draw the heatmaps.
+    heatmap_save_dir : str, optional
+        Directory for ``AF_lowq_global.png`` and ``AF_lowq_<subset>.png``.
 
     Returns
     -------
     summary_df : pd.DataFrame
-    fail : np.ndarray[bool]
+        Per label except ``mixed_label`` (so including ``lowq_label`` if
+        present): ``donor, n_cells, n_stable_loci, score_thr, n_lowq,
+        pct_lowq`` (``score_thr`` / ``n_stable_loci`` from gate 1).
+    fail : np.ndarray of bool
+        Final low-quality flag per cell.
     scores : pd.DataFrame
+        Gate-1 score table from ``flag_amplicon_loss_cells``.
     sample_subsets : dict or None
+        The input subsets (labels possibly updated).
+
+    Notes
+    -----
+    * Row attributes written to ``sample_qc.dna``: ``label_key``,
+      ``lowq_germline_fail``, ``lowq_germline_score``, ``lowq_stable_loci_n``,
+      ``loh_protected`` and ``chr7_loh_protected`` (same mask).
+    * Prints per-donor counts of cells added by each gate, the LOH rescue
+      count, the summary table and the final label counts.
+    * The AF scale (0–1 vs 0–100) is detected from the 99th percentile
+      (> 1.5 means percent) and the AF cut-offs above are switched
+      accordingly, but ``loh_shift`` is compared with AF differences without
+      rescaling (0.35 AF-percent on a 0–100 scale).
+    * Localized LOH: per donor, informative loci have median AF in [0.20,
+      0.80] (or [20, 80]); a cell is protected when it has ``>=
+      loh_min_total_loci`` loci shifted by ``>= loh_shift``, at least
+      ``loh_concentration`` of them on one chromosome and at most
+      ``loh_max_chromosomes`` chromosomes with ``>= loh_min_loci_per_chr``
+      shifted loci.
     """
-    af = sample_qc.dna.get_attribute("AF", constraint="row+col")
-    if not isinstance(af, pd.DataFrame):
-        af = pd.DataFrame(af)
+    af = _af_dataframe(sample_qc.dna)
 
     labels = pd.Series(
         np.asarray(sample_qc.dna.row_attrs[label_key]).astype(str),
@@ -2138,7 +2253,7 @@ def apply_low_quality_qc(
     )
     df = pd.concat([labels, af], axis=1)
 
-    # Gate 1: base amplicon-loss from DNA_Utils
+    # Gate 1: base amplicon-loss from DNA_Utils (its own defaults, not k_mad/q).
     fail, scores = DNA_Utils.flag_amplicon_loss_cells(df, label_col=label_key, return_scores=True)
     fail = np.asarray(fail, dtype=bool)
 
@@ -2153,89 +2268,34 @@ def apply_low_quality_qc(
     global_dropout = np.mean(~np.isfinite(af_vals) | (af_vals <= zero_like_cut), axis=1)
     n_total_loci = max(1, af_vals.shape[1])
 
-    # pooled fallback for small donors
+    # Pooled threshold, used for donors too small for their own.
     valid_pool = ~labels.isin([mixed_label, lowq_label])
     pool_vals = global_dropout[valid_pool.values]
-    pool_med = np.nanmedian(pool_vals)
-    pool_mad = np.nanmedian(np.abs(pool_vals - pool_med)) + 1e-12
-    pool_thr = min(pool_med + k_mad * 1.4826 * pool_mad, np.nanquantile(pool_vals, q))
+    pool_thr = _mad_or_quantile_threshold(pool_vals, k_mad, q)
 
     # Localized-LOH mask (protected from Low_quality relabeling)
     loh_protected_mask = np.zeros(len(labels), dtype=bool)
     if protect_localized_loh:
-        col_names = pd.Index(af.columns).astype(str)
-
-        def _extract_chrom(name):
-            s = str(name)
-            import re
-            m = re.search(r"chr\s*([0-9]{1,2}|[XYM])", s, flags=re.IGNORECASE)
-            if m:
-                return m.group(1).upper()
-            m = re.match(r"\s*([0-9]{1,2}|[XYM])[:_\-]", s, flags=re.IGNORECASE)
-            if m:
-                return m.group(1).upper()
-            return None
-
-        chrom = np.array([_extract_chrom(c) for c in col_names], dtype=object)
-        valid_chrom = pd.notna(chrom)
-
-        if valid_chrom.any():
-            uniq_chrom = [c for c in pd.unique(chrom[valid_chrom]) if c is not None]
-
-            for d in sorted(x for x in labels.unique() if x not in (mixed_label, lowq_label)):
-                m = (labels == d).values
-                if m.sum() < min_donor_cells:
-                    continue
-
-                donor_med = np.nanmedian(af_vals[m], axis=0)
-                donor_mid = (donor_med >= (0.20 if not is_percent_scale else 20.0)) & (
-                    donor_med <= (0.80 if not is_percent_scale else 80.0)
-                )
-                informative_loci = donor_mid & valid_chrom
-                if informative_loci.sum() < int(loh_min_total_loci):
-                    continue
-
-                cell_idx = np.where(m)[0]
-                if len(cell_idx) == 0:
-                    continue
-
-                hit_counts = np.zeros((len(cell_idx), len(uniq_chrom)), dtype=float)
-                for ci, ch in enumerate(uniq_chrom):
-                    use = informative_loci & (chrom == ch)
-                    if use.sum() < int(loh_min_loci_per_chr):
-                        continue
-                    D = np.abs(af_vals[cell_idx][:, use] - donor_med[use][None, :])
-                    hit_counts[:, ci] = np.sum(np.isfinite(D) & (D >= float(loh_shift)), axis=1)
-
-                total_hits = hit_counts.sum(axis=1)
-                max_hits = hit_counts.max(axis=1)
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    concentration = max_hits / np.maximum(total_hits, 1.0)
-                n_affected = np.sum(hit_counts >= float(loh_min_loci_per_chr), axis=1)
-
-                donor_loh_like = (
-                    (total_hits >= float(loh_min_total_loci))
-                    & (concentration >= float(loh_concentration))
-                    & (n_affected <= int(loh_max_chromosomes))
-                )
-                loh_protected_mask[cell_idx] = donor_loh_like
+        loh_protected_mask = _localized_loh_mask(
+            af, af_vals, labels, mixed_label, lowq_label, min_donor_cells, is_percent_scale,
+            loh_shift, loh_concentration, loh_max_chromosomes, loh_min_loci_per_chr,
+            loh_min_total_loci,
+        )
 
     # Gate 2: global dropout per donor
     if use_global_dropout_gate:
-        for d in sorted(x for x in labels.unique() if x not in (mixed_label, lowq_label)):
+        for d in _donor_label_list(labels, mixed_label, lowq_label):
             m = (labels == d).values
             if m.sum() == 0:
                 continue
 
             donor_dropout = global_dropout[m]
             if m.sum() >= min_donor_cells:
-                med = np.nanmedian(donor_dropout)
-                mad = np.nanmedian(np.abs(donor_dropout - med)) + 1e-12
-                dropout_thr = min(med + k_mad * 1.4826 * mad, np.nanquantile(donor_dropout, q))
+                dropout_thr = _mad_or_quantile_threshold(donor_dropout, k_mad, q)
             else:
                 dropout_thr = pool_thr
 
-            se_drop = np.sqrt(np.maximum(dropout_thr * (1.0 - dropout_thr) / n_total_loci, 1e-12))
+            se_drop = _binomial_se(dropout_thr, n_total_loci)
             effect_drop = (global_dropout - dropout_thr) / se_drop
 
             # Depth-adaptive absolute floor: float it above the donor's bulk so a
@@ -2262,7 +2322,7 @@ def apply_low_quality_qc(
 
     # Gate 3: low AF at donor-informative loci
     if use_low_af_gate:
-        for d in sorted(x for x in labels.unique() if x not in (mixed_label, lowq_label)):
+        for d in _donor_label_list(labels, mixed_label, lowq_label):
             m = (labels == d).values
             if m.sum() < min_donor_cells:
                 continue
@@ -2272,17 +2332,11 @@ def apply_low_quality_qc(
             if informative.sum() < 10:
                 continue
 
-            low_af_frac = np.mean(
-                (~np.isfinite(af_vals[:, informative])) | (af_vals[:, informative] < low_af_cut),
-                axis=1,
-            )
-            n_info = np.sum(np.isfinite(af_vals[:, informative]), axis=1)
+            low_af_frac, n_info = _low_af_fraction(af_vals, informative, low_af_cut)
             donor_low = low_af_frac[m]
-            med_low = np.nanmedian(donor_low)
-            mad_low = np.nanmedian(np.abs(donor_low - med_low)) + 1e-12
-            low_thr = min(med_low + k_mad * 1.4826 * mad_low, np.nanquantile(donor_low, q))
+            low_thr = _mad_or_quantile_threshold(donor_low, k_mad, q)
 
-            se_low = np.sqrt(np.maximum(low_thr * (1.0 - low_thr) / np.maximum(n_info, 1), 1e-12))
+            se_low = _binomial_se(low_thr, np.maximum(n_info, 1))
             effect_low = (low_af_frac - low_thr) / se_low
 
             if abs_low_af_info is None:
@@ -2307,7 +2361,7 @@ def apply_low_quality_qc(
 
     # Gate 4: moderate risk on both metrics
     if use_combined_gate:
-        for d in sorted(x for x in labels.unique() if x not in (mixed_label, lowq_label)):
+        for d in _donor_label_list(labels, mixed_label, lowq_label):
             m = (labels == d).values
             if m.sum() < min_donor_cells:
                 continue
@@ -2320,15 +2374,11 @@ def apply_low_quality_qc(
             if informative.sum() < 10:
                 continue
 
-            low_af_frac = np.mean(
-                (~np.isfinite(af_vals[:, informative])) | (af_vals[:, informative] < low_af_cut),
-                axis=1,
-            )
-            n_info = np.sum(np.isfinite(af_vals[:, informative]), axis=1)
+            low_af_frac, n_info = _low_af_fraction(af_vals, informative, low_af_cut)
             l_q = np.nanquantile(low_af_frac[m], combined_quantile)
 
-            se_drop = np.sqrt(np.maximum(d_q * (1.0 - d_q) / n_total_loci, 1e-12))
-            se_low = np.sqrt(np.maximum(l_q * (1.0 - l_q) / np.maximum(n_info, 1), 1e-12))
+            se_drop = _binomial_se(d_q, n_total_loci)
+            se_low = _binomial_se(l_q, np.maximum(n_info, 1))
             eff_drop = (global_dropout - d_q) / se_drop
             eff_low = (low_af_frac - l_q) / se_low
             extra = (
@@ -2342,7 +2392,7 @@ def apply_low_quality_qc(
                 fail |= extra
                 print(f"  {d}: +{int(extra.sum())} by combined moderate-risk gate")
 
-    # Protect likely biological chr7 LOH from low-quality relabeling
+    # Protect likely biological localized LOH (e.g. chr7) from low-quality relabeling
     if protect_localized_loh and loh_protected_mask.any():
         rescued = fail & loh_protected_mask
         if rescued.any():
@@ -2400,9 +2450,7 @@ def apply_low_quality_qc(
     if IS_MULTIPLEXED and sample_subsets is not None and show_subset_heatmaps:
         label_series = pd.Series(np.asarray(sample_qc.dna.row_attrs[label_key]).astype(object), index=af.index)
         for subset in sample_subsets:
-            sub_af = sample_subsets[subset].get_attribute("AF", constraint="row+col")
-            if not isinstance(sub_af, pd.DataFrame):
-                sub_af = pd.DataFrame(sub_af)
+            sub_af = _af_dataframe(sample_subsets[subset])
             sub_ids = pd.Index(sub_af.index)
             sample_subsets[subset].row_attrs[label_key] = (
                 label_series.reindex(sub_ids).fillna(subset).to_numpy(dtype=object)
@@ -2424,450 +2472,3 @@ def apply_low_quality_qc(
             )
 
     return summary_df, fail, scores, sample_subsets
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# RESIDUAL MIXED-LIKE CELL RESCUE (CORRELATION-BASED)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# Append this block to qc_filters.py / DNA_Utils. It depends on helpers already
-# defined in the module:
-#   - _corr_complete_obs   (correlation on complete observations)
-#   - _group_palette       (Mission Bio categorical colours)
-# so do NOT also paste the standalone corr_complete_obs from the second script;
-# it is the same function under a different name and would be redundant.
-
-
-def find_remaining_cells_like_mixed(
-    sample_qc,
-    sample_subsets,
-    reassign_results,
-    donor_calls=None,
-    donor="Donor_A",
-    donors=None,
-    label_key="label",
-    mixed_label="Mixed",
-    lowq_label="Low_quality",
-    disc_af_diff=0.20,
-    min_disc_variants=5,
-    min_shared=40,
-    delta_corr_cut=0.02,
-    min_corr_mixed=0.75,
-    use_discriminating_variants=True,
-    plot=True,
-):
-    """
-    Scan remaining donor-labelled cells and ask whether their AF profile is
-    more correlated with the donor-specific Mixed cluster than with the donor
-    singlet reference.
-
-    For one donor subset, builds a donor reference (high-confidence singlets)
-    and a Mixed reference, optionally restricts to donor-discriminating
-    variants, then correlates every still-donor-labelled cell against both.
-    Cells whose Mixed correlation exceeds the donor correlation by at least
-    ``delta_corr_cut`` (and whose Mixed correlation is at least
-    ``min_corr_mixed``) are flagged Mixed-like.
-
-    Parameters
-    ----------
-    sample_qc : mosaic Sample
-        Full sample, used to build cross-donor references.
-    sample_subsets : dict
-        Per-donor assay subsets from apply_doublet_calls_with_corr_reassign.
-    reassign_results : dict
-        Per-donor reassignment tables; used to pick high-confidence donor cells.
-    donor_calls : dict, optional
-        Per-donor doublet results; merged in for context if provided.
-    donor : str
-        Donor subset to scan.
-    donors : sequence, optional
-        Donor universe for discriminating-variant detection. Defaults to all
-        non-Mixed/non-Low_quality labels.
-    disc_af_diff, min_disc_variants : float, int
-        Discriminating-variant criteria (see flag_doublet_change_cells).
-    min_shared : int
-        Minimum shared finite loci for a correlation to be computed.
-    delta_corr_cut : float
-        Minimum (corr_mixed - corr_donor) to call a cell Mixed-like.
-    min_corr_mixed : float
-        Minimum absolute correlation to the Mixed reference.
-    use_discriminating_variants : bool
-        Restrict correlations to donor-discriminating variants when enough exist.
-    plot : bool
-        Draw the per-donor scatter and delta-correlation histogram.
-
-    Returns
-    -------
-    out : pd.DataFrame
-        One row per remaining donor-labelled cell, sorted by Mixed-correlation
-        excess, with a ``mixed_like_by_corr`` boolean flag.
-    """
-    # ── Donor-specific subset after doublet reassignment ──
-    sub = sample_subsets[donor]
-
-    af_sub = sub.get_attribute("AF", constraint="row+col")
-    if not isinstance(af_sub, pd.DataFrame):
-        af_sub = pd.DataFrame(af_sub)
-
-    labels_sub = pd.Series(
-        np.asarray(sub.row_attrs[label_key]).astype(str),
-        index=af_sub.index,
-        name=label_key,
-    )
-
-    scan_ids = labels_sub.index[labels_sub == donor]
-    mixed_ids = labels_sub.index[labels_sub == mixed_label]
-
-    if len(scan_ids) == 0:
-        raise ValueError(f"No remaining cells labelled {donor!r} in sample_subsets[{donor!r}].")
-
-    if len(mixed_ids) < 3:
-        raise ValueError(
-            f"Too few {mixed_label!r} cells in sample_subsets[{donor!r}] "
-            f"to build a stable Mixed reference: n={len(mixed_ids)}"
-        )
-
-    # ── High-confidence donor cells as the donor reference ──
-    rr = reassign_results.get(donor)
-
-    if rr is not None:
-        donor_ref_ids = rr.index[
-            (~rr["fail_final"].astype(bool))
-            & rr["group"].isin(["LowChange", "Borderline→Donor"])
-        ]
-        donor_ref_ids = pd.Index(donor_ref_ids).intersection(af_sub.index)
-        donor_ref_ids = donor_ref_ids[labels_sub.reindex(donor_ref_ids) == donor]
-    else:
-        donor_ref_ids = scan_ids
-
-    if len(donor_ref_ids) < 10:
-        print(
-            f"Warning: only {len(donor_ref_ids)} high-confidence donor reference cells. "
-            "Falling back to all currently donor-labelled cells."
-        )
-        donor_ref_ids = scan_ids
-
-    donor_ref = af_sub.loc[donor_ref_ids].median(axis=0, skipna=True)
-    mixed_ref = af_sub.loc[mixed_ids].median(axis=0, skipna=True)
-
-    # ── Optional: restrict to donor-discriminating variants ──
-    use_cols = list(af_sub.columns)
-
-    if use_discriminating_variants:
-        all_af = sample_qc.dna.get_attribute("AF", constraint="row+col")
-        if not isinstance(all_af, pd.DataFrame):
-            all_af = pd.DataFrame(all_af)
-
-        all_labels = pd.Series(
-            np.asarray(sample_qc.dna.row_attrs[label_key]).astype(str),
-            index=all_af.index,
-        )
-
-        if donors is None:
-            donors = sorted(
-                d for d in pd.unique(all_labels)
-                if d not in {mixed_label, lowq_label}
-            )
-
-        donor_refs = {}
-        for d in donors:
-            m = all_labels == d
-            if m.sum() >= 10:
-                donor_refs[d] = all_af.loc[m].median(axis=0, skipna=True)
-
-        disc_cols = set()
-        if donor in donor_refs:
-            this_ref = donor_refs[donor]
-            for other_d, other_ref in donor_refs.items():
-                if other_d == donor:
-                    continue
-                common = (
-                    this_ref.index
-                    .intersection(other_ref.index)
-                    .intersection(af_sub.columns)
-                )
-                diff = (this_ref.reindex(common) - other_ref.reindex(common)).abs()
-                disc_cols.update(diff[diff >= float(disc_af_diff)].index)
-
-        disc_cols = [c for c in af_sub.columns if c in disc_cols]
-
-        if len(disc_cols) >= int(min_disc_variants):
-            use_cols = disc_cols
-            print(f"{donor}: using {len(use_cols)} donor-discriminating variants for correlation.")
-        else:
-            print(
-                f"{donor}: only {len(disc_cols)} discriminating variants found; "
-                "using all variants."
-            )
-
-    # ── Correlate each remaining donor-labelled cell to donor and Mixed refs ──
-    donor_ref_use = donor_ref.reindex(use_cols).to_numpy(dtype=float)
-    mixed_ref_use = mixed_ref.reindex(use_cols).to_numpy(dtype=float)
-
-    rows = []
-    for cell in scan_ids:
-        x = af_sub.loc[cell, use_cols].to_numpy(dtype=float)
-        corr_donor = _corr_complete_obs(x, donor_ref_use, min_shared=min_shared)
-        corr_mixed = _corr_complete_obs(x, mixed_ref_use, min_shared=min_shared)
-        rows.append({
-            "cell": cell,
-            "corr_donor": corr_donor,
-            "corr_mixed": corr_mixed,
-            "delta_corr_mixed_minus_donor": corr_mixed - corr_donor,
-        })
-
-    out = pd.DataFrame(rows).set_index("cell")
-
-    # Add original doublet metrics, if available
-    if donor_calls is not None and donor in donor_calls:
-        dc = donor_calls[donor]
-        metric_df = pd.DataFrame(
-            {
-                "doublet_metric": dc.get("metric_values", dc.get("frac_changed")),
-                "frac_gain": dc.get("frac_gain", np.full(len(dc["cell_ids"]), np.nan)),
-                "frac_loss": dc.get("frac_loss", np.full(len(dc["cell_ids"]), np.nan)),
-                "original_fail": dc.get("fail", np.full(len(dc["cell_ids"]), False)),
-            },
-            index=pd.Index(dc["cell_ids"]),
-        )
-        out = out.join(metric_df, how="left")
-
-    out["mixed_like_by_corr"] = (
-        (out["delta_corr_mixed_minus_donor"] >= float(delta_corr_cut))
-        & (out["corr_mixed"] >= float(min_corr_mixed))
-    )
-
-    out = out.sort_values("delta_corr_mixed_minus_donor", ascending=False)
-
-    print(
-        f"{donor}: {int(out['mixed_like_by_corr'].sum())} / {len(out)} "
-        f"remaining donor-labelled cells are Mixed-like by correlation "
-        f"(delta_corr ≥ {delta_corr_cut}, corr_mixed ≥ {min_corr_mixed})."
-    )
-
-    if plot:
-        plt.figure(figsize=(4, 4))
-        plt.scatter(out["corr_donor"], out["corr_mixed"], s=10, alpha=0.6)
-        lim_min = np.nanmin(out[["corr_donor", "corr_mixed"]].to_numpy())
-        lim_max = np.nanmax(out[["corr_donor", "corr_mixed"]].to_numpy())
-        plt.plot([lim_min, lim_max], [lim_min, lim_max], linestyle="--", linewidth=1)
-        plt.xlabel("corr to donor reference")
-        plt.ylabel("corr to Mixed reference")
-        plt.title(f"{donor}: remaining cells vs Mixed")
-        plt.tight_layout()
-        plt.show()
-
-        plt.figure(figsize=(5, 2.5))
-        plt.hist(out["delta_corr_mixed_minus_donor"].dropna(), bins=50)
-        plt.axvline(delta_corr_cut, linestyle="--", linewidth=1)
-        plt.xlabel("corr_mixed - corr_donor")
-        plt.ylabel("cells")
-        plt.title(f"{donor}: Mixed-correlation excess")
-        plt.tight_layout()
-        plt.show()
-
-    return out
-
-
-def visualise_mixed_like_rescue(
-    sample_qc,
-    sample_subsets,
-    reassign_results,
-    summary_df,
-    donor_calls=None,
-    label_key="label",
-    mixed_label="Mixed",
-    lowq_label="Low_quality",
-    delta_corr_cut=-0.03,
-    min_corr_mixed=0.80,
-    disc_af_diff=0.25,
-    min_disc_variants=10,
-    use_discriminating_variants=True,
-    min_shared=40,
-    plot_per_donor=False,
-    plot_summary=True,
-    figsize=(13, 6),
-    palette="auto",
-    save_path=None,
-    show=True,
-):
-    """
-    Scan every donor subset for residual Mixed-like cells and summarise the
-    result across donors in a single overview figure.
-
-    Wraps find_remaining_cells_like_mixed over all donors present in both
-    ``summary_df`` and ``sample_subsets``, concatenates the per-cell scans, and
-    builds a per-donor rescue summary. The overview figure has three panels:
-      - corr-to-donor vs corr-to-Mixed for every remaining cell, coloured by
-        donor, with Mixed-like cells outlined in black;
-      - per-donor counts of remaining vs Mixed-like cells;
-      - the per-donor distribution of (corr_mixed - corr_donor) against the cut.
-
-    Defaults reproduce the stringent clean-up settings (delta_corr_cut=-0.03,
-    min_corr_mixed=0.80, disc_af_diff=0.25, min_disc_variants=10).
-
-    Parameters
-    ----------
-    sample_qc, sample_subsets, reassign_results, donor_calls
-        Passed straight through to find_remaining_cells_like_mixed.
-    summary_df : pd.DataFrame
-        Per-donor table with a ``donor`` column; defines the donors to scan.
-    plot_per_donor : bool
-        Draw the individual scatter/histogram for each donor as well.
-    plot_summary : bool
-        Draw the combined cross-donor overview figure.
-    palette : "auto", dict, or None
-        Donor colours. "auto" uses the Mission Bio categorical cycle so colours
-        match the rest of the pipeline; pass a {donor: colour} dict to override.
-    [other params]
-        See find_remaining_cells_like_mixed.
-
-    Returns
-    -------
-    all_donor_corr_scan : pd.DataFrame
-        One row per scanned cell across all donors.
-    summary_corr_rescue : pd.DataFrame
-        Per-donor rescue summary.
-    fig : matplotlib.figure.Figure or None
-        Overview figure if plot_summary=True and any cells were scanned.
-    """
-    donors = [d for d in summary_df["donor"].tolist() if d in sample_subsets]
-
-    donor_corr_scans = {}
-    for donor in donors:
-        print(f"\nScanning {donor} for remaining Mixed-like cells...")
-        donor_corr_scans[donor] = find_remaining_cells_like_mixed(
-            sample_qc=sample_qc,
-            sample_subsets=sample_subsets,
-            reassign_results=reassign_results,
-            donor_calls=donor_calls,
-            donor=donor,
-            donors=donors,
-            label_key=label_key,
-            mixed_label=mixed_label,
-            lowq_label=lowq_label,
-            delta_corr_cut=delta_corr_cut,
-            min_corr_mixed=min_corr_mixed,
-            disc_af_diff=disc_af_diff,
-            min_disc_variants=min_disc_variants,
-            use_discriminating_variants=use_discriminating_variants,
-            min_shared=min_shared,
-            plot=plot_per_donor,
-        )
-
-    all_donor_corr_scan = (
-        pd.concat(donor_corr_scans, names=["donor", "cell"])
-        .reset_index()
-        .sort_values(
-            ["donor", "mixed_like_by_corr", "delta_corr_mixed_minus_donor"],
-            ascending=[True, False, False],
-        )
-    )
-
-    summary_corr_rescue = (
-        all_donor_corr_scan
-        .groupby("donor")
-        .agg(
-            n_remaining_cells=("cell", "size"),
-            n_corr_mixed_like=("mixed_like_by_corr", "sum"),
-            max_delta_corr=("delta_corr_mixed_minus_donor", "max"),
-            median_delta_corr=("delta_corr_mixed_minus_donor", "median"),
-            median_corr_mixed=("corr_mixed", "median"),
-            median_corr_donor=("corr_donor", "median"),
-        )
-        .reset_index()
-    )
-
-    fig = None
-    if plot_summary and len(all_donor_corr_scan):
-        if isinstance(palette, dict):
-            palette_map = {str(k): v for k, v in palette.items()}
-        else:
-            palette_map = _group_palette(donors, all_labels=donors)
-
-        fig = plt.figure(figsize=figsize)
-        gs = fig.add_gridspec(
-            2, 2, width_ratios=[1.5, 1.0], height_ratios=[1, 1],
-            wspace=0.28, hspace=0.45,
-        )
-        ax_sc = fig.add_subplot(gs[:, 0])
-        ax_bar = fig.add_subplot(gs[0, 1])
-        ax_box = fig.add_subplot(gs[1, 1])
-
-        # Panel 1: corr-to-donor vs corr-to-Mixed, coloured by donor
-        for donor in donors:
-            sub = all_donor_corr_scan[all_donor_corr_scan["donor"] == donor]
-            colour = palette_map.get(str(donor), "#808080")
-            flagged = sub["mixed_like_by_corr"].astype(bool)
-            ax_sc.scatter(
-                sub.loc[~flagged, "corr_donor"], sub.loc[~flagged, "corr_mixed"],
-                s=10, alpha=0.5, color=colour, linewidths=0, label=str(donor),
-            )
-            ax_sc.scatter(
-                sub.loc[flagged, "corr_donor"], sub.loc[flagged, "corr_mixed"],
-                s=26, alpha=0.9, color=colour, edgecolors="black", linewidths=0.6,
-            )
-
-        finite = all_donor_corr_scan[["corr_donor", "corr_mixed"]].to_numpy(dtype=float)
-        finite = finite[np.isfinite(finite).all(axis=1)]
-        if len(finite):
-            lo, hi = float(finite.min()), float(finite.max())
-            ax_sc.plot([lo, hi], [lo, hi], ls="--", lw=1, color="#4a4a4a")
-        ax_sc.axhline(min_corr_mixed, ls=":", lw=1, color="red",
-                      label=f"min corr_mixed={min_corr_mixed}")
-        ax_sc.set_xlabel("corr to donor reference")
-        ax_sc.set_ylabel("corr to Mixed reference")
-        ax_sc.set_title("Remaining donor cells vs Mixed (outlined = Mixed-like)")
-        ax_sc.legend(fontsize=7, loc="best", framealpha=0.6)
-
-        # Panel 2: per-donor remaining vs Mixed-like counts
-        order = summary_corr_rescue["donor"].tolist()
-        y = np.arange(len(order))
-        rem = summary_corr_rescue["n_remaining_cells"].to_numpy(dtype=float)
-        mix = summary_corr_rescue["n_corr_mixed_like"].to_numpy(dtype=float)
-        bar_colours = [palette_map.get(str(d), "#808080") for d in order]
-        ax_bar.barh(y, rem, color="#d3d3d3", label="remaining")
-        ax_bar.barh(y, mix, color=bar_colours, label="Mixed-like")
-        ax_bar.set_yticks(y)
-        ax_bar.set_yticklabels(order, fontsize=8)
-        ax_bar.invert_yaxis()
-        ax_bar.set_xlabel("cells")
-        ax_bar.set_title("Mixed-like vs remaining per donor")
-        for yi, (m_, r_) in enumerate(zip(mix, rem)):
-            ax_bar.text(r_, yi, f" {int(m_)}/{int(r_)}", va="center", fontsize=7)
-
-        # Panel 3: delta_corr distribution by donor (drop donors with no finite delta)
-        box_order, box_data = [], []
-        for d in order:
-            arr = all_donor_corr_scan.loc[
-                all_donor_corr_scan["donor"] == d, "delta_corr_mixed_minus_donor"
-            ].dropna().to_numpy()
-            if len(arr):
-                box_order.append(d)
-                box_data.append(arr)
-
-        if box_data:
-            bp = ax_box.boxplot(
-                box_data, vert=False, patch_artist=True, widths=0.6,
-                flierprops=dict(marker=".", markersize=3, alpha=0.4),
-            )
-            for patch, d in zip(bp["boxes"], box_order):
-                patch.set_facecolor(palette_map.get(str(d), "#808080"))
-                patch.set_alpha(0.7)
-            for med in bp["medians"]:
-                med.set_color("black")
-            ax_box.set_yticks(np.arange(1, len(box_order) + 1))
-            ax_box.set_yticklabels(box_order, fontsize=8)
-            ax_box.invert_yaxis()
-        ax_box.axvline(delta_corr_cut, ls="--", lw=1, color="red",
-                       label=f"cut={delta_corr_cut}")
-        ax_box.set_xlabel("corr_mixed - corr_donor")
-        ax_box.set_title("Mixed-correlation excess per donor")
-        ax_box.legend(fontsize=7, loc="best")
-
-        fig.suptitle("Residual Mixed-like cell rescue", fontsize=12, y=0.99)
-        if save_path:
-            fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        if show:
-            plt.show()
-
-    return all_donor_corr_scan, summary_corr_rescue, fig

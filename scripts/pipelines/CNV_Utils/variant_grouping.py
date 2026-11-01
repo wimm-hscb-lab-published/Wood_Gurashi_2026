@@ -1,30 +1,53 @@
+"""Assign variant IDs to chromosomes and chromosome arms using cytobands.
+
+Main entry point: ``group_informative_variants_by_chr_arm``, whose
+``grouped_by_chr_arm`` output is the per-arm input expected by
+``informativeness.test_variant_informativeness``.
+"""
+
+from __future__ import annotations
+
 from collections import defaultdict
+from typing import Iterable
+
+import pandas as pd
 
 
-def group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytobands, verbose=True):
-    """
-    Group informative variants by chromosome and chromosome arm using cytoband information.
-    
+def group_informative_variants_by_chr_arm(
+    filtered_germline_in_samples: Iterable[str],
+    cytobands: pd.DataFrame,
+    verbose: bool = True,
+) -> tuple[defaultdict, dict]:
+    """Group variant IDs by chromosome and by chromosome arm.
+
     Parameters
     ----------
-    filtered_germline_in_samples : array-like
-        List of variant IDs in format 'chrN:position:REF/ALT'
+    filtered_germline_in_samples : sequence of str
+        Variant IDs formatted ``'chrN:position:REF/ALT'``. Must support
+        ``len()`` and repeated iteration.
     cytobands : pd.DataFrame
-        Cytobands dataframe with columns: chromosome, arm, start, end
-    verbose : bool, default=True
-        Print progress and results
-        
+        Cytoband table with columns ``chromosome`` (without ``'chr'`` prefix,
+        e.g. ``'1'``), ``arm`` (e.g. ``'p'``/``'q'``), ``start`` and ``end``.
+    verbose : bool, default True
+        Print progress and per-chromosome / per-arm counts.
+
     Returns
     -------
-    grouped_by_chr : dict
-        Dictionary mapping chromosome names to list of variants
-        Example: {'chr1': ['chr1:12345:A/T', ...], 'chr2': [...]}
+    grouped_by_chr : collections.defaultdict(list)
+        ``{'chr1': ['chr1:12345:A/T', ...], ...}`` in first-seen order.
     grouped_by_chr_arm : dict
-        Dictionary mapping chromosome arms to list of variants
-        Example: {'chr1p': ['chr1:12345:A/T', ...], 'chr1q': [...]}
+        ``{'chr1p': [...], 'chr1q': [...], ...}``. Variants whose chromosome
+        has no cytoband rows, whose position cannot be parsed, or that fall
+        outside every arm range are left out (only counted in the printout).
+
+    Notes
+    -----
+    Each arm's range is ``[min(start), max(end)]`` over its cytobands, and a
+    variant is assigned to the first arm (in ``groupby`` order) whose range
+    contains its position, inclusive at both ends. The ``'chr'`` prefix is
+    removed with ``str.replace('chr', '')`` before matching cytobands.
     """
-    from collections import defaultdict
-    
+
     def vprint(msg):
         if verbose:
             print(msg)
@@ -54,7 +77,7 @@ def group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytoband
     # ==========================================
     vprint("\n  Step 2: Building chromosome arm lookup table...")
     
-    # Build a mapping from (chromosome, arm) to (start, end)
+    # (chromosome, arm) -> genomic span of all its cytobands
     chrom_arm_ranges = (
         cytobands
         .groupby(['chromosome', 'arm'])
@@ -62,7 +85,7 @@ def group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytoband
         .reset_index()
     )
     
-    # Create a lookup for fast assignment
+    # chromosome -> [{'arm', 'start', 'end'}, ...]
     arm_lookup = {}
     for _, row in chrom_arm_ranges.iterrows():
         arm_lookup.setdefault(row['chromosome'], []).append({
@@ -83,7 +106,6 @@ def group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytoband
     unmapped_variants = []
     
     for chr_name, variants in grouped_by_chr.items():
-        # Remove 'chr' prefix for matching with cytobands
         chr_short = chr_name.replace('chr', '')
         
         if chr_short not in arm_lookup:
@@ -92,7 +114,6 @@ def group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytoband
             continue
         
         for variant in variants:
-            # Extract position from variant string: chrN:position:REF/ALT
             try:
                 pos = int(variant.split(':')[1])
             except Exception as e:
@@ -100,7 +121,6 @@ def group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytoband
                 unmapped_variants.append(variant)
                 continue
             
-            # Find which arm this variant belongs to
             assigned = False
             for arm_info in arm_lookup[chr_short]:
                 if arm_info['start'] <= pos <= arm_info['end']:

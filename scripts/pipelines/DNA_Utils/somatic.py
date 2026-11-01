@@ -1,4 +1,22 @@
-"""Somatic variant discovery (correlation + Wilcoxon) and heatmap visualisation."""
+"""Somatic variant discovery and its visualisation.
+
+Main entry points
+-----------------
+find_somatic_variants
+    Select candidate somatic variants from a cells × variants AF table by
+    combining Spearman correlation with whitelist targets, a WT vs non-WT
+    Mann-Whitney test, a within-WT subclone scan and forced inclusion of
+    whitelist / (likely) pathogenic variants, then germline / intronic /
+    synonymous filtering.
+visualize_found_differential_variants
+    Per-label clustered heatmaps plus a protein-UMAP grid with one panel per
+    variant.
+visualize_found_informative_variants
+    Per-label clustered heatmaps for an informative-variant list.
+plot_somatic_variant_umap_grid
+    Plotly grid: protein UMAP coloured by annotation, then one carrier /
+    background UMAP panel per variant.
+"""
 
 import numpy as np
 import pandas as pd
@@ -41,6 +59,110 @@ def find_somatic_variants(
     ``whitelist_bypass_germline_filter=True``. This bypasses germline,
     intronic, and synonymous filtering, but cannot add variants absent from
     the AF dataframe.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cells × variants AF table (AF in percent, 0–100). The *first* column
+        is taken as the cell label; every other column is a variant.
+    whitelist : list
+        Target variant IDs (``chr:pos:ref/alt``, optionally prefixed
+        ``Gene:``). Matched to ``df`` columns on the canonical
+        ``chr...`` part of the ID. None is treated as empty.
+    filtered_germline_in_samples
+        Germline variant IDs, forwarded to
+        :func:`DNA_Utils.germline.get_real_somatic_variants`.
+    Sample
+        Mosaic Sample, forwarded to ``get_real_somatic_variants``.
+    annotation_df : pd.DataFrame, optional
+        Variant annotations, keyed by a ``'Variant ID'`` column or by the
+        index. Used for pathogenic force-inclusion and for
+        ``Function`` / ``Coding impact`` filtering.
+    always_keep_pathogenic : bool
+        Add detected variants annotated (likely) pathogenic to the candidates.
+    pathogenic_bypass_germline_filter : bool
+        Also protect those pathogenic variants from the germline, intronic and
+        synonymous filters.
+    whitelist_bypass_germline_filter : bool
+        Protect detected whitelist variants from those filters.
+    pathogenicity_cols : list, optional
+        Annotation columns to scan for pathogenicity. None auto-selects
+        columns whose name contains ``pathogen``, ``clinvar``, ``clnsig``,
+        ``significance`` or ``acmg``.
+    wt_label : str
+        Label value identifying wild-type cells (default ``'WT'``).
+    significance_threshold : float
+        Adjusted-p cutoff for all three tests (default 0.05).
+    correction_method : str
+        ``statsmodels.multipletests`` method (default ``'fdr_bh'``).
+    min_samples : int
+        Minimum non-NaN cells per group / pair for a test (default 3).
+    min_carrier_frac : float
+        Minimum ``|carrier_frac_mut - carrier_frac_wt|`` for a Wilcoxon hit
+        (default 0.10).
+    min_het_hom_frac : float
+        Minimum carrier fraction in non-WT cells for a Wilcoxon hit
+        (default 0.15).
+    min_wt_subclone_carrier_frac, max_wt_subclone_carrier_frac : float
+        WT carrier-fraction window for the subclone scan (0.01–0.50).
+    max_nonwt_carrier_frac : float
+        Maximum non-WT carrier fraction for the subclone scan (0.05).
+    min_wt_subclone_carrier_count : int
+        Absolute WT carrier count that passes the subclone scan's lower bound
+        on its own, and the count needed for the zero-in-mutant rescue
+        (default 5).
+    min_zero_mutant_carrier_af : float
+        Minimum mean carrier AF for the zero-in-mutant rescue (default 30.0).
+    trace_variants : list, optional
+        Exact ``df`` column names whose fate is printed at a few checkpoints
+        (printed even when ``verbose=False``).
+    verbose : bool
+        Print progress and result tables.
+
+    Returns
+    -------
+    differential_variants : np.ndarray of str
+        Final variant column names (all present in ``df``).
+    significant_corr_results : pd.DataFrame
+        Significant Spearman tests (``target, column, n, rho, rho_squared,
+        p_value, bonferroni_p, adj_p``), sorted by ``adj_p``; empty if none
+        were run.
+    significant_wilcox_results : pd.DataFrame
+        Mann-Whitney hits passing the significance, carrier-difference and
+        mutant carrier-fraction filters; empty if none / skipped.
+
+    Notes
+    -----
+    A cell is a *carrier* of a variant when its AF is > 10. Steps:
+
+    0. Pathogenic force-include: a value counts as pathogenic when it matches
+       the whole word ``pathogenic`` or ``likely[_- ]*pathogenic`` and not
+       the whole phrase ``(no|not|non)[_- ]*pathogenic`` (lower-cased).
+    1. Spearman between each detected whitelist target and every
+       non-target variant on cells where both are non-NaN (``n >=
+       min_samples``); multiple-testing correction over all pairs.
+    2. Mann-Whitney U (two-sided), WT vs non-WT, per variant (skipped if
+       either group has < 2 cells); NaN p-values become 1.0 before
+       correction. A hit needs ``adj_p < threshold``, ``|carrier_diff| >=
+       min_carrier_frac`` and ``carrier_frac_mut >= min_het_hom_frac``.
+    2b. Within-WT subclone scan (only if >= 10 WT cells, and per variant
+       >= 10 non-NaN WT cells): keep variants with (WT carrier fraction >=
+       min frac OR WT carriers >= min count), WT fraction <= max frac, at
+       least 3 WT carriers and non-WT carrier fraction <= max; one-sided
+       Fisher exact test (WT enriched) and correction. Non-significant
+       variants are rescued when non-WT carrier fraction is 0, WT carriers >=
+       ``min_wt_subclone_carrier_count`` and mean carrier AF >=
+       ``min_zero_mutant_carrier_af``.
+    3. Union of hits from 1, 2, 2b, detected whitelist and forced pathogenic,
+       sorted by chromosome number (stable sort on an alphabetical list), then
+       ``get_real_somatic_variants``; protected variants it removed are added
+       back.
+    4. If ``annotation_df`` is given: drop variants whose ``Function``
+       contains ``intron`` or whose ``Coding impact`` contains
+       ``synonymous``, unless protected. Finally keep only exact ``df``
+       column names. Bonferroni columns are reported but not used for
+       filtering. The within-WT subclone hits feed the union but are not
+       returned.
     """
     from scipy.stats import spearmanr, mannwhitneyu, fisher_exact
     from statsmodels.stats.multitest import multipletests
@@ -939,9 +1061,19 @@ def _variant_heatmap(
     save_plot: bool = True,
     show_plot: bool = True,
 ):
-    """Internal helper that draws clustered heatmaps per label for a given
-    set of variants.  Used by both *visualize_found_differential_variants*
-    and *visualize_found_informative_variants*."""
+    """Draw one clustered AF heatmap panel per label for ``variant_list``.
+
+    Labels come from ``Sample_subset.dna.get_labels()`` and are aligned to
+    ``df`` rows by position. Rows within each label are ordered by average-
+    linkage Euclidean clustering (when >= 2 rows); colour limits are the
+    ``vmin_percentile`` / ``vmax_percentile`` of all values after NaN → 0.
+    Dashed white lines mark chromosome changes. When ``save_plot`` the figure
+    is saved as PNG and PDF under
+    ``{wd}/results/per_sample/{MBio_batch}/{Patient_ID}/dna_cnv/variants/somatic_variants``.
+    Returns ``(fig, df_filtered)`` where ``df_filtered`` is the selected
+    variant columns with a leading ``label`` column. Raises ``ValueError`` if
+    no variant is a column of ``df``.
+    """
     import os
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -1054,13 +1186,58 @@ def visualize_found_differential_variants(
     show_plot: bool = True,
     **kwargs,
 ):
-    """Per-label clustered heatmap (optional) + a single UMAP grid figure with
-    the protein UMAP (coloured by *resolution*) top-left and one panel per
-    differential variant.
+    """Plot heatmaps and a variant UMAP grid for differential variants.
+
+    Draws a per-label clustered heatmap (optional) plus a single UMAP grid
+    figure with the protein UMAP (coloured by ``resolution``) top-left and
+    one panel per differential variant.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cells × variants AF table (barcode-indexed for the UMAP grid).
+    differential_variants : array-like
+        Variant column names to plot.
+    Sample_subset
+        Sample whose DNA labels align row-wise with ``df`` (heatmap).
+    wd, MBio_batch, Patient_ID : str
+        Build the heatmap output directory (see :func:`_variant_heatmap`).
+    Sample : optional
+        Sample used for the UMAPs; defaults to ``Sample_subset``.
+    experiment : str, optional
+        Batch name for the grid output directory
+        ``{wd}/results/per_sample/{experiment}/{Patient_ID}/dna_cnv/clonotypes``;
+        defaults to ``MBio_batch``.
+    variant_metadata : pd.DataFrame, optional
+        Used to prefix grid panel titles with gene / protein names.
+    resolution : str
+        Protein row attribute used to colour the UMAP.
+    umap_attribute : str
+        Protein UMAP attribute name.
+    plot_heatmap, plot_protein_umap, plot_variant_grid : bool
+        Toggle each figure.
+    ncols : int
+        Grid columns.
+    grid_kwargs : dict, optional
+        Overrides for :func:`plot_somatic_variant_umap_grid` arguments.
+    show_plot : bool
+        Show the heatmap and the grid.
+    **kwargs
+        Forwarded to :func:`_variant_heatmap`.
 
     Returns
     -------
-    dict: heatmap_fig, df_filtered, protein_umap_fig, variant_grid_fig.
+    dict
+        ``heatmap_fig``, ``df_filtered``, ``protein_umap_fig``,
+        ``variant_grid_fig`` (None for figures not drawn).
+
+    Notes
+    -----
+    The standalone protein UMAP is built from
+    ``Sample.protein.scatterplot`` but never shown or saved; failures there
+    are printed and skipped. The grid is called with ``verbose=True``,
+    panels of 200 × 200 px, carriers in ``#191919`` (size 6) over
+    ``#D3D3D3`` background (size 3), output prefix ``Variant_UMAP``.
     """
     print("\n" + "=" * 60)
     print("VISUALIZING DIFFERENTIAL VARIANTS")
@@ -1129,7 +1306,13 @@ def visualize_found_informative_variants(
     df, combined_useful_variants_sorted, Sample_subset,
     wd, MBio_batch, Patient_ID, **kwargs,
 ):
-    """Clustered heatmaps per label for informative variants."""
+    """Plot per-label clustered heatmaps for informative variants.
+
+    Thin wrapper around :func:`_variant_heatmap` with title prefix
+    ``Informative`` and file name ``Informative_significant_variants.png``;
+    ``**kwargs`` (e.g. percentiles, ``save_plot``, ``show_plot``) are
+    forwarded. Returns ``(fig, df_filtered)``.
+    """
     print("\n" + "=" * 60)
     print("VISUALIZING INFORMATIVE VARIANTS")
     print("=" * 60)
@@ -1141,10 +1324,14 @@ def visualize_found_informative_variants(
     )
 
 def _protein_umap_frame(Sample, resolution="Final_annotation", umap_attribute="umap"):
-    """Pull UMAP coords + annotation off Sample.protein into a barcode-indexed frame.
+    """Return protein UMAP coordinates and annotation as a barcode-indexed frame.
 
-    Tries the common mosaic accessors; if your build stores these elsewhere,
-    adjust the two getters below.
+    Coordinates come from ``row_attrs[umap_attribute]`` or
+    ``get_attribute(umap_attribute, constraint='row')`` (first 2-D result
+    with >= 2 columns; ``ValueError`` otherwise). The annotation comes from
+    ``row_attrs[resolution]`` or ``get_attribute``; if none has one value per
+    barcode, every cell is annotated ``'all'``. Columns: ``umap_x``,
+    ``umap_y``, ``annot`` (str); index name ``barcode``.
     """
     assay = Sample.protein
     try:
@@ -1212,8 +1399,54 @@ def plot_somatic_variant_umap_grid(
     show_plot=True,
     verbose=True,
 ):
-    """One figure: protein UMAP (coloured by *resolution*) top-left, then one
-    UMAP panel per differential variant (carriers vs background)."""
+    """Plot a protein UMAP grid with one carrier panel per variant.
+
+    Panel (1, 1) is the protein UMAP coloured by ``resolution`` (plotly
+    Dark24 + Light24 palette); each following panel shows cells with
+    ``AF > carrier_af_threshold`` for one variant on top of the other cells.
+
+    Parameters
+    ----------
+    Sample
+        Sample whose ``protein`` assay provides UMAP and annotation
+        (see :func:`_protein_umap_frame`).
+    df : pd.DataFrame
+        Barcode-indexed cells × variants AF table; reindexed to the protein
+        barcodes.
+    differential_variants : array-like
+        Variants to plot; those not in ``df`` are skipped with a warning.
+    variant_metadata : pd.DataFrame, optional
+        If given, panel titles become ``"<Gene|Protein|Coding impact><br>id"``
+        using the first non-null of ``Gene``, ``gene``, ``Protein``,
+        ``protein``, ``Coding impact``.
+    resolution, umap_attribute : str
+        Protein annotation and UMAP attribute names.
+    ncols : int
+        Grid columns; rows = ``ceil((1 + n_variants) / ncols)``.
+    carrier_af_threshold : float
+        AF (percent) above which a cell is a carrier (default 10.0).
+    color_by_af : bool
+        Colour carriers by AF (Viridis, 0–100) instead of ``variant_color``.
+    variant_color, background_color : str
+        Carrier / background marker colours.
+    variant_size, background_size : int
+        Marker sizes (annotation panel uses ``background_size + 1``).
+    panel_width, panel_height : int
+        Pixel size per grid cell.
+    title : str, optional
+        Figure title.
+    outdir : str, optional
+        Where to write ``<output_prefix>_grid.html`` and (if kaleido is
+        available) ``<output_prefix>_grid.png``.
+    output_prefix : str
+        File name prefix.
+    save_plot, show_plot, verbose : bool
+        Save (only when ``outdir`` is set), show, and print.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+    """
     import os
     import math
     import plotly.graph_objects as go

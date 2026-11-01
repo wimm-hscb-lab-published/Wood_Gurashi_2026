@@ -1,45 +1,88 @@
 """
-Phase 4 – Non-LOH ↔ LOH Clone Correlation & Merge
-====================================================
+Phase 4 – Non-LOH ↔ LOH clone correlation, merge and cell-level clean-up.
 
-For each non-LOH clone, check whether it shares a base genotype name
-with any LOH clone.  If it does, compute the per-cell mean allele-
-frequency correlation between the two on the LOH arm's variants.
-When correlation ≥ ``correlation_threshold``, merge the non-LOH cells
-into the LOH clone (they are the same biological clone but were not
-detected in Phase 1 due to weaker signal).
+Phase 4 runs after Phase 3 and reconciles LOH clones with the non-LOH clones
+that share their base genotype. ``run_phase4(state)`` is the only public entry
+point; it runs these steps in order and mutates ``state`` in place:
 
-Call after Phase 3::
+1. **Clone-level merge / per-cell rescue (4a).** Each non-LOH clone with
+   ``>= min_final_clone_size`` cells is compared with every LOH clone of the
+   same base genotype over that LOH clone's arms. A whole-clone merge needs
+   mean Pearson r ``>= correlation_threshold`` and mean extreme-AF fraction
+   ``>= merge_min_extreme_frac``; otherwise an amplicon-aware, ADO-tolerant
+   per-cell rescue can move individual cells.
+2. **ADO check (4b, printed as "PHASE 4.1").** WT/Het cells whose full AF
+   profile (minus the somatic-mutation amplicon) matches a Hem/Hom clone are
+   relabelled ``ADO`` and removed from ``state.df`` / ``state.df_numeric``.
+3. **Cross-LOH similarity diagnostic (4c, "PHASE 4.4").** Pairs of LOH clones
+   with near-identical same-arm block profiles are reported; nothing is
+   relabelled.
+4. **Iterative cell-level reassignment (4d, "PHASE 4.5").** Cells are moved to
+   the largest passing compatible target, repeated to a fixed point (with a
+   pass cap and cycle detection).
+5. **Final residual base-clone refinement (4f, "PHASE 4.7").** A single,
+   conservative pass that turns a validated residual LOH signature inside a
+   base clone into an (existing or new) active LOH label.
 
-    from phase4 import run_phase4
-    merged = run_phase4(state)
+Usage::
+
+    from LOH_Pipeline.phase4 import run_phase4
+    results = run_phase4(state)   # returns state.results
 """
 from __future__ import annotations
-from typing import TYPE_CHECKING
 
 import re
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr
+
+from .ado_probability import score_ado_combination
+from .loh_config import (
+    ADO_LABEL,
+    LOH_TAG,
+    arm_variants,
+    extract_chr_arms,
+    fmt_float,
+    fp_base_name,
+    get_base_clone,
+    is_fp_label,
+    is_hem_like,
+    is_loh_label,
+    is_small_label,
+    is_sub_label,
+    is_wt_clone,
+    pearson_safe,
+    sort_chromosome_arms,
+    vprint,
+)
 
 if TYPE_CHECKING:
     from .loh_config import LOHConfig, PipelineState
 
 
-# ── ANSI helpers ───────────────────────────────────────────────────
+# ── ANSI colours for console output ──────────────────────────────────
 _GREEN  = "\033[92m"
 _YELLOW = "\033[93m"
 _RED    = "\033[91m"
 _RESET  = "\033[0m"
 
+# Standard deviation below which an AF profile is treated as constant
+# (Pearson r would be undefined).
+_FLAT_PROFILE_SD = 1e-6
+
+# Sort key returned for variant IDs whose position cannot be parsed.
+_UNKNOWN_VARIANT_POS = 10**18
+
 
 def _is_active_loh(label: object) -> bool:
-    from .loh_config import is_loh_label
+    """Return True for an active LOH label (not FP/SUB/small)."""
     return is_loh_label(label)
 
 
 def _is_active_non_loh(label: object) -> bool:
-    from .loh_config import is_loh_label, is_fp_label, is_sub_label, is_small_label
+    """Return True for a plain non-LOH clone label (not LOH, FP, SUB or small)."""
     return (
         (not is_loh_label(label))
         and (not is_fp_label(label))
@@ -123,32 +166,6 @@ def _base_names_compatible(
     return False, "different_base"
 
 
-def _extract_mutation(label: str) -> str | None:
-    """
-    Extract the TP53 mutation token from a clone label.
-
-    Handles both underscore-delimited and colon-delimited formats:
-      'TP53_R248W_Het'                      → 'TP53_R248W'
-      'TP53_R248W_Hem LOH-C2 chr5q'        → 'TP53_R248W'
-      'TP53:R273H_Het'                      → 'TP53:R273H'
-      'TP53_E204Ter_Hem_BCORL1_T907Lfs18'  → 'TP53_E204Ter'
-
-    Strategy: find 'TP53' followed by a separator (_  or :) then the
-    mutation token, terminated by _ followed by Het/Hem/Hom.
-    """
-    import re
-    # Try colon format first: TP53:R248W_Het
-    m = re.search(r"(TP53:\S+?)_(Het|Hem|Hom)", label)
-    if m:
-        return m.group(1)
-    # Underscore format: TP53_R248W_Het
-    m = re.search(r"(TP53_[A-Za-z]\d+\S*?)_(Het|Hem|Hom)", label)
-    if m:
-        return m.group(1)
-    return None
-
-
-
 # ── Block-aware / ADO-tolerant rescue helpers ───────────────────────
 def _build_variant_to_amplicon(state) -> dict[str, str]:
     """Return {variant_id: amplicon_id} from Sample.dna.col_attrs, falling back to variant IDs."""
@@ -170,20 +187,23 @@ def _build_variant_to_amplicon(state) -> dict[str, str]:
 
 
 def _variant_pos(v: str) -> int:
+    """Parse the genomic position from ``chrN:POS[-END]:REF/ALT``; unknown -> sentinel."""
     try:
         return int(str(v).split(":")[1].split("-")[0])
     except Exception:
-        return 10**18
+        return _UNKNOWN_VARIANT_POS
 
 
 def _loh_block_variants_for_label(clone_label: str, state, arm: str | None = None) -> list[str] | None:
-    """
-    Return persisted/cytoband-inferred LOH block variants for *clone_label*.
-    If *arm* is supplied, restrict to that arm's variants.
-    """
-    from .loh_config import extract_chr_arms, arm_variants
-    import re as _re
+    """Return the LOH block variants for *clone_label*, or None when none are found.
 
+    Sources, tried in order: (1) the exact key in ``state.clone_block_variants``;
+    (2) any persisted key that is a substring of the label (or vice versa), for
+    merged labels; (3) cytoband ranges embedded in the label (e.g.
+    ``chr20p:p12.3-p11.21``) resolved against ``state.cytobands_df``. If *arm*
+    is given the result is restricted to that arm's variants. The result is
+    de-duplicated (order kept) and limited to columns of ``state.df``.
+    """
     label = str(clone_label)
     out: list[str] = []
 
@@ -204,7 +224,7 @@ def _loh_block_variants_for_label(clone_label: str, state, arm: str | None = Non
     if not out:
         cytobands_df = getattr(state, "cytobands_df", None)
         if cytobands_df is not None and len(cytobands_df) > 0:
-            cytoband_pattern = _re.compile(
+            cytoband_pattern = re.compile(
                 r"(chr(?:\d+|X|Y)[pq]):([pq][\w.]+(?:-[pq][\w.]+)?)"
             )
             for arm_label, band_range in cytoband_pattern.findall(label):
@@ -309,6 +329,7 @@ def _informative_variant_set_for_rescue(cfg) -> set[str] | None:
 
 
 def _direction(vals: np.ndarray, low_af: float, high_af: float) -> str:
+    """Classify finite AFs as LOW, HIGH, MIXED (both), MID (neither) or NA (none finite)."""
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
         return "NA"
@@ -429,7 +450,7 @@ def _score_cell_against_loh_profile_ado_tolerant(
         if cv.size >= min_corr_variants:
             sd_c = float(np.nanstd(cv))
             sd_p = float(np.nanstd(pv))
-            if sd_c < 1e-6 or sd_p < 1e-6:
+            if sd_c < _FLAT_PROFILE_SD or sd_p < _FLAT_PROFILE_SD:
                 # Correlation is undefined for constant LOW/HIGH blocks.  Treat
                 # it as a match only if the absolute profile difference is small.
                 max_abs_diff = float(getattr(cfg, "phase4_rescue_constant_profile_max_abs_diff", 15.0))
@@ -485,12 +506,16 @@ def _het_ado_check(
         somatic mutation(s).
       • No amplicon ADO probability model is used.
       • Passing cells are relabelled as ADO and removed from state.df / df_numeric.
-    """
-    from .loh_config import (
-        LOH_TAG, ADO_LABEL, vprint, is_hem_like, fmt_float, is_wt_clone,
-    )
-    import re as _re
 
+    Het candidates are paired with Hem/Hom targets of the same mutation key
+    (label with LOH tokens and zygosity suffixes removed); WT candidates with
+    same-key active-LOH Hem/Hom targets or, when none exist and
+    ``ado_wt_compare_all_hemhom_loh_targets`` is on, with all of them. A cell
+    is flagged when, against some target mean profile, it has ``>=
+    ado_min_comparison_variants`` (20) finite variants, Pearson r ``>=
+    ado_min_corr`` (0.80) and median |ΔAF| ``<= ado_max_median_abs_diff`` (15).
+    Returns the number of cells relabelled (0 when disabled or skipped).
+    """
     if not bool(getattr(cfg, "ado_check_enabled", True)):
         return 0
 
@@ -517,11 +542,11 @@ def _het_ado_check(
 
     # ── Helpers ─────────────────────────────────────────────────────
     def _is_hom_like(label: str) -> bool:
-        return _re.search(
+        return re.search(
             r"(^|[^A-Za-z0-9])hom([^A-Za-z0-9]|$)",
             str(label),
-            flags=_re.IGNORECASE,
-        ) is not None or _re.search(r"_Hom\b", str(label)) is not None
+            flags=re.IGNORECASE,
+        ) is not None or re.search(r"_Hom\b", str(label)) is not None
 
     def _is_hemhom_like(label: str) -> bool:
         return is_hem_like(label) or (include_hom and _is_hom_like(label))
@@ -546,7 +571,7 @@ def _het_ado_check(
         ]
         out = []
         for pat in pats:
-            for m in _re.finditer(pat, s):
+            for m in re.finditer(pat, s):
                 tok = m.group(1).strip()
                 if tok and tok not in out:
                     out.append(tok)
@@ -559,7 +584,7 @@ def _het_ado_check(
         """
         base = _get_base_name(lbl, LOH_TAG)
         # Replace mutation zygosity tokens by mutation core.
-        base = _re.sub(
+        base = re.sub(
             r"\b([A-Za-z][A-Za-z0-9]*[:_][A-Za-z0-9][A-Za-z0-9*.+-]*?)_(Het|Hem|Hom)\b",
             r"\1",
             base,
@@ -596,7 +621,7 @@ def _het_ado_check(
         pass
 
     def _normalise(s: str) -> str:
-        return _re.sub(r"[^A-Za-z0-9]+", "", str(s)).lower()
+        return re.sub(r"[^A-Za-z0-9]+", "", str(s)).lower()
 
     def _amplicons_for_somatic_tokens(tokens: list[str]) -> set[str]:
         amps: set[str] = set()
@@ -703,7 +728,7 @@ def _het_ado_check(
             else:
                 target_profile = state.df.loc[target_bcs, comp_vars].mean(axis=0).values.astype(float)
                 target_profile_cache[key] = target_profile
-            if np.nanstd(target_profile) < 1e-6:
+            if np.nanstd(target_profile) < _FLAT_PROFILE_SD:
                 continue
 
             vprint(
@@ -721,7 +746,7 @@ def _het_ado_check(
                 n = int(mask.sum())
                 if n < min_variants:
                     continue
-                if np.nanstd(cell_vals[mask]) < 1e-6:
+                if np.nanstd(cell_vals[mask]) < _FLAT_PROFILE_SD:
                     continue
                 r, _ = pearsonr(cell_vals[mask], target_profile[mask])
                 mad = float(np.nanmedian(np.abs(cell_vals[mask] - target_profile[mask])))
@@ -776,455 +801,6 @@ def _het_ado_check(
 
     return len(ado_barcodes)
 
-def _arm_pooled_rescue(
-    state,
-    cfg,
-    LOH_TAG: str,
-    arm_variants_fn,
-    extract_chr_arms_fn,
-    low_af: float,
-    high_af: float,
-) -> int:
-    """
-    Fix 1 — Arm-level pooled rescue pass (Phase 4c).
-
-    For each LOH arm currently in state, build a pooled mean AF profile from
-    ALL cells carrying LOH on that arm (regardless of which LOH clone they
-    belong to).  Then, for each non-LOH clone whose base-genotype name matches
-    AT LEAST ONE existing LOH clone's base name, check every individual cell
-    against the pooled profile.  Cells that pass the per-cell correlation and
-    extreme-fraction thresholds are rescued into:
-      (a) The existing matching LOH clone for that arm + base-name, if one
-          exists; or
-      (b) A newly created LOH clone label, if none exists yet for that
-          base-name × arm combination.
-
-    This catches the case where chr4q LOH in TET2_... cells was never rescued
-    because there was no same-name chr4q LOH clone surviving Phase 1 — the
-    existing Phase 4 per-cell rescue only runs *against* surviving LOH clones.
-
-    Returns the number of new rescue operations performed.
-    """
-    from .loh_config import vprint, fmt_float
-    import re as _re
-
-    pc_min_r = float(getattr(cfg, "phase4_percell_min_corr", 0.60))
-    pc_min_ef = float(getattr(cfg, "phase4_percell_min_extreme", 0.70))
-    min_rescued_cells = int(getattr(cfg, "phase4_arm_rescue_min_cells", cfg.min_final_clone_size))
-    enabled = bool(getattr(cfg, "phase4_arm_rescue_enabled", True))
-
-    if not enabled:
-        return 0
-
-    vprint("\n" + "-" * 60, cfg)
-    vprint("PHASE 4.2: Arm-level pooled rescue", cfg)
-    vprint("-" * 60, cfg)
-    allowed_msg = getattr(cfg, "phase4_rescue_max_ado_amplicons", 1)
-    vprint(
-        f"  Criteria: block-aware rescue, per-cell r ≥ {pc_min_r}, "
-        f"allow ≤{allowed_msg} non-supporting/ADO amplicon(s) "
-        f"only when block has ≥{getattr(cfg, 'phase4_rescue_min_amplicons_to_allow_ado', 5)} informative amplicons, "
-        f"min rescued cells ≥ {min_rescued_cells}",
-        cfg,
-    )
-
-    state.refresh()
-
-    # ── Step 1: identify all arms currently with LOH cells ──────────
-    arm_to_loh_cells: dict[str, list] = {}
-    arm_to_block_variants: dict[str, list[str]] = {}
-    for lbl, cells in state.clone_to_cells.items():
-        if not _is_active_loh(lbl):
-            continue
-        for arm in extract_chr_arms_fn(lbl):
-            arm_to_loh_cells.setdefault(arm, [])
-            arm_to_loh_cells[arm].extend(cells)
-            bvars = _rescue_variants_for_clone_arm(str(lbl), arm, state, cfg, arm_variants_fn)
-            if bvars:
-                arm_to_block_variants.setdefault(arm, [])
-                arm_to_block_variants[arm].extend([str(v) for v in bvars])
-
-    if not arm_to_loh_cells:
-        vprint("  No LOH arms found — skipping.", cfg)
-        return 0
-
-    # ── Step 2: build per-arm pooled profiles ───────────────────────
-    # Use union of surviving LOH block variants for that arm when available;
-    # this avoids rescuing on noisy arm-wide variants outside the discovered block.
-    arm_profiles: dict[str, tuple[np.ndarray, list[str]]] = {}
-    for arm, cells in arm_to_loh_cells.items():
-        variants = list(dict.fromkeys(arm_to_block_variants.get(arm, [])))
-        if len(variants) < 2:
-            variants = list(arm_variants_fn(arm, state))
-        variants = [str(v) for v in variants if str(v) in state.df.columns]
-        if len(variants) < 2:
-            continue
-        bcs = [str(c) for c in cells if str(c) in state.df.index]
-        if len(bcs) < 2:
-            continue
-        prof = state.df.loc[bcs, variants].mean(axis=0).values.astype(float)
-        arm_profiles[arm] = (prof, variants)
-
-    if not arm_profiles:
-        vprint("  Could not build any arm profiles — skipping.", cfg)
-        return 0
-
-    # ── Step 3: build base-name index for existing LOH clones ────────
-    # base_name → {arm → loh_label}
-    loh_base_arm: dict[str, dict[str, str]] = {}
-    for lbl in state.clone_to_cells:
-        if not _is_active_loh(lbl):
-            continue
-        base = _get_base_name(lbl, LOH_TAG)
-        for arm in extract_chr_arms_fn(lbl):
-            loh_base_arm.setdefault(base, {})[arm] = lbl
-
-    # ── Step 4: collect non-LOH clones ───────────────────────────────
-    non_loh_clones = {
-        lbl: cells
-        for lbl, cells in state.clone_to_cells.items()
-        if _is_active_non_loh(lbl) and len(cells) > 0
-    }
-
-    if not non_loh_clones:
-        vprint("  No non-LOH clones — skipping.", cfg)
-        return 0
-
-    # ── Step 5: for each non-LOH clone, check each arm ───────────────
-    ops_done = 0
-
-    for non_loh_lbl, non_loh_cells in sorted(
-        non_loh_clones.items(), key=lambda kv: -len(kv[1])
-    ):
-        base = _get_base_name(non_loh_lbl, LOH_TAG)
-
-        # Only process clones whose base name appears in at least one LOH clone
-        if base not in loh_base_arm:
-            continue
-
-        for arm, (prof, variants) in arm_profiles.items():
-            # Skip arm if this non-LOH clone's base already has an LOH clone
-            # for this arm AND the non-LOH clone was already processed by the
-            # standard Phase 4 loop (we only handle NEW arm assignments here)
-            already_has_loh_for_arm = arm in loh_base_arm.get(base, {})
-
-            # Also skip if the non-LOH clone itself already carries this arm
-            if arm in extract_chr_arms_fn(non_loh_lbl):
-                continue
-
-            # Per-cell rescue against pooled profile
-            candidate_bcs = [str(c) for c in non_loh_cells if str(c) in state.df.index]
-            if not candidate_bcs:
-                continue
-
-            rescued_bcs: list[str] = []
-            v2a = _build_variant_to_amplicon(state)
-
-            for bc_str in candidate_bcs:
-                cell_vals = state.df.loc[bc_str, variants].values.astype(float)
-                score = _score_cell_against_loh_profile_ado_tolerant(
-                    cell_vals,
-                    prof,
-                    variants,
-                    v2a=v2a,
-                    cfg=cfg,
-                    low_af=low_af,
-                    high_af=high_af,
-                )
-                if score["passes"]:
-                    rescued_bcs.append(bc_str)
-
-            if len(rescued_bcs) < min_rescued_cells:
-                continue
-
-            # Determine target LOH label
-            if already_has_loh_for_arm:
-                target_lbl = loh_base_arm[base][arm]
-            else:
-                # Create a new LOH clone label for this base × arm
-                existing_c = []
-                for lbl2 in state.clone_to_cells:
-                    if not _is_active_loh(lbl2):
-                        continue
-                    if arm not in extract_chr_arms_fn(lbl2):
-                        continue
-                    m = _re.search(r"LOH-C(\d+)", str(lbl2))
-                    if m:
-                        existing_c.append(int(m.group(1)))
-                next_c = max(existing_c, default=-1) + 1
-                target_lbl = f"{base} LOH-C{next_c} {arm}"
-
-            vprint(
-                f"\n  [{arm}] '{non_loh_lbl}' ({len(non_loh_cells)} cells) "
-                f"→ {len(rescued_bcs)} cells rescued into '{target_lbl}'",
-                cfg,
-            )
-            for bc_str in rescued_bcs:
-                vprint(f"    ✓ {bc_str} → {target_lbl}", cfg)
-
-            # Apply relabelling
-            clone_arr = state.Sample.dna.row_attrs["Clone"]
-            barcode_arr = pd.Series(
-                state.Sample.dna.row_attrs["barcode"]
-            ).astype(str).values
-
-            for bc_str in rescued_bcs:
-                mask = barcode_arr == bc_str
-                if mask.any():
-                    clone_arr[mask] = target_lbl
-
-            state.Sample.dna.row_attrs["Clone"] = clone_arr
-
-            # Update clone_to_cells
-            existing_in_target = list(state.clone_to_cells.get(target_lbl, []))
-            state.clone_to_cells[target_lbl] = list(
-                set(existing_in_target + rescued_bcs)
-            )
-            remaining = [c for c in non_loh_cells if str(c) not in set(rescued_bcs)]
-            if remaining:
-                state.clone_to_cells[non_loh_lbl] = remaining
-            elif non_loh_lbl in state.clone_to_cells:
-                del state.clone_to_cells[non_loh_lbl]
-
-            # Update loh_base_arm index for subsequent iterations
-            loh_base_arm.setdefault(base, {})[arm] = target_lbl
-
-            ops_done += 1
-
-    vprint(f"\n  Arm-level pooled rescue: {ops_done} operation(s) performed.", cfg)
-    state.refresh()
-    return ops_done
-
-
-def _loh_arm_expansion(
-    state,
-    cfg,
-    LOH_TAG: str,
-    arm_variants_fn,
-    extract_chr_arms_fn,
-    low_af: float,
-    high_af: float,
-) -> int:
-    """
-    Phase 4c-ii — LOH arm expansion (second pass over existing LOH clones).
-
-    For each existing LOH clone, check whether its cells *also* carry LOH
-    on additional arms not yet in the clone label.  The test uses the
-    per-arm pooled profile (built from ALL cells currently assigned LOH on
-    that arm across all clones).
-
-    • If ≥ ``unanimous_frac`` of the clone's cells pass the per-cell
-      correlation and extreme-fraction thresholds on a new arm, the whole
-      clone is relabelled to include that arm.
-    • If fewer pass but still ≥ ``min_cells``, the passing cells are split
-      into a new clone that carries the expanded label, and the remainder
-      keep the original label.
-    • Otherwise the arm is skipped for that clone.
-
-    Returns the number of expansion operations performed.
-    """
-    from .loh_config import vprint, fmt_float
-    import re as _re
-
-    enabled = bool(getattr(cfg, "phase4_arm_expansion_enabled", True))
-    if not enabled:
-        return 0
-
-    pc_min_r = float(getattr(cfg, "phase4_arm_expansion_min_corr", 0.60))
-    pc_min_ef = float(getattr(cfg, "phase4_arm_expansion_min_extreme", 0.70))
-    unanimous_frac = float(getattr(cfg, "phase4_arm_expansion_unanimous_frac", 0.90))
-    min_cells = int(getattr(cfg, "phase4_arm_expansion_min_cells", 5))
-
-    vprint("\n" + "-" * 60, cfg)
-    vprint("PHASE 4.3: LOH arm expansion (existing clone second pass)", cfg)
-    vprint("-" * 60, cfg)
-    vprint(
-        f"  Criteria: per-cell r ≥ {pc_min_r}, extreme ≥ {pc_min_ef}, "
-        f"unanimous ≥ {unanimous_frac:.0%}, min cells ≥ {min_cells}",
-        cfg,
-    )
-
-    state.refresh()
-
-    # ── Step 1: identify all arms with LOH cells & build pooled profiles ─
-    arm_to_loh_cells: dict[str, list] = {}
-    for lbl, cells in state.clone_to_cells.items():
-        if not _is_active_loh(lbl):
-            continue
-        for arm in extract_chr_arms_fn(lbl):
-            arm_to_loh_cells.setdefault(arm, [])
-            arm_to_loh_cells[arm].extend(cells)
-
-    arm_profiles: dict[str, tuple[np.ndarray, list[str]]] = {}
-    for arm, cells in arm_to_loh_cells.items():
-        variants = arm_variants_fn(arm, state)
-        if len(variants) < 2:
-            continue
-        bcs = [str(c) for c in cells if str(c) in state.df.index]
-        if len(bcs) < 2:
-            continue
-        prof = state.df.loc[bcs, variants].mean(axis=0).values.astype(float)
-        if np.nanstd(prof) < 1e-6:
-            continue
-        arm_profiles[arm] = (prof, variants)
-
-    if not arm_profiles:
-        vprint("  No arm profiles available — skipping.", cfg)
-        return 0
-
-    vprint(f"  Pooled profiles built for arms: {sorted(arm_profiles.keys())}", cfg)
-
-    # ── Step 2: iterate over each LOH clone ──────────────────────────────
-    ops_done = 0
-
-    # Snapshot clone list to avoid mutating dict during iteration
-    loh_snapshot = [
-        (lbl, list(cells))
-        for lbl, cells in state.clone_to_cells.items()
-        if _is_active_loh(lbl) and len(cells) > 0
-    ]
-
-    for clone_lbl, clone_cells in loh_snapshot:
-        existing_arms = set(extract_chr_arms_fn(clone_lbl))
-
-        # Check each arm not already carried by this clone
-        for arm, (prof, variants) in arm_profiles.items():
-            if arm in existing_arms:
-                continue
-
-            # Per-cell test against pooled profile for this arm
-            candidate_bcs = [str(c) for c in clone_cells if str(c) in state.df.index]
-            if not candidate_bcs:
-                continue
-
-            passing: list[str] = []
-            failing: list[str] = []
-
-            for bc_str in candidate_bcs:
-                cell_vals = state.df.loc[bc_str, variants].values.astype(float)
-                mask = np.isfinite(cell_vals) & np.isfinite(prof)
-                if mask.sum() < 3:
-                    failing.append(bc_str)
-                    continue
-                if np.nanstd(cell_vals[mask]) < 1e-6:
-                    failing.append(bc_str)
-                    continue
-
-                r_val, _ = pearsonr(cell_vals[mask], prof[mask])
-                if not np.isfinite(r_val):
-                    failing.append(bc_str)
-                    continue
-
-                valid = cell_vals[np.isfinite(cell_vals)]
-                ef = (
-                    float(np.mean((valid <= low_af) | (valid >= high_af)))
-                    if len(valid) > 0
-                    else 0.0
-                )
-
-                if r_val >= pc_min_r and ef >= pc_min_ef:
-                    passing.append(bc_str)
-                else:
-                    failing.append(bc_str)
-
-            if len(passing) < min_cells:
-                continue
-
-            pass_frac = len(passing) / max(len(candidate_bcs), 1)
-
-            # ── Build the expanded label ─────────────────────────────
-            # Find the next LOH-C index for this arm globally
-            existing_c: list[int] = []
-            for lbl2 in list(state.clone_to_cells.keys()):
-                if not _is_active_loh(lbl2):
-                    continue
-                if arm not in extract_chr_arms_fn(lbl2):
-                    continue
-                m = _re.search(r"LOH-C(\d+)", str(lbl2))
-                if m:
-                    existing_c.append(int(m.group(1)))
-            next_c = max(existing_c, default=-1) + 1
-
-            expanded_lbl = f"{clone_lbl} LOH-C{next_c} {arm}"
-
-            if pass_frac >= unanimous_frac:
-                # ── Unanimous: relabel entire clone ──────────────────
-                vprint(
-                    f"\n  {_GREEN}[{arm}] '{clone_lbl}' → RELABEL entire clone "
-                    f"({len(passing)}/{len(candidate_bcs)} = {pass_frac:.0%} pass){_RESET}",
-                    cfg,
-                )
-                vprint(f"    New label: '{expanded_lbl}'", cfg)
-
-                clone_arr = state.Sample.dna.row_attrs["Clone"]
-                barcode_arr = pd.Series(
-                    state.Sample.dna.row_attrs["barcode"]
-                ).astype(str).values
-
-                # Relabel all cells currently in this clone
-                all_clone_bcs = [str(c) for c in clone_cells]
-                for bc_str in all_clone_bcs:
-                    mask = barcode_arr == bc_str
-                    if mask.any():
-                        clone_arr[mask] = expanded_lbl
-
-                state.Sample.dna.row_attrs["Clone"] = clone_arr
-
-                # Update clone_to_cells
-                state.clone_to_cells[expanded_lbl] = list(
-                    state.clone_to_cells.pop(clone_lbl, clone_cells)
-                )
-
-                ops_done += 1
-
-                # Update existing_arms so subsequent arm checks for this
-                # clone use the new label context
-                existing_arms.add(arm)
-
-                # Update clone_lbl reference for subsequent arm iterations
-                clone_lbl = expanded_lbl
-
-            else:
-                # ── Split: passing cells get expanded label, rest keep original ─
-                vprint(
-                    f"\n  {_YELLOW}[{arm}] '{clone_lbl}' → SPLIT "
-                    f"({len(passing)}/{len(candidate_bcs)} = {pass_frac:.0%} pass, "
-                    f"below {unanimous_frac:.0%} unanimity){_RESET}",
-                    cfg,
-                )
-                vprint(f"    Expanded label: '{expanded_lbl}' ({len(passing)} cells)", cfg)
-                vprint(f"    Remaining in:   '{clone_lbl}' ({len(failing)} cells)", cfg)
-
-                clone_arr = state.Sample.dna.row_attrs["Clone"]
-                barcode_arr = pd.Series(
-                    state.Sample.dna.row_attrs["barcode"]
-                ).astype(str).values
-
-                for bc_str in passing:
-                    mask = barcode_arr == bc_str
-                    if mask.any():
-                        clone_arr[mask] = expanded_lbl
-
-                state.Sample.dna.row_attrs["Clone"] = clone_arr
-
-                # Update clone_to_cells
-                state.clone_to_cells[expanded_lbl] = passing
-                remaining_cells = [
-                    c for c in clone_cells if str(c) not in set(passing)
-                ]
-                if remaining_cells:
-                    state.clone_to_cells[clone_lbl] = remaining_cells
-                elif clone_lbl in state.clone_to_cells:
-                    del state.clone_to_cells[clone_lbl]
-
-                ops_done += 1
-
-    vprint(f"\n  LOH arm expansion: {ops_done} operation(s) performed.", cfg)
-    state.refresh()
-    return ops_done
-
-
-
 def _safe_similarity_corr(
     x: np.ndarray,
     y: np.ndarray,
@@ -1252,7 +828,7 @@ def _safe_similarity_corr(
 
     mad = float(np.nanmedian(np.abs(x - y)))
 
-    if float(np.nanstd(x)) < 1e-6 or float(np.nanstd(y)) < 1e-6:
+    if float(np.nanstd(x)) < _FLAT_PROFILE_SD or float(np.nanstd(y)) < _FLAT_PROFILE_SD:
         if constant_profiles_are_match and mad <= constant_profile_max_mad:
             return 1.0
         return np.nan
@@ -1265,6 +841,7 @@ def _safe_similarity_corr(
 
 
 def _profile_extreme_fraction(vals: np.ndarray, low_af: float, high_af: float) -> float:
+    """Fraction of finite values ``<= low_af`` or ``>= high_af`` (NaN if none finite)."""
     vals = np.asarray(vals, dtype=float)
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
@@ -1273,10 +850,11 @@ def _profile_extreme_fraction(vals: np.ndarray, low_af: float, high_af: float) -
 
 
 def _directions_compatible(direction_a: str, direction_b: str) -> bool:
-    """
-    LOW and HIGH must match exactly.
-    MIXED is compatible with LOW/HIGH/MIXED because mixed-direction LOH can be
-    produced by informative SNPs phased on opposite alleles.
+    """Return True when two ``_direction`` labels are compatible.
+
+    Identical labels match (including MID/MID); MIXED matches anything except
+    NA, because mixed-direction LOH can come from informative SNPs phased on
+    opposite alleles; NA never matches; LOW vs HIGH and MID vs LOW/HIGH do not.
     """
     direction_a = str(direction_a)
     direction_b = str(direction_b)
@@ -1315,8 +893,6 @@ def _cross_loh_clone_similarity_check(
       • no cells are relabelled
       • results are stored in state.results["phase4_cross_loh_similarity"]
     """
-    from .loh_config import vprint, fmt_float
-
     enabled = bool(getattr(cfg, "phase4_cross_loh_similarity_enabled", True))
     if not enabled:
         return pd.DataFrame()
@@ -1568,8 +1144,6 @@ def _merge_small_loh_clones_after_annotation(
     diagnostic table is written to state.results["phase4_small_loh_merge"].
     Each row is one source-cell/target comparison.
     """
-    from .loh_config import vprint, fmt_float, is_fp_label
-
     enabled = bool(getattr(cfg, "phase4_merge_small_loh_after_annotation_enabled", True))
     if not enabled:
         return pd.DataFrame()
@@ -2243,7 +1817,6 @@ def _merge_small_loh_clones_after_annotation(
     # individually match a validated same-base LOH clone. Scored on the same
     # base->LOH per-cell path; non-matching cells stay FP.
     if promote_fp_to_loh:
-        from .loh_config import fp_base_name
         for source_label, source_cells in sorted(
             [
                 (str(lbl), list(cells))
@@ -2538,8 +2111,6 @@ def _contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
 
 def _residual_component_homogeneous(X: np.ndarray, *, min_variants: int, min_mean_r: float, max_mad: float) -> tuple[bool, dict]:
     """Conservative cell-to-centroid validation for a residual LOH component."""
-    from .loh_config import pearson_safe
-
     X = np.asarray(X, dtype=float)
     if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < int(min_variants):
         return False, {"reason": "insufficient_cells_or_variants", "mean_r": float("nan"), "n_usable_r": 0}
@@ -2569,190 +2140,6 @@ def _residual_component_homogeneous(X: np.ndarray, *, min_variants: int, min_mea
     return passed, {"reason": "constant_profile_distance_pass" if passed else "insufficient_usable_correlations", "mean_r": float("nan"), "median_abs_diff": median_mad, "n_usable_r": len(rs)}
 
 
-def _discover_residual_base_loh_subclones(state, cfg) -> pd.DataFrame:
-    """Discover conservative de novo LOH subgroups in remaining base clones.
-
-    This runs only after Phase 4 rescue against established targets. It scans
-    the residual cells of each active base clone arm-by-arm, requiring a
-    direction-consistent connected component, a shared contiguous extreme
-    block, and independent component homogeneity. It never relabels cells
-    that have no coherent new event.
-    """
-    from .loh_config import arm_variants, is_small_label, vprint
-
-    if not bool(getattr(cfg, "phase4_residual_base_loh_discovery_enabled", True)):
-        return pd.DataFrame()
-
-    min_cells = int(getattr(cfg, "phase4_residual_base_loh_min_candidate_cells", cfg.min_final_clone_size))
-    min_run = int(getattr(cfg, "phase4_residual_base_loh_min_contiguous_variants", cfg.min_contiguous_variants_initial))
-    min_extreme = float(getattr(cfg, "phase4_residual_base_loh_min_extreme_fraction", cfg.min_extreme_fraction))
-    min_shared = int(getattr(cfg, "phase4_residual_base_loh_min_shared_variants", cfg.min_shared_variants))
-    min_mean_r = float(getattr(cfg, "phase4_residual_base_loh_min_mean_corr", cfg.phase3_min_mean_corr_to_mean))
-    max_mad = float(getattr(cfg, "phase4_residual_base_loh_max_cell_median_abs_diff", 15.0))
-    low = float(cfg.low_allele_threshold)
-    high = float(cfg.high_allele_threshold)
-
-    rows: list[dict] = []
-    if not hasattr(state, "clone_block_variants") or state.clone_block_variants is None:
-        state.clone_block_variants = {}
-    current = state.current_clones.copy()
-    next_num = _next_residual_loh_number(state)
-    changed = False
-
-    base_groups = [
-        (str(label), [c for c in cells if c in state.df_numeric.index])
-        for label, cells in state.clone_to_cells.items()
-        if _is_active_non_loh(label) and not is_small_label(label) and len(cells) >= min_cells
-    ]
-
-    if not base_groups:
-        return pd.DataFrame()
-
-    vprint("\n------------------------------------------------------------", cfg)
-    vprint("PHASE 4.6: Residual base-clone LOH discovery", cfg)
-    vprint("------------------------------------------------------------", cfg)
-    vprint(
-        f"  Criteria: ≥{min_cells} cells; ≥{min_run} contiguous extreme variants; "
-        f"shared directional variants ≥{min_shared}; mean cell-to-centroid r ≥{min_mean_r:.2f}.",
-        cfg,
-    )
-
-    # Store accepted cells per base so one cell cannot be assigned to two
-    # independent de novo arm discoveries in the same pass.
-    used_cells_by_base: dict[str, set] = {}
-
-    for base_label, base_cells in sorted(base_groups, key=lambda item: (-len(item[1]), item[0])):
-        used_cells_by_base.setdefault(base_label, set())
-        for arm in state.chr_arms:
-            arm_vars = [str(v) for v in arm_variants(arm, state) if str(v) in state.df_numeric.columns]
-            if len(arm_vars) < min_run:
-                continue
-
-            candidate_cells = [c for c in base_cells if c not in used_cells_by_base[base_label]]
-            if len(candidate_cells) < min_cells:
-                continue
-
-            X = state.df_numeric.loc[candidate_cells, arm_vars].to_numpy(dtype=float)
-            extreme = np.isfinite(X) & ((X <= low) | (X >= high))
-            signs = np.zeros_like(X, dtype=np.int8)
-            signs[np.isfinite(X) & (X <= low)] = -1
-            signs[np.isfinite(X) & (X >= high)] = 1
-
-            segment_mask = np.zeros_like(extreme, dtype=bool)
-            eligible_idx: list[int] = []
-            for i, row_extreme in enumerate(extreme):
-                runs = [run for run in _contiguous_runs(row_extreme) if (run[1] - run[0] + 1) >= min_run]
-                if not runs:
-                    continue
-                eligible_idx.append(i)
-                for start, end in runs:
-                    segment_mask[i, start:end + 1] = True
-
-            if len(eligible_idx) < min_cells:
-                continue
-
-            # Connected components: cells must share enough same-direction
-            # extreme variants inside their contiguous candidate segments.
-            adjacency = {i: set() for i in eligible_idx}
-            for pos_i, i in enumerate(eligible_idx):
-                for j in eligible_idx[pos_i + 1:]:
-                    shared = segment_mask[i] & segment_mask[j] & (signs[i] != 0) & (signs[i] == signs[j])
-                    if int(shared.sum()) >= min_shared:
-                        adjacency[i].add(j)
-                        adjacency[j].add(i)
-
-            seen: set[int] = set()
-            for start_i in eligible_idx:
-                if start_i in seen:
-                    continue
-                stack = [start_i]
-                seen.add(start_i)
-                component: list[int] = []
-                while stack:
-                    i = stack.pop()
-                    component.append(i)
-                    for j in adjacency[i]:
-                        if j not in seen:
-                            seen.add(j)
-                            stack.append(j)
-
-                if len(component) < min_cells:
-                    continue
-
-                comp_X = X[np.asarray(component, dtype=int), :]
-                called = np.isfinite(comp_X).sum(axis=0)
-                ext_count = ((comp_X <= low) | (comp_X >= high)).sum(axis=0)
-                ext_frac = np.divide(ext_count, called, out=np.zeros_like(ext_count, dtype=float), where=called > 0)
-                valid_runs = [run for run in _contiguous_runs(ext_frac >= min_extreme) if (run[1] - run[0] + 1) >= min_run]
-                if not valid_runs:
-                    continue
-
-                # Choose the most strongly supported longest block.
-                best_run = sorted(
-                    valid_runs,
-                    key=lambda run: (run[1] - run[0] + 1, float(np.mean(ext_frac[run[0]:run[1] + 1])), -run[0]),
-                    reverse=True,
-                )[0]
-                block_idx = list(range(best_run[0], best_run[1] + 1))
-                block_vars = [arm_vars[k] for k in block_idx]
-                passed, metrics = _residual_component_homogeneous(
-                    comp_X[:, block_idx],
-                    min_variants=min_run,
-                    min_mean_r=min_mean_r,
-                    max_mad=max_mad,
-                )
-
-                comp_cells = [candidate_cells[i] for i in component]
-                status = "rejected_homogeneity"
-                new_label = ""
-                if passed:
-                    new_label = f"{base_label} LOH-C{next_num} {arm}"
-                    next_num += 1
-                    status = "new_loh_subclone"
-                    for cell in comp_cells:
-                        bc = state.cell_to_barcode.get(cell, str(cell))
-                        idx = state.sample_idx_for_barcode(str(bc))
-                        if idx is not None:
-                            current.iloc[idx] = new_label
-                    state.clone_block_variants[new_label] = list(block_vars)
-                    used_cells_by_base[base_label].update(comp_cells)
-                    changed = True
-                    mean_r_text = metrics.get("mean_r", float("nan"))
-                    mean_r_text = "NA" if not np.isfinite(mean_r_text) else f"{float(mean_r_text):.3f}"
-                    vprint(
-                        f"  ✓ {base_label}: {len(comp_cells)} cell(s) → {new_label} "
-                        f"(block={len(block_vars)}v, mean_r={mean_r_text})",
-                        cfg,
-                    )
-
-                rows.append({
-                    "base_label": base_label,
-                    "arm": arm,
-                    "status": status,
-                    "new_label": new_label,
-                    "n_cells": len(comp_cells),
-                    "block_variants": ";".join(block_vars),
-                    "block_n_variants": len(block_vars),
-                    "block_extreme_fraction": float(np.mean(ext_frac[block_idx])),
-                    **metrics,
-                    "barcodes": ";".join(str(state.cell_to_barcode.get(c, c)) for c in comp_cells),
-                })
-
-    if changed:
-        state.set_clone_labels(current)
-
-    audit = pd.DataFrame(rows)
-    if not audit.empty:
-        state.results["phase4_residual_base_loh_discovery"] = audit
-    if audit.empty:
-        vprint("  No coherent de novo residual LOH subgroups found.", cfg)
-    else:
-        n_new = int((audit["status"] == "new_loh_subclone").sum())
-        vprint(f"  Residual LOH discovery: {n_new} accepted subgroup(s).", cfg)
-    return audit
-
-
-
 # ── Phase 4f: final residual base-clone refinement ───────────────────
 def _final_residual_arm_components(
     *,
@@ -2774,8 +2161,6 @@ def _final_residual_arm_components(
     same LOW/HIGH orientation. This keeps the final refinement arm-specific
     and prevents a reciprocal mixture from being promoted as one LOH event.
     """
-    from .loh_config import arm_variants
-
     low = float(cfg.low_allele_threshold)
     high = float(cfg.high_allele_threshold)
     arm_vars = [
@@ -2893,8 +2278,6 @@ def _final_residual_arm_components(
 
 def _existing_exact_arm_target(*, base_label: str, arms: tuple[str, ...], state) -> str | None:
     """Return an unambiguous active LOH target with the exact arm set."""
-    from .loh_config import extract_chr_arms, get_base_clone, is_loh_label, sort_chromosome_arms
-
     wanted = tuple(sort_chromosome_arms(list(arms)))
     matches = []
     for label, cells in state.clone_to_cells.items():
@@ -2970,8 +2353,6 @@ def _final_residual_direction_signature(
 
 def _final_residual_lineage_size(state, base_label: str) -> int:
     """Return all currently labelled cells from the same genotype lineage."""
-    from .loh_config import get_base_clone
-
     n = 0
     for label, cells in state.clone_to_cells.items():
         try:
@@ -2992,9 +2373,6 @@ def _final_refine_remaining_base_clones(state, cfg) -> pd.DataFrame:
     homogeneity, a shared variant-wise directional signature, and an ADO tail
     probability that is unlikely under the configured amplicon model.
     """
-    from .ado_probability import score_ado_combination
-    from .loh_config import is_small_label, sort_chromosome_arms, vprint
-
     if not bool(getattr(cfg, "phase4_final_residual_refinement_enabled", True)):
         return pd.DataFrame()
 
@@ -3224,408 +2602,89 @@ def _final_refine_remaining_base_clones(state, cfg) -> pd.DataFrame:
         state.results["phase4_final_residual_refinement"] = audit
     return audit
 
-def run_phase4(
-    state: "PipelineState",
-    cfg: "LOHConfig | None" = None,
-) -> dict:
+
+def _percell_rescue_score(
+    bc_str: str,
+    loh_profiles: dict[str, np.ndarray],
+    arm_var_lists: dict[str, list[str]],
+    *,
+    state,
+    cfg,
+    v2a: dict[str, str],
+    low_af: float,
+    high_af: float,
+    pc_min_r: float,
+) -> tuple[tuple, bool]:
+    """Score one non-LOH cell against an LOH clone's per-arm rescue profiles (Phase 4a).
+
+    Amplicon support is pooled over arms (passing vs required amplicons) and r
+    is averaged over arms with a finite r. Returns ``(rescue_tuple, passes)``
+    where ``rescue_tuple`` is ``(barcode, mean_r, mean_support_frac, n_pass,
+    n_required, n_amplicons, n_block_amplicons, n_somatic_excluded_amplicons)``.
     """
-    For each non-LOH clone with ≥ min_final_clone_size cells, check
-    correlation against LOH clones that share the same base genotype.
-    Merge if correlation ≥ threshold.
+    cell_rs = []
+    cell_support = []
+    n_pass_total = 0
+    n_req_total = 0
+    n_amp_total = 0
+    n_block_amp_total = 0
+    n_som_amp_total = 0
 
-    Returns the updated ``state.results`` dict.
-    """
-    from .loh_config import (
-        LOH_TAG,
-        vprint,
-        arm_variants,
-        extract_chr_arms,
-        fmt_float,
-    )
-
-    if cfg is None:
-        cfg = state.config
-
-    min_size = cfg.min_final_clone_size
-    corr_thresh = cfg.correlation_threshold
-    extreme_thresh = cfg.merge_min_extreme_frac
-    low_af = cfg.low_allele_threshold
-    high_af = cfg.high_allele_threshold
-
-    vprint("\n" + "=" * 60, cfg)
-    vprint("PHASE 4: Non-LOH ↔ LOH Clone Correlation & Merge", cfg)
-    vprint("=" * 60, cfg)
-
-    # ── Identify LOH and non-LOH clones ───────────────────────────────
-    loh_clones = {
-        lbl: cells
-        for lbl, cells in state.clone_to_cells.items()
-        if _is_active_loh(lbl) and len(cells) > 0
-    }
-    non_loh_clones = {
-        lbl: cells
-        for lbl, cells in state.clone_to_cells.items()
-        if _is_active_non_loh(lbl) and len(cells) >= min_size
-    }
-
-    if not loh_clones:
-        vprint("  No LOH clones found — nothing to check.", cfg)
-        vprint("=" * 60 + "\n", cfg)
-        return state.results
-
-    if not non_loh_clones:
-        vprint("  No non-LOH clones (≥ min size) to check.", cfg)
-        vprint("=" * 60 + "\n", cfg)
-        return state.results
-
-    # ── Build base-name index for LOH clones ──────────────────────────
-    # base_name → list of (loh_label, arms)
-    loh_by_base: dict[str, list[tuple[str, list[str]]]] = {}
-    for lbl in loh_clones:
-        base = _get_base_name(lbl, LOH_TAG)
-        arms = extract_chr_arms(lbl)
-        loh_by_base.setdefault(base, []).append((lbl, arms))
-
-    vprint(f"\n  LOH clones:     {len(loh_clones)}", cfg)
-    vprint(f"  Non-LOH clones: {len(non_loh_clones)}  (≥ {min_size} cells)", cfg)
-    vprint(f"  LOH base names: {sorted(loh_by_base.keys())}", cfg)
-    vprint(
-        f"  Merge requires: r ≥ {corr_thresh}  AND  extreme fraction ≥ {extreme_thresh}",
-        cfg,
-    )
-
-    # ── Check each non-LOH clone ──────────────────────────────────────
-    merges_done = 0
-    merges_skipped = 0
-
-    for non_loh_lbl, non_loh_cells in sorted(
-        non_loh_clones.items(), key=lambda kv: -len(kv[1])
-    ):
-        base = _get_base_name(non_loh_lbl, LOH_TAG)
-
-        if base not in loh_by_base:
-            vprint(
-                f"\n  {non_loh_lbl}  ({len(non_loh_cells)} cells)"
-                f"  — no matching LOH clone, skip.",
-                cfg,
-            )
-            continue
-
-        vprint(
-            f"\n  {non_loh_lbl}  ({len(non_loh_cells)} cells)"
-            f"  — checking against LOH clone(s):",
-            cfg,
+    for arm, prof in loh_profiles.items():
+        variants = arm_var_lists[arm]
+        cell_vals = state.df.loc[bc_str, variants].values.astype(float)
+        score = _score_cell_against_loh_profile_ado_tolerant(
+            cell_vals,
+            prof,
+            variants,
+            v2a=v2a,
+            cfg=cfg,
+            low_af=low_af,
+            high_af=high_af,
         )
+        n_pass_total += int(score["n_pass_amplicons"])
+        n_req_total += int(score["n_required_amplicons"])
+        n_amp_total += int(score["n_total_amplicons"])
+        n_block_amp_total += int(score.get("n_total_block_amplicons", score["n_total_amplicons"]))
+        n_som_amp_total += int(score.get("n_somatic_excluded_amplicons", 0))
+        cell_support.append(float(score["amp_support_frac"]))
+        if np.isfinite(score["r"]):
+            cell_rs.append(float(score["r"]))
 
-        # Try each matching LOH clone
-        for loh_lbl, loh_arms in loh_by_base[base]:
-            loh_cells = state.clone_to_cells[loh_lbl]
-
-            vprint(
-                f"    vs {loh_lbl}  ({len(loh_cells)} cells, "
-                f"arms: {', '.join(loh_arms)})",
-                cfg,
-            )
-
-            # Compute correlation AND extreme fraction on each LOH arm
-            arm_corrs = []
-            arm_extremes = []
-            for arm in loh_arms:
-                variants = arm_variants(arm, state)
-                if len(variants) < 2:
-                    vprint(f"      {arm}: < 2 variants, skip", cfg)
-                    continue
-
-                loh_barcodes = [str(bc) for bc in loh_cells if str(bc) in state.df.index]
-                non_loh_barcodes = [str(bc) for bc in non_loh_cells if str(bc) in state.df.index]
-
-                if len(loh_barcodes) < 2 or len(non_loh_barcodes) < 2:
-                    vprint(
-                        f"      {arm}: too few cells in df "
-                        f"(LOH={len(loh_barcodes)}, non-LOH={len(non_loh_barcodes)})",
-                        cfg,
-                    )
-                    continue
-
-                loh_profile = state.df.loc[loh_barcodes, variants].mean(axis=0).values
-                non_loh_profile = state.df.loc[non_loh_barcodes, variants].mean(axis=0).values
-
-                # Check for constant profiles (would give NaN correlation)
-                if np.std(loh_profile) < 1e-6 or np.std(non_loh_profile) < 1e-6:
-                    vprint(f"      {arm}: constant profile, skip", cfg)
-                    continue
-
-                r, p = pearsonr(loh_profile, non_loh_profile)
-                arm_corrs.append((arm, r, p))
-
-                non_loh_vals = state.df.loc[non_loh_barcodes, variants].values
-                extreme_mask = (non_loh_vals <= low_af) | (non_loh_vals >= high_af)
-                per_cell_extreme = np.nanmean(extreme_mask, axis=1)
-                clone_extreme_frac = float(np.nanmean(per_cell_extreme))
-                arm_extremes.append((arm, clone_extreme_frac))
-
-                vprint(
-                    f"      {arm}: r = {fmt_float(r)},  p = {fmt_float(p)}"
-                    f"  |  extreme frac = {clone_extreme_frac:.3f}",
-                    cfg,
-                )
-
-            if not arm_corrs:
-                vprint(f"    → No valid correlations, skip.", cfg)
-                merges_skipped += 1
-                continue
-
-            # Use mean correlation across arms
-            mean_r = np.mean([r for _, r, _ in arm_corrs])
-            # Use mean extreme fraction across arms
-            mean_extreme = np.mean([ef for _, ef in arm_extremes]) if arm_extremes else 0.0
-
-            vprint(
-                f"    → Mean r = {fmt_float(mean_r)}  (threshold = {corr_thresh})"
-                f"  |  Mean extreme frac = {mean_extreme:.3f}  (threshold = {extreme_thresh})",
-                cfg,
-            )
-
-            passes_corr = mean_r >= corr_thresh
-            passes_extreme = mean_extreme >= extreme_thresh
-
-            # "Hint of similarity" trigger for per-cell rescue
-            hint_mean_r = float(getattr(cfg, "phase4_percell_trigger_mean_corr", 0.35))
-            hint_any_arm_r = float(getattr(cfg, "phase4_percell_trigger_any_arm_corr", 0.75))
-
-            arm_r_values = [float(r) for _, r, _ in arm_corrs if np.isfinite(r)]
-            max_arm_r = max(arm_r_values) if arm_r_values else float("-inf")
-
-            has_similarity_hint = (
-                (np.isfinite(mean_r) and mean_r >= hint_mean_r)
-                or (np.isfinite(max_arm_r) and max_arm_r >= hint_any_arm_r)
-            )
-
-            if passes_corr and passes_extreme:
-                # ── MERGE ───────────────────────────────────────────
-                vprint(
-                    f"    {_GREEN}✓ MERGE: {non_loh_lbl} → {loh_lbl}{_RESET}  "
-                    f"({len(non_loh_cells)} cells)",
-                    cfg,
-                )
-
-                clone_arr = state.Sample.dna.row_attrs["Clone"]
-                barcode_arr = pd.Series(state.Sample.dna.row_attrs["barcode"]).astype(str).values
-
-                for bc in non_loh_cells:
-                    mask = barcode_arr == str(bc)
-                    if mask.any():
-                        clone_arr[mask] = loh_lbl
-
-                state.Sample.dna.row_attrs["Clone"] = clone_arr
-
-                state.clone_to_cells[loh_lbl] = list(set(list(loh_cells) + list(non_loh_cells)))
-                if non_loh_lbl in state.clone_to_cells:
-                    del state.clone_to_cells[non_loh_lbl]
-
-                merges_done += 1
-                break
-            else:
-                reasons = []
-                if not passes_corr:
-                    reasons.append(f"r={fmt_float(mean_r)} < {corr_thresh}")
-                if not passes_extreme:
-                    reasons.append(f"extreme={mean_extreme:.3f} < {extreme_thresh}")
-                vprint(f"    {_RED}✗ No merge: {'; '.join(reasons)}{_RESET}", cfg)
-
-                # ── Per-cell rescue ────────────────────────────────
-                if cfg.phase4_percell_rescue and (passes_corr or has_similarity_hint):
-                    if not passes_corr and has_similarity_hint:
-                        vprint(
-                            f"    Per-cell rescue triggered by similarity hint "
-                            f"(mean_r={fmt_float(mean_r)}, max_arm_r={fmt_float(max_arm_r)}; "
-                            f"hint thresholds: mean≥{hint_mean_r}, any-arm≥{hint_any_arm_r})",
-                            cfg,
-                        )
-
-                    pc_min_r = cfg.phase4_percell_min_corr
-                    pc_min_ef = cfg.phase4_percell_min_extreme
-                    allowed_msg = getattr(cfg, "phase4_rescue_max_ado_amplicons", 1)
-                    vprint(
-                        f"    Per-cell rescue: block-aware, r ≥ {pc_min_r}, "
-                        f"allow ≤{allowed_msg} non-supporting/ADO amplicon(s) per block",
-                        cfg,
-                    )
-
-                    loh_profiles: dict[str, np.ndarray] = {}
-                    arm_var_lists: dict[str, list[str]] = {}
-                    v2a = _build_variant_to_amplicon(state)
-
-                    for arm in loh_arms:
-                        variants = _rescue_variants_for_clone_arm(loh_lbl, arm, state, cfg, arm_variants)
-                        if len(variants) < 2:
-                            continue
-                        loh_bcs = [str(bc) for bc in loh_cells if str(bc) in state.df.index]
-                        if len(loh_bcs) < 2:
-                            continue
-                        prof = state.df.loc[loh_bcs, variants].mean(axis=0).values.astype(float)
-                        # Do not skip constant profiles: a true LOW/HIGH block can be constant.
-                        loh_profiles[arm] = prof
-                        arm_var_lists[arm] = variants
-
-                    if loh_profiles:
-                        rescued: list[tuple[str, float, float, int, int, int]] = []
-                        not_rescued: list[tuple[str, float, float, int, int, int]] = []
-
-                        for bc in non_loh_cells:
-                            bc_str = str(bc)
-                            if bc_str not in state.df.index:
-                                continue
-
-                            cell_rs = []
-                            cell_support = []
-                            n_pass_total = 0
-                            n_req_total = 0
-                            n_amp_total = 0
-                            n_block_amp_total = 0
-                            n_som_amp_total = 0
-
-                            for arm, prof in loh_profiles.items():
-                                variants = arm_var_lists[arm]
-                                cell_vals = state.df.loc[bc_str, variants].values.astype(float)
-                                score = _score_cell_against_loh_profile_ado_tolerant(
-                                    cell_vals,
-                                    prof,
-                                    variants,
-                                    v2a=v2a,
-                                    cfg=cfg,
-                                    low_af=low_af,
-                                    high_af=high_af,
-                                )
-                                n_pass_total += int(score["n_pass_amplicons"])
-                                n_req_total += int(score["n_required_amplicons"])
-                                n_amp_total += int(score["n_total_amplicons"])
-                                n_block_amp_total += int(score.get("n_total_block_amplicons", score["n_total_amplicons"]))
-                                n_som_amp_total += int(score.get("n_somatic_excluded_amplicons", 0))
-                                cell_support.append(float(score["amp_support_frac"]))
-                                if np.isfinite(score["r"]):
-                                    cell_rs.append(float(score["r"]))
-
-                            avg_r = float(np.mean(cell_rs)) if cell_rs else np.nan
-                            avg_support = float(np.mean(cell_support)) if cell_support else 0.0
-                            support_ok = n_pass_total >= n_req_total and n_req_total > 0
-                            corr_ok = (
-                                np.isfinite(avg_r) and avg_r >= pc_min_r
-                            ) or (
-                                bool(getattr(cfg, "phase4_rescue_allow_amplicon_support_without_corr", False))
-                                and support_ok
-                            )
-
-                            rescue_tuple = (
-                                bc_str, avg_r, avg_support, n_pass_total, n_req_total,
-                                n_amp_total, n_block_amp_total, n_som_amp_total,
-                            )
-                            if support_ok and corr_ok:
-                                rescued.append(rescue_tuple)
-                            else:
-                                not_rescued.append(rescue_tuple)
-
-                        if rescued:
-                            for bc_str, r_val, support_val, n_pass, n_req, n_amp, n_block_amp, n_som_amp in rescued:
-                                som_txt = ""
-                                if n_som_amp > 0 or n_block_amp > n_amp:
-                                    som_txt = f" excluding_somatic={n_som_amp}amp/{max(n_block_amp, n_amp)}block_amp"
-                                vprint(
-                                    f"      {_GREEN}✓ {bc_str}: r={fmt_float(r_val)}, "
-                                    f"amp_support={n_pass}/{n_amp} required≥{n_req}"
-                                    f"{som_txt} ({support_val:.0%}) → {loh_lbl}{_RESET}",
-                                    cfg,
-                                )
-
-                            clone_arr = state.Sample.dna.row_attrs["Clone"]
-                            barcode_arr = pd.Series(state.Sample.dna.row_attrs["barcode"]).astype(str).values
-
-                            for bc_str, *_ in rescued:
-                                mask = barcode_arr == bc_str
-                                if mask.any():
-                                    clone_arr[mask] = loh_lbl
-
-                            state.Sample.dna.row_attrs["Clone"] = clone_arr
-
-                            rescued_bcs = [bc for bc, *_ in rescued]
-                            rescued_set = set(map(str, rescued_bcs))
-
-                            state.clone_to_cells[loh_lbl] = list(
-                                set(list(loh_cells) + rescued_bcs)
-                            )
-
-                            remaining = [
-                                bc for bc in non_loh_cells
-                                if str(bc) not in rescued_set
-                            ]
-                            if remaining:
-                                state.clone_to_cells[non_loh_lbl] = remaining
-                            elif non_loh_lbl in state.clone_to_cells:
-                                del state.clone_to_cells[non_loh_lbl]
-
-                            vprint(
-                                f"    Per-cell rescue: {_GREEN}{len(rescued)} cell(s) → {loh_lbl}{_RESET}, "
-                                f"{len(remaining)} cell(s) remain in {non_loh_lbl}",
-                                cfg,
-                            )
-                            merges_done += 1
-
-                            # Important: a partial per-cell rescue should not
-                            # terminate testing for this base genotype.  Keep
-                            # checking the remaining cells against other same-base
-                            # LOH clones, e.g. chr12q first and then chr4q.
-                            non_loh_cells = remaining
-
-                            if len(non_loh_cells) < min_size:
-                                vprint(
-                                    f"    Remaining non-LOH cells below min size "
-                                    f"({len(non_loh_cells)} < {min_size}); stop checking this clone.",
-                                    cfg,
-                                )
-                                break
-
-                            continue
-                        else:
-                            vprint("      No cells passed per-cell rescue.", cfg)
-
-                elif cfg.phase4_percell_rescue:
-                    vprint(
-                        f"    Per-cell rescue skipped: no similarity hint "
-                        f"(mean_r={fmt_float(mean_r)} < {hint_mean_r}, "
-                        f"max_arm_r={fmt_float(max_arm_r)} < {hint_any_arm_r})",
-                        cfg,
-                    )
-
-                merges_skipped += 1
-
-    # Phase 4c pooled rescue and Phase 4c-ii arm expansion were removed.
-    # They are intentionally not called because they can inflate small seeds
-    # into broad false-positive LOH subclones.
-
-    # ── Phase 4b: WT/Het → Hem/Hom ADO check ─────────────────────────
-    ado_removed = _het_ado_check(state, cfg)
-
-    # ── Refresh before end-of-phase diagnostics ───────────────────────
-    # Phase 4 may have changed clone labels through full-clone merge,
-    # per-cell rescue, and/or ADO relabelling. Refresh unconditionally when
-    # anything changed so cross-LOH similarity uses the final Phase 4 state.
-    if merges_done > 0 or ado_removed > 0:
-        vprint(f"\n  Refreshing state after Phase 4 updates ...", cfg)
-        state.refresh()
-
-    # ── Phase 4c: Cross-LOH clone similarity diagnostic ───────────────
-    phase4_cross_loh_similarity = _cross_loh_clone_similarity_check(
-        state=state,
-        cfg=cfg,
-        LOH_TAG=LOH_TAG,
-        arm_variants_fn=arm_variants,
-        extract_chr_arms_fn=extract_chr_arms,
-        low_af=low_af,
-        high_af=high_af,
+    avg_r = float(np.mean(cell_rs)) if cell_rs else np.nan
+    avg_support = float(np.mean(cell_support)) if cell_support else 0.0
+    support_ok = n_pass_total >= n_req_total and n_req_total > 0
+    corr_ok = (
+        np.isfinite(avg_r) and avg_r >= pc_min_r
+    ) or (
+        bool(getattr(cfg, "phase4_rescue_allow_amplicon_support_without_corr", False))
+        and support_ok
     )
-    state.results["phase4_cross_loh_similarity"] = phase4_cross_loh_similarity
 
-    # ── Phase 4d: iterative cell-level reassignment to a fixed point ───
+    rescue_tuple = (
+        bc_str, avg_r, avg_support, n_pass_total, n_req_total,
+        n_amp_total, n_block_amp_total, n_som_amp_total,
+    )
+    return rescue_tuple, bool(support_ok and corr_ok)
+
+
+def _iterative_cell_level_reassignment(
+    state,
+    cfg,
+    *,
+    low_af: float,
+    high_af: float,
+) -> int:
+    """Run Phase 4d cell-level reassignment repeatedly until no cell moves (Phase 4d).
+
+    Each pass calls ``_merge_small_loh_clones_after_annotation`` with profiles
+    rebuilt from the previous pass. Stops on convergence (0 reassignments), on
+    a recurring full label state (when cycle detection is on), or after
+    ``phase4_cell_merge_max_iters`` passes (1 pass when iteration is off).
+    Writes ``phase4_small_loh_merge``, ``phase4_cell_assignment_iterations``
+    and ``phase4_cell_assignment_convergence`` to ``state.results`` and returns
+    the total number of reassigned cells over all non-final passes.
+    """
     # Every pass rebuilds target profiles using the labels from the preceding
     # pass. This lets clone centroids become progressively better defined while
     # retaining an explicit convergence cap and cycle detection safeguard.
@@ -3773,12 +2832,414 @@ def run_phase4(
                 cfg,
             )
 
+    return small_loh_cells_merged
+
+
+def run_phase4(
+    state: "PipelineState",
+    cfg: "LOHConfig | None" = None,
+) -> dict:
+    """
+    Run Phase 4: reconcile LOH clones with same-base non-LOH clones and clean up cells.
+
+    Parameters
+    ----------
+    state : PipelineState
+        Pipeline state after Phase 3. Mutated in place: ``Sample.dna.row_attrs
+        ["Clone"]``, ``clone_to_cells``, ``df`` / ``df_numeric`` (ADO cells are
+        dropped), ``clone_block_variants`` and ``results``.
+    cfg : LOHConfig, optional
+        Configuration; defaults to ``state.config``.
+
+    Returns
+    -------
+    dict
+        ``state.results`` (the same object), with the keys
+        ``phase4_cross_loh_similarity``, ``phase4_small_loh_merge``,
+        ``phase4_cell_assignment_iterations``,
+        ``phase4_cell_assignment_convergence`` and, when it produced rows,
+        ``phase4_final_residual_refinement``. If there are no active LOH
+        clones, or no non-LOH clone with ``>= min_final_clone_size`` cells,
+        it returns immediately after printing a message and changes nothing.
+
+    Notes
+    -----
+    Steps, in order:
+
+    * **4a clone-level merge.** Non-LOH clones (largest first) are compared to
+      each same-base LOH clone. Per LOH arm with ``>= 2`` variants and ``>= 2``
+      cells on each side, the two clone-mean AF profiles are correlated
+      (Pearson; constant profiles skipped) and the non-LOH clone's mean
+      extreme-AF fraction (``<= low_allele_threshold`` or
+      ``>= high_allele_threshold``; NaN counted as non-extreme) is computed.
+      Mean r ``>= correlation_threshold`` (0.80) and mean extreme fraction
+      ``>= merge_min_extreme_frac`` (0.85) relabels the whole clone.
+    * **4a per-cell rescue.** Otherwise, if ``phase4_percell_rescue`` and
+      (r passes, or mean r ``>= phase4_percell_trigger_mean_corr`` (0.70), or
+      any arm r ``>= phase4_percell_trigger_any_arm_corr`` (0.85)), each cell
+      is scored amplicon-by-amplicon over the LOH block
+      (``_score_cell_against_loh_profile_ado_tolerant``); passing cells move
+      and the remaining cells continue against the next same-base LOH clone.
+    * **4b** ``_het_ado_check``, **4c** ``_cross_loh_clone_similarity_check``
+      (diagnostic only), **4d** ``_iterative_cell_level_reassignment`` and
+      **4f** ``_final_refine_remaining_base_clones``.
+    """
+    if cfg is None:
+        cfg = state.config
+
+    min_size = cfg.min_final_clone_size
+    corr_thresh = cfg.correlation_threshold
+    extreme_thresh = cfg.merge_min_extreme_frac
+    low_af = cfg.low_allele_threshold
+    high_af = cfg.high_allele_threshold
+
+    vprint("\n" + "=" * 60, cfg)
+    vprint("PHASE 4: Non-LOH ↔ LOH Clone Correlation & Merge", cfg)
+    vprint("=" * 60, cfg)
+
+    # ── Identify LOH and non-LOH clones ───────────────────────────────
+    loh_clones = {
+        lbl: cells
+        for lbl, cells in state.clone_to_cells.items()
+        if _is_active_loh(lbl) and len(cells) > 0
+    }
+    non_loh_clones = {
+        lbl: cells
+        for lbl, cells in state.clone_to_cells.items()
+        if _is_active_non_loh(lbl) and len(cells) >= min_size
+    }
+
+    if not loh_clones:
+        vprint("  No LOH clones found — nothing to check.", cfg)
+        vprint("=" * 60 + "\n", cfg)
+        return state.results
+
+    if not non_loh_clones:
+        vprint("  No non-LOH clones (≥ min size) to check.", cfg)
+        vprint("=" * 60 + "\n", cfg)
+        return state.results
+
+    # ── Build base-name index for LOH clones ──────────────────────────
+    # base_name → list of (loh_label, arms)
+    loh_by_base: dict[str, list[tuple[str, list[str]]]] = {}
+    for lbl in loh_clones:
+        base = _get_base_name(lbl, LOH_TAG)
+        arms = extract_chr_arms(lbl)
+        loh_by_base.setdefault(base, []).append((lbl, arms))
+
+    vprint(f"\n  LOH clones:     {len(loh_clones)}", cfg)
+    vprint(f"  Non-LOH clones: {len(non_loh_clones)}  (≥ {min_size} cells)", cfg)
+    vprint(f"  LOH base names: {sorted(loh_by_base.keys())}", cfg)
+    vprint(
+        f"  Merge requires: r ≥ {corr_thresh}  AND  extreme fraction ≥ {extreme_thresh}",
+        cfg,
+    )
+
+    # ── Check each non-LOH clone ──────────────────────────────────────
+    merges_done = 0
+    merges_skipped = 0
+
+    for non_loh_lbl, non_loh_cells in sorted(
+        non_loh_clones.items(), key=lambda kv: -len(kv[1])
+    ):
+        base = _get_base_name(non_loh_lbl, LOH_TAG)
+
+        if base not in loh_by_base:
+            vprint(
+                f"\n  {non_loh_lbl}  ({len(non_loh_cells)} cells)"
+                f"  — no matching LOH clone, skip.",
+                cfg,
+            )
+            continue
+
+        vprint(
+            f"\n  {non_loh_lbl}  ({len(non_loh_cells)} cells)"
+            f"  — checking against LOH clone(s):",
+            cfg,
+        )
+
+        # Try each matching LOH clone
+        for loh_lbl, loh_arms in loh_by_base[base]:
+            loh_cells = state.clone_to_cells[loh_lbl]
+
+            vprint(
+                f"    vs {loh_lbl}  ({len(loh_cells)} cells, "
+                f"arms: {', '.join(loh_arms)})",
+                cfg,
+            )
+
+            # Compute correlation AND extreme fraction on each LOH arm
+            arm_corrs = []
+            arm_extremes = []
+            for arm in loh_arms:
+                variants = arm_variants(arm, state)
+                if len(variants) < 2:
+                    vprint(f"      {arm}: < 2 variants, skip", cfg)
+                    continue
+
+                loh_barcodes = [str(bc) for bc in loh_cells if str(bc) in state.df.index]
+                non_loh_barcodes = [str(bc) for bc in non_loh_cells if str(bc) in state.df.index]
+
+                if len(loh_barcodes) < 2 or len(non_loh_barcodes) < 2:
+                    vprint(
+                        f"      {arm}: too few cells in df "
+                        f"(LOH={len(loh_barcodes)}, non-LOH={len(non_loh_barcodes)})",
+                        cfg,
+                    )
+                    continue
+
+                loh_profile = state.df.loc[loh_barcodes, variants].mean(axis=0).values
+                non_loh_profile = state.df.loc[non_loh_barcodes, variants].mean(axis=0).values
+
+                # Check for constant profiles (would give NaN correlation)
+                if np.std(loh_profile) < _FLAT_PROFILE_SD or np.std(non_loh_profile) < _FLAT_PROFILE_SD:
+                    vprint(f"      {arm}: constant profile, skip", cfg)
+                    continue
+
+                r, p = pearsonr(loh_profile, non_loh_profile)
+                arm_corrs.append((arm, r, p))
+
+                non_loh_vals = state.df.loc[non_loh_barcodes, variants].values
+                extreme_mask = (non_loh_vals <= low_af) | (non_loh_vals >= high_af)
+                per_cell_extreme = np.nanmean(extreme_mask, axis=1)
+                clone_extreme_frac = float(np.nanmean(per_cell_extreme))
+                arm_extremes.append((arm, clone_extreme_frac))
+
+                vprint(
+                    f"      {arm}: r = {fmt_float(r)},  p = {fmt_float(p)}"
+                    f"  |  extreme frac = {clone_extreme_frac:.3f}",
+                    cfg,
+                )
+
+            if not arm_corrs:
+                vprint(f"    → No valid correlations, skip.", cfg)
+                merges_skipped += 1
+                continue
+
+            # Use mean correlation across arms
+            mean_r = np.mean([r for _, r, _ in arm_corrs])
+            # Use mean extreme fraction across arms
+            mean_extreme = np.mean([ef for _, ef in arm_extremes]) if arm_extremes else 0.0
+
+            vprint(
+                f"    → Mean r = {fmt_float(mean_r)}  (threshold = {corr_thresh})"
+                f"  |  Mean extreme frac = {mean_extreme:.3f}  (threshold = {extreme_thresh})",
+                cfg,
+            )
+
+            passes_corr = mean_r >= corr_thresh
+            passes_extreme = mean_extreme >= extreme_thresh
+
+            # "Hint of similarity" trigger for per-cell rescue
+            hint_mean_r = float(getattr(cfg, "phase4_percell_trigger_mean_corr", 0.35))
+            hint_any_arm_r = float(getattr(cfg, "phase4_percell_trigger_any_arm_corr", 0.75))
+
+            arm_r_values = [float(r) for _, r, _ in arm_corrs if np.isfinite(r)]
+            max_arm_r = max(arm_r_values) if arm_r_values else float("-inf")
+
+            has_similarity_hint = (
+                (np.isfinite(mean_r) and mean_r >= hint_mean_r)
+                or (np.isfinite(max_arm_r) and max_arm_r >= hint_any_arm_r)
+            )
+
+            if passes_corr and passes_extreme:
+                # ── MERGE ───────────────────────────────────────────
+                vprint(
+                    f"    {_GREEN}✓ MERGE: {non_loh_lbl} → {loh_lbl}{_RESET}  "
+                    f"({len(non_loh_cells)} cells)",
+                    cfg,
+                )
+
+                clone_arr = state.Sample.dna.row_attrs["Clone"]
+                barcode_arr = pd.Series(state.Sample.dna.row_attrs["barcode"]).astype(str).values
+
+                for bc in non_loh_cells:
+                    mask = barcode_arr == str(bc)
+                    if mask.any():
+                        clone_arr[mask] = loh_lbl
+
+                state.Sample.dna.row_attrs["Clone"] = clone_arr
+
+                state.clone_to_cells[loh_lbl] = list(set(list(loh_cells) + list(non_loh_cells)))
+                if non_loh_lbl in state.clone_to_cells:
+                    del state.clone_to_cells[non_loh_lbl]
+
+                merges_done += 1
+                break
+            else:
+                reasons = []
+                if not passes_corr:
+                    reasons.append(f"r={fmt_float(mean_r)} < {corr_thresh}")
+                if not passes_extreme:
+                    reasons.append(f"extreme={mean_extreme:.3f} < {extreme_thresh}")
+                vprint(f"    {_RED}✗ No merge: {'; '.join(reasons)}{_RESET}", cfg)
+
+                # ── Per-cell rescue ────────────────────────────────
+                if cfg.phase4_percell_rescue and (passes_corr or has_similarity_hint):
+                    if not passes_corr and has_similarity_hint:
+                        vprint(
+                            f"    Per-cell rescue triggered by similarity hint "
+                            f"(mean_r={fmt_float(mean_r)}, max_arm_r={fmt_float(max_arm_r)}; "
+                            f"hint thresholds: mean≥{hint_mean_r}, any-arm≥{hint_any_arm_r})",
+                            cfg,
+                        )
+
+                    pc_min_r = cfg.phase4_percell_min_corr
+                    pc_min_ef = cfg.phase4_percell_min_extreme
+                    allowed_msg = getattr(cfg, "phase4_rescue_max_ado_amplicons", 1)
+                    vprint(
+                        f"    Per-cell rescue: block-aware, r ≥ {pc_min_r}, "
+                        f"allow ≤{allowed_msg} non-supporting/ADO amplicon(s) per block",
+                        cfg,
+                    )
+
+                    loh_profiles: dict[str, np.ndarray] = {}
+                    arm_var_lists: dict[str, list[str]] = {}
+                    v2a = _build_variant_to_amplicon(state)
+
+                    for arm in loh_arms:
+                        variants = _rescue_variants_for_clone_arm(loh_lbl, arm, state, cfg, arm_variants)
+                        if len(variants) < 2:
+                            continue
+                        loh_bcs = [str(bc) for bc in loh_cells if str(bc) in state.df.index]
+                        if len(loh_bcs) < 2:
+                            continue
+                        prof = state.df.loc[loh_bcs, variants].mean(axis=0).values.astype(float)
+                        # Do not skip constant profiles: a true LOW/HIGH block can be constant.
+                        loh_profiles[arm] = prof
+                        arm_var_lists[arm] = variants
+
+                    if loh_profiles:
+                        rescued: list[tuple[str, float, float, int, int, int, int, int]] = []
+
+                        for bc in non_loh_cells:
+                            bc_str = str(bc)
+                            if bc_str not in state.df.index:
+                                continue
+                            rescue_tuple, passes = _percell_rescue_score(
+                                bc_str,
+                                loh_profiles,
+                                arm_var_lists,
+                                state=state,
+                                cfg=cfg,
+                                v2a=v2a,
+                                low_af=low_af,
+                                high_af=high_af,
+                                pc_min_r=pc_min_r,
+                            )
+                            if passes:
+                                rescued.append(rescue_tuple)
+
+                        if rescued:
+                            for bc_str, r_val, support_val, n_pass, n_req, n_amp, n_block_amp, n_som_amp in rescued:
+                                som_txt = ""
+                                if n_som_amp > 0 or n_block_amp > n_amp:
+                                    som_txt = f" excluding_somatic={n_som_amp}amp/{max(n_block_amp, n_amp)}block_amp"
+                                vprint(
+                                    f"      {_GREEN}✓ {bc_str}: r={fmt_float(r_val)}, "
+                                    f"amp_support={n_pass}/{n_amp} required≥{n_req}"
+                                    f"{som_txt} ({support_val:.0%}) → {loh_lbl}{_RESET}",
+                                    cfg,
+                                )
+
+                            clone_arr = state.Sample.dna.row_attrs["Clone"]
+                            barcode_arr = pd.Series(state.Sample.dna.row_attrs["barcode"]).astype(str).values
+
+                            for bc_str, *_ in rescued:
+                                mask = barcode_arr == bc_str
+                                if mask.any():
+                                    clone_arr[mask] = loh_lbl
+
+                            state.Sample.dna.row_attrs["Clone"] = clone_arr
+
+                            rescued_bcs = [bc for bc, *_ in rescued]
+                            rescued_set = set(map(str, rescued_bcs))
+
+                            state.clone_to_cells[loh_lbl] = list(
+                                set(list(loh_cells) + rescued_bcs)
+                            )
+
+                            remaining = [
+                                bc for bc in non_loh_cells
+                                if str(bc) not in rescued_set
+                            ]
+                            if remaining:
+                                state.clone_to_cells[non_loh_lbl] = remaining
+                            elif non_loh_lbl in state.clone_to_cells:
+                                del state.clone_to_cells[non_loh_lbl]
+
+                            vprint(
+                                f"    Per-cell rescue: {_GREEN}{len(rescued)} cell(s) → {loh_lbl}{_RESET}, "
+                                f"{len(remaining)} cell(s) remain in {non_loh_lbl}",
+                                cfg,
+                            )
+                            merges_done += 1
+
+                            # Important: a partial per-cell rescue should not
+                            # terminate testing for this base genotype.  Keep
+                            # checking the remaining cells against other same-base
+                            # LOH clones, e.g. chr12q first and then chr4q.
+                            non_loh_cells = remaining
+
+                            if len(non_loh_cells) < min_size:
+                                vprint(
+                                    f"    Remaining non-LOH cells below min size "
+                                    f"({len(non_loh_cells)} < {min_size}); stop checking this clone.",
+                                    cfg,
+                                )
+                                break
+
+                            continue
+                        else:
+                            vprint("      No cells passed per-cell rescue.", cfg)
+
+                elif cfg.phase4_percell_rescue:
+                    vprint(
+                        f"    Per-cell rescue skipped: no similarity hint "
+                        f"(mean_r={fmt_float(mean_r)} < {hint_mean_r}, "
+                        f"max_arm_r={fmt_float(max_arm_r)} < {hint_any_arm_r})",
+                        cfg,
+                    )
+
+                merges_skipped += 1
+
+    # Phase 4c pooled rescue and Phase 4c-ii arm expansion were removed.
+    # They are intentionally not called because they can inflate small seeds
+    # into broad false-positive LOH subclones.
+
+    # ── Phase 4b: WT/Het → Hem/Hom ADO check ─────────────────────────
+    ado_removed = _het_ado_check(state, cfg)
+
+    # ── Refresh before end-of-phase diagnostics ───────────────────────
+    # Phase 4 may have changed clone labels through full-clone merge,
+    # per-cell rescue, and/or ADO relabelling. Refresh unconditionally when
+    # anything changed so cross-LOH similarity uses the final Phase 4 state.
+    if merges_done > 0 or ado_removed > 0:
+        vprint(f"\n  Refreshing state after Phase 4 updates ...", cfg)
+        state.refresh()
+
+    # ── Phase 4c: Cross-LOH clone similarity diagnostic ───────────────
+    phase4_cross_loh_similarity = _cross_loh_clone_similarity_check(
+        state=state,
+        cfg=cfg,
+        LOH_TAG=LOH_TAG,
+        arm_variants_fn=arm_variants,
+        extract_chr_arms_fn=extract_chr_arms,
+        low_af=low_af,
+        high_af=high_af,
+    )
+    state.results["phase4_cross_loh_similarity"] = phase4_cross_loh_similarity
+
+    # ── Phase 4d: iterative cell-level reassignment to a fixed point ───
+    small_loh_cells_merged = _iterative_cell_level_reassignment(
+        state, cfg, low_af=low_af, high_af=high_af,
+    )
+
     if small_loh_cells_merged > 0:
         merges_done += small_loh_cells_merged
 
     # Legacy Phase 4e residual discovery is intentionally not run here.
     # Phase 4f below is the single conservative residual-base validation pass.
-    residual_new_cells = 0
 
     # ── Phase 4f: final residual signature refinement before Phase 5 ───
     final_refinement = _final_refine_remaining_base_clones(state, cfg)
@@ -3807,7 +3268,7 @@ def run_phase4(
     if small_loh_cells_merged > 0:
         vprint(f"  Small LOH cells merged into larger LOH clones: {small_loh_cells_merged}", cfg)
 
-    if merges_done > 0 or ado_removed > 0 or small_loh_cells_merged > 0 or residual_new_cells > 0 or final_refinement_cells > 0:
+    if merges_done > 0 or ado_removed > 0 or small_loh_cells_merged > 0 or final_refinement_cells > 0:
         vprint(
             f"  LOH clones after:  {len([l for l in state.clone_to_cells if _is_active_loh(l)])}  "
             f"({state.loh_cell_count()} cells)",

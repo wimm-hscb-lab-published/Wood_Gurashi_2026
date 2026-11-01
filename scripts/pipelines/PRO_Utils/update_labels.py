@@ -1,3 +1,15 @@
+"""Copy cell labels from an annotation table onto a Sample's protein assay.
+
+Main entry point
+----------------
+update_protein_labels_from_dataframe
+    Match cells by barcode and write ``Sample.protein.row_attrs[target_attr]``.
+"""
+
+from __future__ import annotations
+
+import sys
+
 import numpy as np
 import pandas as pd
 
@@ -10,42 +22,55 @@ def update_protein_labels_from_dataframe(
     target_attr: str = 'label',
     verbose: bool = True
 ) -> None:
-    """
-    Update Sample.protein.row_attrs with labels from an annotation dataframe.
-    Matches cells by barcode.
+    """Update ``Sample.protein.row_attrs`` with labels from an annotation table.
+
+    Cells are matched by barcode. Cells absent from ``anno_df`` keep their
+    current ``target_attr`` value when that row attribute already exists, and
+    are set to ``'Unknown'`` otherwise.
 
     Parameters
     ----------
     Sample : object
-        Sample object with protein attribute
+        Sample object with a ``protein`` assay.
     anno_df : pd.DataFrame
-        DataFrame containing barcodes and labels.
-        If barcode_col is None, assumes barcodes are in the index.
+        Table of barcodes and labels. If ``barcode_col`` is None the index is
+        used as barcodes.
     barcode_col : str, optional
-        Name of column containing barcodes in anno_df.
-        If None, uses the index.
+        Column of ``anno_df`` holding barcodes; None uses the index.
     label_col : str
-        Name of column containing labels in anno_df (default: 'label')
+        Column of ``anno_df`` holding labels (default ``'label'``).
     target_attr : str
-        Name of attribute to update in Sample.protein.row_attrs (default: 'label')
+        Row attribute of ``Sample.protein`` to write (default ``'label'``).
     verbose : bool
-        Print progress messages
+        Print progress, matching statistics and the label distribution.
 
     Returns
     -------
     None
-        Updates Sample.protein.row_attrs[target_attr] in place
+        ``Sample.protein.row_attrs[target_attr]`` is replaced in place via
+        ``add_row_attr``.
 
-    Example
-    -------
+    Raises
+    ------
+    ValueError
+        If ``barcode_col`` (when given) or ``label_col`` is not a column of
+        ``anno_df``.
+
+    Notes
+    -----
+    The barcode → label mapping is built with ``dict(zip(...))``, so for
+    duplicated barcodes in ``anno_df`` the last occurrence wins. The matched /
+    not-matched percentages are computed even when ``verbose=False``, so an
+    assay with zero cells raises ``ZeroDivisionError``.
+
+    Examples
+    --------
     >>> update_protein_labels_from_dataframe(
     ...     Sample=Sample,
     ...     anno_df=pro_df_anno,
     ...     label_col='label'
     ... )
     """
-    import sys
-
     def vprint(msg):
         if verbose:
             print(msg)
@@ -55,7 +80,6 @@ def update_protein_labels_from_dataframe(
     vprint("UPDATING PROTEIN LABELS FROM DATAFRAME")
     vprint("=" * 60)
 
-    # Get barcodes from annotation dataframe
     if barcode_col is None:
         anno_barcodes = anno_df.index.values
         vprint("  Using index as barcodes")
@@ -65,7 +89,6 @@ def update_protein_labels_from_dataframe(
         anno_barcodes = anno_df[barcode_col].values
         vprint(f"  Using column '{barcode_col}' as barcodes")
 
-    # Get labels from annotation dataframe
     if label_col not in anno_df.columns:
         raise ValueError(f"Column '{label_col}' not found in anno_df")
     anno_labels = anno_df[label_col].values
@@ -73,14 +96,11 @@ def update_protein_labels_from_dataframe(
     vprint(f"  Annotation dataframe: {anno_df.shape[0]} cells")
     vprint(f"  Unique labels in dataframe: {len(np.unique(anno_labels))}")
 
-    # Get barcodes from Sample.protein
     protein_barcodes = np.array(Sample.protein.barcodes())
     vprint(f"\n  Sample.protein: {len(protein_barcodes)} cells")
 
-    # Create mapping dictionary
     anno_dict = dict(zip(anno_barcodes, anno_labels))
 
-    # Map labels to protein barcodes
     new_labels = []
     n_matched = 0
     n_missing = 0
@@ -90,6 +110,7 @@ def update_protein_labels_from_dataframe(
             new_labels.append(anno_dict[bc])
             n_matched += 1
         else:
+            # Unmatched cells keep their existing label when there is one.
             if target_attr in Sample.protein.row_attrs:
                 existing_label = Sample.protein.row_attrs[target_attr][
                     protein_barcodes == bc
@@ -105,12 +126,10 @@ def update_protein_labels_from_dataframe(
     vprint(f"    Matched: {n_matched} cells ({100 * n_matched / len(protein_barcodes):.1f}%)")
     vprint(f"    Not matched: {n_missing} cells ({100 * n_missing / len(protein_barcodes):.1f}%)")
 
-    # Update Sample.protein.row_attrs
     Sample.protein.add_row_attr(target_attr, new_labels)
 
     vprint(f"\n  ✓ Updated Sample.protein.row_attrs['{target_attr}']")
 
-    # Print label distribution
     unique_labels, counts = np.unique(new_labels, return_counts=True)
     vprint(f"\n  Label distribution:")
     for label, count in sorted(zip(unique_labels, counts), key=lambda x: -x[1]):

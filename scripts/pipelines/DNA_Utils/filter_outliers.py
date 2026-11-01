@@ -6,12 +6,19 @@ default) in ``clone_variant_calls``. Cells from WT, missing, ADO, FP, small,
 or unrelated clones are excluded from that variant's AF distribution. Variant
 IDs are matched on their canonical chr:pos:ref/alt key, so a leading gene
 prefix (e.g. ``TP53:chr17:7577539:G/A``) matches a bare ``chr17:7577539:G/A``.
+
+Main entry point: :func:`filter_somatic_variant_outliers` (DP filter, per-clone
+mean ± k·SD AF filter, jitter plots, audit CSVs and kept-barcode files).
 """
 
+from __future__ import annotations
+
 import os
+import re
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 
@@ -37,20 +44,6 @@ def _canonical_variant_key(v) -> str:
         if tok.lower().startswith("chr"):
             return ":".join(parts[i:])
     return s
-
-
-def _is_het_clone_call(value) -> bool:
-    """Return True only for heterozygous clone-level genotype calls."""
-    if pd.isna(value):
-        return False
-
-    value = str(value).strip().lower()
-
-    return (
-        value.startswith("het")
-        or value.startswith("heterozygous")
-        or value in {"0/1", "1/0"}
-    )
 
 
 def _clone_call_matches(value, accepted=("het", "hom")) -> bool:
@@ -91,11 +84,16 @@ def _prepare_clone_variant_calls(
 ) -> pd.DataFrame:
     """Return clone-level genotype calls indexed by canonical variant key.
 
-    The variant column is located by whitespace-normalised name, so a wrapped
-    header like 'Variant\\nname' still matches variant_column='Variant name'.
-    """
-    import re
+    The variant column is located by whitespace-normalised, case-insensitive
+    name, so a wrapped header like 'Variant\\nname' still matches
+    variant_column='Variant name'. If no column matches, the existing index
+    (as strings) is used. The input is copied, not modified.
 
+    Raises
+    ------
+    TypeError
+        If ``clone_variant_calls`` is not a DataFrame.
+    """
     if not isinstance(clone_variant_calls, pd.DataFrame):
         raise TypeError("clone_variant_calls must be a pandas DataFrame.")
 
@@ -127,7 +125,21 @@ def _ensure_barcode_index(
     df_DP: pd.DataFrame,
     Sample,
 ):
-    """Use Sample.dna barcodes when extracted matrices have positional indices."""
+    """Give ``df_AF`` / ``df_DP`` barcode (string) row indices.
+
+    * Same length as ``Sample.dna`` and an integer index or no barcode match:
+      the DNA barcodes are assigned positionally.
+    * Otherwise, an integer index is mapped position → barcode (unknown
+      positions become their string form).
+    * Otherwise the index is cast to ``str``.
+
+    Copies are returned; inputs are not modified.
+
+    Raises
+    ------
+    ValueError
+        If ``df_AF`` is empty.
+    """
     dna_barcodes = pd.Index(
         np.asarray(Sample.dna.row_attrs["barcode"]).astype(str)
     )
@@ -179,6 +191,147 @@ def _ensure_barcode_index(
     return df_AF, df_DP
 
 
+def _get_het_clone_barcodes_by_variant(
+    Sample,
+    differential_variants,
+    clone_variant_calls: pd.DataFrame,
+    variant_column: str = "Variant name",
+    eligible_genotypes=("het", "hom"),
+):
+    """Identify clone labels and barcodes eligible for each variant.
+
+    A clone is eligible for a variant if its call matches one of
+    ``eligible_genotypes`` (Het and Hom by default). Only columns in
+    ``clone_variant_calls`` that are active labels in ``Sample.dna`` are
+    considered clone columns, so table-only summary columns such as
+    ``Missing GT clones (3)`` and ``Small subclones (7)`` are excluded
+    automatically. Variants are matched on their canonical chr:pos:ref/alt key;
+    with duplicate rows for one key a clone is eligible if any row matches.
+
+    Returns
+    -------
+    eligible_barcodes_by_variant : dict[str, set[str]]
+    het_clones_by_variant : dict[str, list[str]]
+        Eligible clone labels, in clone-table column order.
+    audit : pd.DataFrame
+        One row per variant: ``variant``, ``status`` (``ok``,
+        ``no_carrier_clone_barcodes`` or ``missing_from_clone_variant_calls``),
+        ``het_clones``, ``n_het_clones``, ``n_het_clone_barcodes``.
+
+    Raises
+    ------
+    ValueError
+        If no clone-table column matches a label of ``Sample.dna``.
+    """
+    calls = _prepare_clone_variant_calls(
+        clone_variant_calls=clone_variant_calls,
+        variant_column=variant_column,
+    )
+
+    sample_clone_labels = {
+        str(label)
+        for label in Sample.dna.get_labels()
+        if pd.notna(label) and str(label).strip() != ""
+    }
+
+    clone_columns = [
+        column
+        for column in calls.columns
+        if str(column) in sample_clone_labels
+    ]
+
+    if len(clone_columns) == 0:
+        raise ValueError(
+            "No clone columns in clone_variant_calls match labels in "
+            "Sample.dna.get_labels(). Ensure clone-table column names match "
+            "the labels stored in Sample.dna."
+        )
+
+    clone_barcodes = {}
+
+    for column in clone_columns:
+        clone_label = str(column)
+
+        clone_barcodes[clone_label] = {
+            str(barcode)
+            for barcode in Sample.dna.barcodes({clone_label})
+        }
+
+    eligible_barcodes_by_variant = {}
+    het_clones_by_variant = {}
+    audit_records = []
+
+    for variant in map(str, differential_variants):
+        key = _canonical_variant_key(variant)
+
+        if key not in calls.index:
+            eligible_barcodes_by_variant[variant] = set()
+            het_clones_by_variant[variant] = []
+
+            audit_records.append(
+                {
+                    "variant": variant,
+                    "status": "missing_from_clone_variant_calls",
+                    "het_clones": "",
+                    "n_het_clones": 0,
+                    "n_het_clone_barcodes": 0,
+                }
+            )
+
+            continue
+
+        variant_calls = calls.loc[key]
+
+        # Handle duplicate variant rows safely:
+        # a clone is eligible if any matching row carries the variant.
+        if isinstance(variant_calls, pd.DataFrame):
+            is_het_by_clone = {
+                column: variant_calls[column].map(
+                    lambda x: _clone_call_matches(x, eligible_genotypes)
+                ).any()
+                for column in clone_columns
+            }
+        else:
+            is_het_by_clone = {
+                column: _clone_call_matches(variant_calls[column], eligible_genotypes)
+                for column in clone_columns
+            }
+
+        het_clones = [
+            str(column)
+            for column in clone_columns
+            if is_het_by_clone[column]
+        ]
+
+        eligible_barcodes = set()
+
+        for clone_label in het_clones:
+            eligible_barcodes.update(clone_barcodes[clone_label])
+
+        eligible_barcodes_by_variant[variant] = eligible_barcodes
+        het_clones_by_variant[variant] = het_clones
+
+        audit_records.append(
+            {
+                "variant": variant,
+                "status": (
+                    "ok"
+                    if len(eligible_barcodes) > 0
+                    else "no_carrier_clone_barcodes"
+                ),
+                "het_clones": ";".join(het_clones),
+                "n_het_clones": len(het_clones),
+                "n_het_clone_barcodes": len(eligible_barcodes),
+            }
+        )
+
+    return (
+        eligible_barcodes_by_variant,
+        het_clones_by_variant,
+        pd.DataFrame(audit_records),
+    )
+
+
 def _jitter_plot_by_label(
     df: pd.DataFrame,
     y_col: str,
@@ -196,7 +349,14 @@ def _jitter_plot_by_label(
     filename_suffix: str = "",
     show_plot: bool = True,
 ):
-    """Jitter plot of AF by label with mean ± SD whiskers."""
+    """Save (and optionally show) a jitter plot of ``y_col`` by label with mean ± SD whiskers.
+
+    Labels are placed in order of first appearance; x positions are jittered
+    with ``np.random.uniform`` (global RNG). Each label gets a white box at the
+    mean and, when the SD (ddof=1) is defined, a whisker with caps at mean ±
+    SD. Written to ``<outdir>/<safe y_col><filename_suffix>.png`` and ``.pdf``.
+    Nothing is drawn when no numeric, labelled values remain.
+    """
     d = df[[label_col, y_col]].copy()
     d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
     d = d.dropna(subset=[label_col, y_col])
@@ -304,7 +464,20 @@ def _sd_filter_per_label(
     k: float = 1.5,
     min_n: int = 3,
 ):
-    """Flag outlier cells per label using mean ± k × SD."""
+    """Keep cells within mean ± k × SD (ddof=1) of their label's ``y_col`` values.
+
+    Non-numeric ``y_col`` values and missing labels are dropped first. Labels
+    with fewer than ``min_n`` cells, or with zero / non-finite SD, are kept
+    entirely (bounds ±inf). Bounds are inclusive.
+
+    Returns
+    -------
+    kept : pd.DataFrame
+        Rows of the cleaned input that pass.
+    audit : pd.DataFrame
+        Cleaned rows grouped by label with ``mu``, ``sd``, ``lo``, ``hi``,
+        ``k`` and ``status`` (``kept`` / ``removed``); empty if no rows remain.
+    """
     d = df[[label_col, y_col]].copy()
     d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
 
@@ -376,7 +549,7 @@ def filter_somatic_variant_outliers(
     df_AF: pd.DataFrame,
     differential_variants,
     outdir: str,
-    clone_variant_calls: pd.DataFrame = None,
+    clone_variant_calls: pd.DataFrame | None = None,
     variant_column: str = "Variant name",
     eligible_genotypes=("het", "hom"),
     label_col: str = "label",
@@ -451,6 +624,24 @@ def filter_somatic_variant_outliers(
     sd_min_n : int
         Minimum cells per clone to apply the SD filter.
 
+    jitter, alpha, point_size, rect_width, rect_height, cap_width, y_limits, dpi
+        Jitter-plot styling (see ``_jitter_plot_by_label``).
+
+    save_audit : bool
+        Write the audit / summary CSVs listed in Notes.
+
+    save_kept_barcodes : bool
+        Write one kept-barcode text file per processed variant.
+
+    show_plots : bool
+        Show the jitter plots (they are always saved).
+
+    verbose : bool
+        Print progress and a final summary.
+
+    random_seed : int
+        Seed passed to ``np.random.seed`` (global RNG) for the plot jitter.
+
     Returns
     -------
     kept_barcodes : dict[str, pd.Index]
@@ -461,8 +652,34 @@ def filter_somatic_variant_outliers(
 
     removed_barcodes_by_variant : dict[str, pd.Index]
         Eligible (carrier-clone) cells that did NOT survive for each variant,
-        i.e. DP failures plus SD-flagged AF outliers. WT and non-carrier cells
-        never appear here.
+        i.e. DP failures plus SD-flagged AF outliers, sorted. WT and
+        non-carrier cells never appear here.
+
+    Raises
+    ------
+    ValueError
+        If ``clone_variant_calls`` is None, ``df_AF`` shares no rows with the
+        DP matrix, none of ``differential_variants`` is in both matrices, or no
+        clone-table column matches a sample label.
+
+    Notes
+    -----
+    * Variant keys of the returned dicts are the original
+      ``differential_variants`` entries; variants not in both matrices are
+      silently skipped.
+    * A cell passes the DP filter when ``DP > dp_threshold`` (NaN fails).
+      Cells failing DP are not in the per-variant audit table.
+    * Files in ``outdir`` per processed variant ``<v>`` (``_safe_filename``):
+      ``<v>__CARRIER_CLONES__UNFILTERED.png/.pdf`` and
+      ``<v>__CARRIER_CLONES__SD<sd_k>.png/.pdf`` (jitter plots, always),
+      ``<v>__carrier_clones__kept_barcodes__SD<sd_k>.txt`` and
+      ``<v>__carrier_clones__sd_filter_audit__k<sd_k>.csv``. Overall (with
+      ``save_audit``): ``carrier_clone_eligibility_by_variant.csv``,
+      ``carrier_clone_eligible_barcodes_by_variant.csv``,
+      ``sd_filter_audit_ALL__carrier_clones__k<sd_k>.csv`` and
+      ``somatic_variant_filter_summary__carrier_clones__k<sd_k>.csv``.
+    * ``df_AF`` row labels are aligned with the DP matrix's index (from
+      ``Sample.dna.get_attribute``) before barcodes are assigned.
     """
     np.random.seed(random_seed)
 
@@ -883,127 +1100,3 @@ def filter_somatic_variant_outliers(
     vprint("=" * 60 + "\n")
 
     return kept_barcodes, all_audits, removed_barcodes_by_variant
-
-def _get_het_clone_barcodes_by_variant(
-    Sample,
-    differential_variants,
-    clone_variant_calls: pd.DataFrame,
-    variant_column: str = "Variant name",
-    eligible_genotypes=("het", "hom"),
-):
-    """Identify clone labels and barcodes eligible for each variant.
-
-    A clone is eligible for a variant if its call matches one of
-    ``eligible_genotypes`` (Het and Hom by default). Only columns in
-    ``clone_variant_calls`` that are active labels in ``Sample.dna`` are
-    considered clone columns, so table-only summary columns such as
-    ``Missing GT clones (3)`` and ``Small subclones (7)`` are excluded
-    automatically. Variants are matched on their canonical chr:pos:ref/alt key.
-    """
-    calls = _prepare_clone_variant_calls(
-        clone_variant_calls=clone_variant_calls,
-        variant_column=variant_column,
-    )
-
-    sample_clone_labels = {
-        str(label)
-        for label in Sample.dna.get_labels()
-        if pd.notna(label) and str(label).strip() != ""
-    }
-
-    clone_columns = [
-        column
-        for column in calls.columns
-        if str(column) in sample_clone_labels
-    ]
-
-    if len(clone_columns) == 0:
-        raise ValueError(
-            "No clone columns in clone_variant_calls match labels in "
-            "Sample.dna.get_labels(). Ensure clone-table column names match "
-            "the labels stored in Sample.dna."
-        )
-
-    clone_barcodes = {}
-
-    for column in clone_columns:
-        clone_label = str(column)
-
-        clone_barcodes[clone_label] = {
-            str(barcode)
-            for barcode in Sample.dna.barcodes({clone_label})
-        }
-
-    eligible_barcodes_by_variant = {}
-    het_clones_by_variant = {}
-    audit_records = []
-
-    for variant in map(str, differential_variants):
-        key = _canonical_variant_key(variant)
-
-        if key not in calls.index:
-            eligible_barcodes_by_variant[variant] = set()
-            het_clones_by_variant[variant] = []
-
-            audit_records.append(
-                {
-                    "variant": variant,
-                    "status": "missing_from_clone_variant_calls",
-                    "het_clones": "",
-                    "n_het_clones": 0,
-                    "n_het_clone_barcodes": 0,
-                }
-            )
-
-            continue
-
-        variant_calls = calls.loc[key]
-
-        # Handle duplicate variant rows safely:
-        # a clone is eligible if any matching row carries the variant.
-        if isinstance(variant_calls, pd.DataFrame):
-            is_het_by_clone = {
-                column: variant_calls[column].map(
-                    lambda x: _clone_call_matches(x, eligible_genotypes)
-                ).any()
-                for column in clone_columns
-            }
-        else:
-            is_het_by_clone = {
-                column: _clone_call_matches(variant_calls[column], eligible_genotypes)
-                for column in clone_columns
-            }
-
-        het_clones = [
-            str(column)
-            for column in clone_columns
-            if is_het_by_clone[column]
-        ]
-
-        eligible_barcodes = set()
-
-        for clone_label in het_clones:
-            eligible_barcodes.update(clone_barcodes[clone_label])
-
-        eligible_barcodes_by_variant[variant] = eligible_barcodes
-        het_clones_by_variant[variant] = het_clones
-
-        audit_records.append(
-            {
-                "variant": variant,
-                "status": (
-                    "ok"
-                    if len(eligible_barcodes) > 0
-                    else "no_carrier_clone_barcodes"
-                ),
-                "het_clones": ";".join(het_clones),
-                "n_het_clones": len(het_clones),
-                "n_het_clone_barcodes": len(eligible_barcodes),
-            }
-        )
-
-    return (
-        eligible_barcodes_by_variant,
-        het_clones_by_variant,
-        pd.DataFrame(audit_records),
-    )

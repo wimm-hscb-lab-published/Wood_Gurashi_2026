@@ -1,10 +1,16 @@
-"""DNA_pipeline – DNA variant analysis utilities.
+"""DNA_Utils: single-cell DNA genotype processing for Tapestri / Mosaic samples.
 
-v3 initializer exposing the notebook-facing germline utilities.
-Copy this file to the package as ``__init__.py`` together with the updated
-``germline.py`` module. The downloadable module may be named ``germline.py``;
-inside the package it should be copied/renamed to ``germline.py`` unless you
-also change the import below to ``from .germline import ...``.
+Modules
+-------
+utils           Variant-ID parsing, assay helpers, Varsome annotation-cache maintenance, matrix export.
+qc_filters      Cell QC: doublet scoring and calls, low-quality (amplicon-loss) cells, AF heatmaps.
+filter_outliers Removal of outlier cells for somatic variants.
+germline        Germline heterozygous variant detection, genotype profiles, CNV/BAF audit pipelines.
+somatic         Somatic variant selection and plots.
+clones          Clone tables, VAF and clone sizes.
+plot_clones     Clone UMAPs and somatic-variant plots.
+
+Everything listed in ``__all__`` is importable directly from ``DNA_Utils``. See README.md for details.
 """
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -15,8 +21,6 @@ from .utils import (
     chrom_key,
     sanitize_row_attrs,
     drop_scalar_row_attrs,
-    heatmap_shape,
-    binomial_pval_right_tail,
 
     # Varsome annotation cache maintenance
     VARSOME_DB_COLUMNS,
@@ -24,9 +28,7 @@ from .utils import (
     VARSOME_VALID_GENOMES,
     varsome_db_path,
     varsome_db_lock,
-    inspect_varsome_db,
     repair_varsome_db,
-    reset_varsome_db,
     annotate_with_repair,
 
     # Annotation / subsetting / metadata / matrix export
@@ -46,10 +48,7 @@ from .qc_filters import (
     define_doublet_cutoff_per_donor,
     apply_doublet_calls_with_corr_reassign,
     apply_low_quality_qc,
-    doublets_example,
     fast_af_heatmap,
-    find_remaining_cells_like_mixed,
-    visualise_mixed_like_rescue,
 )
 
 # ── Germline / CNV marker workflow ────────────────────────────────────────────
@@ -71,17 +70,7 @@ from .germline import (
 
     # Cohort calibration helpers
     resolve_calibration_columns,
-    load_germline_cohort,
-    germline_recurrence,
-    germline_anchor_frame,
-    germline_percentile_table,
-    propose_germline_thresholds,
-    evaluate_min_frac_het,
-    germline_practical_anchor_frame,
-    calibrate_practical_germline_thresholds,
     apply_calibrated_germline_rules,
-    germline_counts_per_sample,
-    calibrate_germline_thresholds,
 
     # Notebook-facing v2/v3 wrappers
     get_empirical_cohort_germline_thresholds,
@@ -110,7 +99,6 @@ from .somatic import (
 
 # ── Clones ────────────────────────────────────────────────────────────────────
 from .clones import (
-    assign_patients_from_whitelist,
     clones_to_dataframe,
     get_VAF,
     get_clones_size,
@@ -135,8 +123,6 @@ __all__ = [
     "chrom_key",
     "sanitize_row_attrs",
     "drop_scalar_row_attrs",
-    "heatmap_shape",
-    "binomial_pval_right_tail",
 
     # varsome cache maintenance
     "VARSOME_DB_COLUMNS",
@@ -144,9 +130,7 @@ __all__ = [
     "VARSOME_VALID_GENOMES",
     "varsome_db_path",
     "varsome_db_lock",
-    "inspect_varsome_db",
     "repair_varsome_db",
-    "reset_varsome_db",
     "annotate_with_repair",
 
     # annotation / subsetting / metadata / export
@@ -164,10 +148,7 @@ __all__ = [
     "define_doublet_cutoff_per_donor",
     "apply_doublet_calls_with_corr_reassign",
     "apply_low_quality_qc",
-    "doublets_example",
     "fast_af_heatmap",
-    "find_remaining_cells_like_mixed",
-    "visualise_mixed_like_rescue",
 
     # original germline helpers
     "get_real_somatic_variants",
@@ -186,17 +167,7 @@ __all__ = [
 
     # cohort calibration helpers
     "resolve_calibration_columns",
-    "load_germline_cohort",
-    "germline_recurrence",
-    "germline_anchor_frame",
-    "germline_percentile_table",
-    "propose_germline_thresholds",
-    "evaluate_min_frac_het",
-    "germline_practical_anchor_frame",
-    "calibrate_practical_germline_thresholds",
     "apply_calibrated_germline_rules",
-    "germline_counts_per_sample",
-    "calibrate_germline_thresholds",
 
     # v2/v3 notebook-facing wrappers
     "get_empirical_cohort_germline_thresholds",
@@ -221,7 +192,6 @@ __all__ = [
     "visualize_found_informative_variants",
 
     # clones
-    "assign_patients_from_whitelist",
     "clones_to_dataframe",
     "get_VAF",
     "get_clones_size",

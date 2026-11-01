@@ -1,17 +1,44 @@
 """
-LOH Pipeline – Configuration, shared state, and helper functions.
+LOH Pipeline – configuration, shared state and stateless helpers.
 
-All phases import from here so parameter definitions and utilities live in one place.
+Every phase module imports from here, so parameter definitions and shared
+utilities live in one place.
+
+Main contents
+-------------
+- Label constants (``LOH_TAG``, ``HET_TAG``, ``ADO_LABEL``, ``SMALL_LABEL``,
+  ``FP_TAG``, ``SUB_TAG``) and label helpers (``is_loh_label``,
+  ``is_fp_label``, ``is_sub_label``, ``is_small_label``, ``make_fp_label``,
+  ``make_sub_label``, ``clone_category``, ``fp_base_name``).
+- ``LOHConfig``: dataclass holding every tuneable parameter (Phases 0–6 and
+  plotting).
+- ``PipelineState``: mutable data shared across phases (Sample, AF/DP
+  matrices, cell↔barcode↔clone mappings, per-phase results).
+- Stateless helpers: ``vprint``, ``edge_tolerant_extreme_runs``,
+  ``sort_chromosome_arms``, ``get_base_clone``, ``extract_chr_arms``,
+  ``is_wt_clone``, ``is_hem_like``, ``arm_variants``, ``pearson_safe``,
+  ``check_directional_consistency``, ``mean_profile``, ``fmt_float``,
+  ``build_cytoband_maps``.
+
+Label grammar
+-------------
+An active LOH label is ``"<base clone> LOH-C<n> <arm>"`` (possibly with
+several ``LOH-C<n> <arm>`` suffixes). Review-only labels are prefixed
+``"FP: "`` (possible LOH / false positive) or ``"SUB: "`` (unresolved
+subclone), and sub-threshold terminal labels are ``"small"`` or
+``"small: <label>"``. In FP/SUB labels ``LOH-C<n>`` is rewritten to ``C<n>``
+so that substring scans for ``"LOH"`` never match them.
 """
 from __future__ import annotations
 
 import re
 import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
-from collections import defaultdict
-from typing import Any
 from scipy.stats import pearsonr
 
 
@@ -27,28 +54,84 @@ SUB_TAG     = "SUB:"
 
 
 def is_small_label(label: object) -> bool:
-    """Return True for the common terminal sub-threshold label ``small``."""
+    """Return True for the terminal sub-threshold label ``small`` or ``small: ...``.
+
+    Parameters
+    ----------
+    label : object
+        Clone label (converted with ``str`` and stripped).
+
+    Returns
+    -------
+    bool
+    """
     text = str(label).strip()
     return text == SMALL_LABEL or text.startswith(f"{SMALL_LABEL}:")
 
 
 def is_fp_label(label: object) -> bool:
-    """Return True for a retained false-positive clone label (``FP: ...``)."""
+    """Return True for a retained false-positive clone label (``FP: ...``).
+
+    ``small``-prefixed labels are never FP.
+
+    Parameters
+    ----------
+    label : object
+        Clone label (converted with ``str`` and stripped).
+
+    Returns
+    -------
+    bool
+    """
     return (not is_small_label(label)) and str(label).strip().startswith(FP_TAG)
 
 
 def is_sub_label(label: object) -> bool:
-    """Return True for an unresolved directional subclone label (``SUB: ...``)."""
+    """Return True for an unresolved directional subclone label (``SUB: ...``).
+
+    ``small``-prefixed labels are never SUB.
+
+    Parameters
+    ----------
+    label : object
+        Clone label (converted with ``str`` and stripped).
+
+    Returns
+    -------
+    bool
+    """
     return (not is_small_label(label)) and str(label).strip().startswith(SUB_TAG)
 
 
 def is_uncertain_loh_label(label: object) -> bool:
-    """Return True for review-only FP or unresolved subclonal LOH labels."""
+    """Return True for review-only FP or unresolved subclonal (SUB) LOH labels.
+
+    Parameters
+    ----------
+    label : object
+        Clone label (converted with ``str`` and stripped).
+
+    Returns
+    -------
+    bool
+    """
     return is_fp_label(label) or is_sub_label(label)
 
 
 def is_loh_label(label: object) -> bool:
-    """Return True only for active LOH labels, never review-only FP/SUB/small labels."""
+    """Return True only for active LOH labels, never review-only FP/SUB/small labels.
+
+    A label is active LOH when it contains ``"LOH"`` and is not small, FP or SUB.
+
+    Parameters
+    ----------
+    label : object
+        Clone label (converted with ``str`` and stripped).
+
+    Returns
+    -------
+    bool
+    """
     return (not is_small_label(label)) and (not is_uncertain_loh_label(label)) and (LOH_TAG in str(label))
 
 
@@ -59,6 +142,16 @@ def make_fp_label(assigned_clone_label: object) -> str:
     ``FP: TP53_R248W_Hem C0 chr7p:p22.1-p14.1``.  This preserves the
     assigned-clone identity while ensuring the literal ``LOH`` token cannot
     be rediscovered by legacy substring scans in later phases.
+
+    Parameters
+    ----------
+    assigned_clone_label : object
+        Label to mark; returned unchanged if it is already an FP label.
+
+    Returns
+    -------
+    str
+        ``"FP: <label with LOH-C<n> → C<n>>"``.
     """
     label = str(assigned_clone_label).strip()
     if is_fp_label(label):
@@ -73,6 +166,16 @@ def make_sub_label(assigned_clone_label: object) -> str:
     ``SUB:`` is reserved for cells from a coherent parent LOH clone that could
     not be assigned to any validated directional child. It is deliberately
     distinct from technical/biological false-positive ``FP:`` labels.
+
+    Parameters
+    ----------
+    assigned_clone_label : object
+        Label to mark; returned unchanged if it is already a SUB label.
+
+    Returns
+    -------
+    str
+        ``"SUB: <label with LOH-C<n> → C<n>>"``.
     """
     label = str(assigned_clone_label).strip()
     if is_sub_label(label):
@@ -81,18 +184,20 @@ def make_sub_label(assigned_clone_label: object) -> str:
     return f"{SUB_TAG} {label}"
 
 
-def make_small_label(assigned_clone_label: object) -> str:
-    """Return the common terminal small-clone label.
-
-    Small groups are deliberately collapsed into the single label ``small``
-    during final cleanup so 1-4-cell technical remnants do not masquerade as
-    named biological populations.
-    """
-    return SMALL_LABEL
-
-
 def clone_category(label: object) -> str:
-    """Classify active LOH, SUB, FP, small, or non-LOH labels."""
+    """Classify a clone label.
+
+    Parameters
+    ----------
+    label : object
+        Clone label.
+
+    Returns
+    -------
+    str
+        First match of ``"small"``, ``"subclonal_LOH"`` (SUB), ``"possible_LOH"``
+        (FP), ``"LOH"`` (active), else ``"non_LOH"``.
+    """
     if is_small_label(label):
         return "small"
     if is_sub_label(label):
@@ -108,7 +213,17 @@ def fp_base_name(label: object) -> str:
     """Recover the base genotype from an FP label.
 
     ``FP: TP53_R248W_Hem C0 chr7p:p22.1-p14.1`` -> ``TP53_R248W_Hem``.
-    The rendered ``C<n> <arm>`` tokens and the ``FP:`` prefix are stripped.
+    A leading ``small:`` and ``FP:``/``SUB:`` prefix and every rendered
+    ``C<n> <token>`` pair are stripped, and whitespace is collapsed.
+
+    Parameters
+    ----------
+    label : object
+        FP, SUB or small label (other labels pass through the same regexes).
+
+    Returns
+    -------
+    str
     """
     s = re.sub(rf"^{re.escape(SMALL_LABEL)}:\s*", "", str(label).strip())
     s = re.sub(rf"^(?:{re.escape(FP_TAG)}|{re.escape(SUB_TAG)})\s*", "", s)
@@ -139,7 +254,12 @@ def fp_base_name(label: object) -> str:
 # ─────────────────────────────────────────────────────────────────────
 @dataclass
 class LOHConfig:
-    """All tuneable parameters for the current LOH pipeline phases (0–5) + plotting."""
+    """All tuneable parameters for the LOH pipeline phases (0–6) and plotting.
+
+    Fields are grouped by the phase that reads them; see the inline comments
+    for each group. Several fields are retained only so older configs still
+    load (they are marked "Unused", "Legacy" or "Compatibility-only").
+    """
 
     # Phase 1 – per-arm detection (core thresholds)
     low_allele_threshold: float = 10.0
@@ -208,9 +328,8 @@ class LOHConfig:
     phase1_localized_min_good_frac: float = 0.85
     phase1_localized_good_cell_r: float = 0.85
 
-    # NEW: localized cytoband logic
-    # Require >= this many *extreme-mean* variants within the *contiguous run* of passing cytobands.
-    # (Default 5 = "over 4".)
+    # Localized cytoband logic: require >= this many *extreme-mean* variants
+    # within the *contiguous run* of passing cytobands.
     phase1_localized_min_extreme_variants_passing_bands: int = 4
 
     # Phase 1 – clone-size gate applied to both arm-wide and localised calls
@@ -235,7 +354,7 @@ class LOHConfig:
     )
     phase1_ngt_numeric_no_call_values: tuple = (3,)
 
-    # Legacy/manual only: Phase 2 p/q merging is skipped by the default full pipeline.
+    # Correlation needed to merge LOH clones (Phase 3 rescue merges; Phase 5 sibling-merge fallback).
     post_merge_correlation_threshold: float = 0.80
 
     # Phase 3 – LOH clone QC
@@ -380,7 +499,7 @@ class LOHConfig:
     # amplicons only.
     phase4_rescue_exclude_somatic_from_amp_support: bool = True
 
-    # NEW: trigger per-cell rescue when there's a "hint of similarity"
+    # Trigger per-cell rescue when there is a "hint of similarity".
     phase4_percell_trigger_mean_corr: float = 0.70
     phase4_percell_trigger_any_arm_corr: float = 0.85
 
@@ -595,6 +714,8 @@ class LOHConfig:
 
     # Legacy/manual only: ADO-combination probability QC is disabled and not run
     # by the default Phase 5 workflow. No amplicon_ado_rates are required.
+    # These fields are kept so existing configs still load; no pipeline code
+    # currently reads them.
     ado_probability_qc_enabled: bool = False
     amplicon_ado_rates: Any = None
     ado_probability_rate_col: str = "smooth_ado_any_rate"
@@ -629,6 +750,40 @@ class PipelineState:
 
     Call ``refresh()`` after any modification to Sample clone labels so
     that derived mappings (barcode_to_clone, clone_to_cells) stay in sync.
+
+    Parameters
+    ----------
+    Sample : missionbio.mosaic Sample
+        Must expose ``dna.row_attrs['barcode']`` and ``['Clone']``.
+    df : pd.DataFrame
+        Cells × columns AF table. Columns containing ``':'`` (other than
+        ``barcode``/``Clone``/``Clone_backup``) are treated as variants.
+    grouped_by_chr_arm : dict
+        Arm → variant names.
+    chr_arms : list[str]
+        Arms to process.
+    config : LOHConfig
+        Run configuration (``config.cytobands`` becomes ``cytobands_df``).
+    df_dp : pd.DataFrame or None
+        Optional read-depth matrix. If None, ``Sample.dna.get_attribute("DP",
+        constraint="row+col")`` is tried (any exception → no DP).
+
+    Attributes
+    ----------
+    variant_cols : list[str]
+        Variant columns of *df*.
+    df_numeric : pd.DataFrame
+        Numeric AF matrix (coerced with ``pd.to_numeric`` when the first
+        variant column is object/string dtype).
+    df_dp_numeric : pd.DataFrame
+        DP matrix aligned to ``df_numeric`` (rows by index, else by
+        ``barcode`` column); all-NaN when no DP is available.
+    cell_to_barcode, barcode_to_sample_idx : dict
+        Stable row-id → barcode and barcode → Sample position maps.
+    barcode_to_clone, clone_to_cells : dict
+        Derived from the current ``Clone`` labels by ``refresh()``.
+    results : dict
+        Per-phase outputs.
     """
 
     def __init__(
@@ -751,6 +906,7 @@ class PipelineState:
 
     @property
     def current_clones(self) -> pd.Series:
+        """Current ``Sample.dna.row_attrs['Clone']`` as a string Series."""
         return pd.Series(self.Sample.dna.row_attrs["Clone"]).astype(str)
 
     def sample_idx_for_barcode(self, barcode: str) -> int | None:
@@ -770,7 +926,15 @@ class PipelineState:
 # Helper functions (stateless)
 # ─────────────────────────────────────────────────────────────────────
 def vprint(msg: str, cfg: LOHConfig) -> None:
-    """Verbose print – only outputs when cfg.verbose is True."""
+    """Print *msg* and flush stdout, only when ``cfg.verbose`` is True.
+
+    Parameters
+    ----------
+    msg : str
+        Text to print.
+    cfg : LOHConfig
+        Supplies ``verbose``.
+    """
     if cfg.verbose:
         print(msg)
         sys.stdout.flush()
@@ -792,6 +956,25 @@ def edge_tolerant_extreme_runs(
     ``span_indices`` (core plus permitted terminal padding), and
     ``n_edge_padded``.  Downstream QC should use the core for AF purity and
     independent-amplicon support, while it may use the span for block length.
+
+    Parameters
+    ----------
+    extreme_mask : array-like of bool
+        Per-variant extreme flags in genomic order (flattened).
+    max_edge_tolerance : int, default 0
+        Maximum non-extreme variants that may be padded onto each side of a
+        core (negative/None → 0).
+
+    Returns
+    -------
+    list[dict]
+        One record per extreme core, in order; empty if there is none.
+
+    Notes
+    -----
+    Padding stops at the array edge or at another extreme value. A
+    non-extreme index that could pad two neighbouring cores is given to
+    neither.
     """
     arr = np.asarray(extreme_mask, dtype=bool).ravel()
     n = int(arr.size)
@@ -858,7 +1041,18 @@ def edge_tolerant_extreme_runs(
 
 
 def sort_chromosome_arms(chr_list: list[str]) -> list[str]:
-    """Sort chromosome arm labels naturally: chr1p, chr1q, chr2p, ..."""
+    """Sort chromosome arm labels naturally: chr1p, chr1q, chr2p, ..., chrXp, chrYq.
+
+    Parameters
+    ----------
+    chr_list : list[str]
+        Arm labels. Labels not matching ``chr(\\d+|X|Y)[pq]`` sort last.
+
+    Returns
+    -------
+    list[str]
+        New sorted list.
+    """
     def _key(chr_arm):
         m = re.match(r"chr(\d+|X|Y)([pq])", str(chr_arm))
         if not m:
@@ -875,22 +1069,38 @@ def sort_chromosome_arms(chr_list: list[str]) -> list[str]:
 
 
 def get_base_clone(clone_label: str) -> str:
-    """Strip all ' LOH-C<n> <arm>' suffixes from a clone label."""
+    """Strip all ``' LOH-C<n> <arm>'`` suffixes from a clone label.
+
+    Parameters
+    ----------
+    clone_label : str
+        Clone label (converted with ``str``).
+
+    Returns
+    -------
+    str
+        The base clone name.
+    """
     return re.sub(r" LOH-C\d+ \S+", "", str(clone_label))
 
 
 def extract_chr_arms(clone_label: str) -> list[str]:
-    """Return all chrNp / chrNq tokens in a clone label."""
+    """Return all ``chrNp`` / ``chrNq`` (incl. X/Y) tokens in a clone label.
+
+    Parameters
+    ----------
+    clone_label : str
+        Clone label (converted with ``str``).
+
+    Returns
+    -------
+    list[str]
+        Arm tokens in order of appearance (duplicates kept).
+    """
     return [
         m.group(1)
         for m in re.finditer(r"(chr\d+[pq]|chrX[pq]|chrY[pq])", str(clone_label))
     ]
-
-
-def get_chr_number(chr_arm: str) -> str | None:
-    """Extract chromosome number/letter from an arm label."""
-    m = re.match(r"chr(\d+|X|Y)", str(chr_arm))
-    return m.group(1) if m else None
 
 
 def is_wt_clone(label: str, cfg: LOHConfig) -> bool:
@@ -899,6 +1109,17 @@ def is_wt_clone(label: str, cfg: LOHConfig) -> bool:
 
     By default a clone is WT if its label starts with ``"WT"``.  A deprecated
     runtime attribute ``cfg.wt_labels`` is still honoured if present.
+
+    Parameters
+    ----------
+    label : str
+        Clone label.
+    cfg : LOHConfig
+        May carry a ``wt_labels`` iterable of extra WT prefixes.
+
+    Returns
+    -------
+    bool
     """
     s = str(label)
     if s.startswith("WT"):
@@ -910,7 +1131,17 @@ def is_wt_clone(label: str, cfg: LOHConfig) -> bool:
 
 
 def is_hem_like(label: str) -> bool:
-    """Detect Hem/HEM/hem even when delimited by underscores/punctuation."""
+    """Detect a case-insensitive ``hem`` token delimited by non-alphanumerics.
+
+    Parameters
+    ----------
+    label : str
+        Clone label, e.g. ``"TP53_R248W_Hem"``.
+
+    Returns
+    -------
+    bool
+    """
     return (
         re.search(
             r"(^|[^A-Za-z0-9])hem([^A-Za-z0-9]|$)", str(label), flags=re.IGNORECASE
@@ -920,7 +1151,20 @@ def is_hem_like(label: str) -> bool:
 
 
 def arm_variants(arm: str, state: PipelineState) -> list[str]:
-    """Variants for *arm* that exist as columns in state.df_numeric."""
+    """Variants for *arm* that exist as columns in ``state.df_numeric``.
+
+    Parameters
+    ----------
+    arm : str
+        Chromosome arm.
+    state : PipelineState
+        Supplies ``grouped_by_chr_arm`` and ``df_numeric``.
+
+    Returns
+    -------
+    list[str]
+        Variants in ``grouped_by_chr_arm`` order.
+    """
     return [
         v for v in state.grouped_by_chr_arm.get(arm, [])
         if v in state.df_numeric.columns
@@ -928,7 +1172,21 @@ def arm_variants(arm: str, state: PipelineState) -> list[str]:
 
 
 def pearson_safe(x, y, min_n: int = 5) -> float | None:
-    """Pearson r returning None instead of NaN for degenerate inputs."""
+    """Pearson r returning None instead of NaN for degenerate inputs.
+
+    Parameters
+    ----------
+    x, y : array-like or None
+        Paired values; positions where either is non-finite are dropped.
+    min_n : int, default 5
+        Minimum finite pairs required.
+
+    Returns
+    -------
+    float or None
+        None if an input is None, fewer than *min_n* pairs remain, either
+        side has zero SD, or r is not finite.
+    """
     if x is None or y is None:
         return None
     x = np.asarray(x, dtype=float)
@@ -966,6 +1224,16 @@ def check_directional_consistency(
     The block "passes" overall if at least min_block_pass_frac of variants
     with enough extreme cells pass the per-variant check.
 
+    Parameters
+    ----------
+    af_block : np.ndarray
+        Cells × variants AF block (percent).
+    low_thr, high_thr : float
+        Extreme LOW / HIGH thresholds (inclusive).
+    min_per_var_agreement : float, default 0.85
+    min_block_pass_frac : float, default 0.80
+    min_extreme_cells_per_var : int, default 3
+
     Returns
     -------
     dict with keys:
@@ -974,8 +1242,14 @@ def check_directional_consistency(
         n_variants_passing : int
         block_pass_frac : float
         per_variant_agreements : list[float]   # NaN if too few extreme cells
-        per_variant_directions : list[str]     # 'LOW', 'HIGH', or 'NA'
+        per_variant_directions : list[str]     # 'LOW', 'HIGH', 'TIE', or 'NA'
         dominant_direction : str               # 'LOW', 'HIGH', 'MIXED', or 'NA'
+
+    Notes
+    -----
+    A ``TIE`` variant (equal LOW and HIGH counts) is evaluated but never
+    passes. ``dominant_direction`` counts only *passing* variants. A non-2-D or
+    empty block returns ``passes=False`` with NaN ``block_pass_frac``.
     """
     af = np.asarray(af_block, dtype=float)
     if af.ndim != 2 or af.size == 0:
@@ -1056,7 +1330,23 @@ def check_directional_consistency(
 def mean_profile(
     df_numeric: pd.DataFrame, cells: list, variants: list
 ) -> np.ndarray | None:
-    """Mean AF profile across *cells* for *variants*; None if empty."""
+    """Nan-mean AF profile across *cells* for *variants*.
+
+    Parameters
+    ----------
+    df_numeric : pd.DataFrame
+        Numeric AF matrix.
+    cells : list
+        Row labels; those not in the index are skipped.
+    variants : list
+        Column labels (must exist).
+
+    Returns
+    -------
+    np.ndarray or None
+        None if *cells*/*variants* is empty, no cell is found, or every
+        mean is non-finite.
+    """
     if not cells or not variants:
         return None
     rows = [
@@ -1071,7 +1361,19 @@ def mean_profile(
 
 
 def fmt_float(x, nd: int = 3) -> str:
-    """Format a float for display; returns 'NA' for None/NaN/Inf."""
+    """Format a number with *nd* decimals; ``'NA'`` for None/NaN/Inf or on error.
+
+    Parameters
+    ----------
+    x : object
+        Value to format.
+    nd : int, default 3
+        Decimal places.
+
+    Returns
+    -------
+    str
+    """
     try:
         if x is None:
             return "NA"
@@ -1082,23 +1384,6 @@ def fmt_float(x, nd: int = 3) -> str:
         return "NA"
 
 
-def fmt_pct(x) -> str:
-    """Format a fraction as a percentage string; returns 'NA' for bad values."""
-    try:
-        if x is None:
-            return "NA"
-        if isinstance(x, float) and (np.isnan(x) or np.isinf(x)):
-            return "NA"
-        return f"{100.0 * float(x):.1f}%"
-    except Exception:
-        return "NA"
-
-
-def dedupe_preserve_order(items) -> list[str]:
-    """De-duplicate a list while preserving insertion order."""
-    return list(dict.fromkeys([str(x) for x in items if str(x).strip() != ""]))
-
-
 def build_cytoband_maps(
     variants_sorted: list[str],
     cytobands_df: pd.DataFrame | None,
@@ -1107,7 +1392,23 @@ def build_cytoband_maps(
     """
     Build bidirectional variant-index <-> cytoband mappings for one chromosome arm.
 
-    cytobands_df must have columns: 'chromosome arm', 'start', 'end', 'cytoband'.
+    Parameters
+    ----------
+    variants_sorted : list[str]
+        Variant names ``chrN:POS[-END]:...`` in the order to index.
+    cytobands_df : pd.DataFrame or None
+        Columns ``'chromosome arm'``, ``'start'``, ``'end'``, ``'cytoband'``.
+    target_chr : str
+        Arm to select from *cytobands_df*.
+
+    Returns
+    -------
+    var_idx_to_band : dict[int, str] or None
+        Variant index → first band (in table order) whose inclusive
+        ``[start, end]`` contains its position.
+    band_to_var_indices : dict[str, list[int]] or None
+        Band → variant indices. Both are None if there are no inputs, no
+        bands for the arm, or no variant maps; unparsable positions are skipped.
     """
     if cytobands_df is None or len(cytobands_df) == 0 or len(variants_sorted) == 0:
         return None, None

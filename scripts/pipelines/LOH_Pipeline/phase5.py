@@ -9,11 +9,23 @@ This phase also performs a final LOH-label cleanup before summarizing:
 
 1. Merge final LOH clones that share the same base clone name and same LOH
    arm set when their LOH-block AF profiles are highly correlated.
-2. Rename remaining LOH clones with fewer than ``min_final_clone_size`` cells
-   to the configured small-clone label, default ``small``.
+2. Rename every terminal clone with fewer than ``min_final_clone_size`` cells
+   (and any legacy ``small: ...`` label) to the single label ``small``.
 
 That final cleanup is necessary because Phase 4 can create or split LOH clones
 after Phase 3's small-clone cleanup.
+
+For every surviving LOH clone the strongest LOH block per arm is recomputed
+from the clone-mean AF profile, its independent amplicon support sets a
+low/mid/high confidence tier, and an ADO-plausibility readout (empirical
+same-base background rates, or a fixed per-amplicon rate) is attached.
+
+Main entry point
+----------------
+``run_phase5(state, cfg=None, *, loh_min_cells=None, heading=...)`` –
+cleanup, summary table (stored in ``state.results["phase5_summary"]``) and
+printed report. ``run_post_phase5_subclone_scan`` (Phase 6) reuses it as the
+Phase 7 summary.
 
 Call after Phase 4::
 
@@ -22,10 +34,28 @@ Call after Phase 4::
 """
 from __future__ import annotations
 
+import math
+import re
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
+
+from .loh_config import (
+    arm_variants,
+    extract_chr_arms,
+    get_base_clone,
+    is_fp_label,
+    is_hem_like,
+    is_loh_label,
+    is_small_label,
+    is_sub_label,
+    mean_profile,
+    pearson_safe,
+    sort_chromosome_arms,
+    vprint,
+)
 
 if TYPE_CHECKING:
     from .loh_config import LOHConfig, PipelineState
@@ -36,14 +66,52 @@ _YELLOW = "\033[93m"
 _GREEN = "\033[92m"
 _RESET = "\033[0m"
 
+_DEFAULT_HEADING = "PHASE 5: LOH CLONE SUMMARY"
+_SMALL_LABEL = "small"
+
+# Amplicon values treated as "no amplicon annotation".
+_MISSING_AMPLICON_VALUES = (None, "", "nan", "None")
+
+# Column order of the Phase 5 summary table (also used for the empty table).
+_SUMMARY_COLUMNS = [
+    "clone_label",
+    "n_cells",
+    "is_loh",
+    "is_subclonal",
+    "is_small",
+    "loh_arms",
+    "is_hem",
+    "is_tp53",
+    "has_chr17p_loh",
+    "loh_block_details",
+    "loh_block_min_amplicons",
+    "loh_confidence",
+    "loh_confidence_reason",
+    "qc_alert",
+    "ado_alert_explanation",
+    "ado_rate_source",
+    "ado_assumed_amplicon_rate",
+    "ado_empirical_background_cells",
+    "ado_empirical_dp_used",
+    "ado_empirical_min_depth",
+    "ado_empirical_amplicon_rates",
+    "ado_cell_probability",
+    "ado_original_clone_size",
+    "ado_observed_loh_cells",
+    "ado_expected_cells",
+    "ado_pvalue_ge_observed",
+    "ado_verdict",
+    "ado_qc_scope",
+]
+
 
 def _is_active_loh(label: object) -> bool:
-    from .loh_config import is_loh_label
+    """True for an active LOH label (excludes FP:/SUB: review labels)."""
     return is_loh_label(label)
 
 
 def _is_active_non_loh(label: object) -> bool:
-    from .loh_config import is_loh_label, is_fp_label, is_sub_label, is_small_label
+    """True for a label that is not LOH, FP, SUB or small."""
     return (
         (not is_loh_label(label))
         and (not is_fp_label(label))
@@ -53,7 +121,7 @@ def _is_active_non_loh(label: object) -> bool:
 
 
 def _is_subclonal_loh(label: object) -> bool:
-    from .loh_config import is_sub_label
+    """True for an unresolved directional ``SUB:`` LOH label."""
     return is_sub_label(label)
 
 
@@ -76,19 +144,17 @@ def _merge_similar_loh_clones_before_phase5(
     -------
     int
         Number of cells whose clone label was changed by this merge pass.
+
+    Notes
+    -----
+    Disabled when ``cfg.phase5_merge_similar_loh_clones`` is False. Pairwise
+    Pearson r of clone-mean AF over the group's arm variants must reach
+    ``phase5_merge_similar_loh_min_corr`` (falling back to
+    ``post_merge_correlation_threshold``, default 0.80) with at least
+    ``min_variants_per_arm_for_corr`` (default 5) variants. Similar labels are
+    joined transitively (union-find); each component is relabelled to its
+    largest member (ties broken alphabetically).
     """
-    import numpy as np
-
-    from .loh_config import (
-        LOH_TAG,
-        arm_variants,
-        extract_chr_arms,
-        get_base_clone,
-        mean_profile,
-        pearson_safe,
-        vprint,
-    )
-
     enabled = bool(getattr(cfg, "phase5_merge_similar_loh_clones", True))
     if not enabled:
         return 0
@@ -210,9 +276,6 @@ def _merge_similar_loh_clones_before_phase5(
             state.set_clone_labels(current)
             total_changed_cells += changed_this_group
 
-    # Avoid unused-import lint complaints if strict linting is enabled.
-    _ = np
-
     return total_changed_cells
 
 
@@ -231,14 +294,10 @@ def _prune_small_terminal_clones_before_phase5(
     the Phase 6 residual scan, where provisional small LOH children are kept for
     downstream merging). When None, the standard ``min_final_clone_size`` floor
     applies to every label.
-    """
-    from .loh_config import (
-        is_loh_label,
-        is_small_label,
-        make_small_label,
-        vprint,
-    )
 
+    Returns the number of cells relabelled (0 when
+    ``cfg.phase5_prune_all_small_clones`` is False).
+    """
     if not bool(getattr(cfg, "phase5_prune_all_small_clones", True)):
         return 0
 
@@ -257,7 +316,7 @@ def _prune_small_terminal_clones_before_phase5(
     terminal_small = [
         str(label)
         for label, n in counts.items()
-        if (is_small_label(label) and str(label).strip() != "small")
+        if (is_small_label(label) and str(label).strip() != _SMALL_LABEL)
         or ((not is_small_label(label)) and int(n) < _floor_for(label))
     ]
     if not terminal_small:
@@ -270,7 +329,7 @@ def _prune_small_terminal_clones_before_phase5(
         n = int(mask.sum())
         if n == 0:
             continue
-        new_label = "small"
+        new_label = _SMALL_LABEL
         current.loc[mask] = new_label
         changed += n
         vprint(
@@ -281,7 +340,6 @@ def _prune_small_terminal_clones_before_phase5(
     if changed:
         state.set_clone_labels(current)
     return changed
-
 
 
 # ── Final-clone LOH block support / QC-alert helpers ────────────────
@@ -348,10 +406,15 @@ def _best_loh_block_support_for_clone_arm(
     find contiguous extreme runs, ignore somatic/context variants for amplicon
     support when cfg.informative_variants is supplied, and keep the strongest
     passing block.
-    """
-    import numpy as np
 
-    from .loh_config import arm_variants
+    Returns None when the arm has fewer than ``min_contiguous_variants_final``
+    variants, the clone has no cells, no variant→amplicon map exists, or no
+    block passes. Otherwise returns a dict with ``chr_arm``, ``n_variants``,
+    ``n_amplicons``, ``amplicons``, ``amplicon_ids``, ``amplicon_to_variants``,
+    ``amplicon_to_variant_dirs`` (LOW/HIGH per variant), ``block_span`` and
+    ``variant_ids``. Blocks are ranked by amplicons, then variants.
+    """
+    # Imported lazily: phase1 is only needed for this final-block recomputation.
     from .phase1 import (
         _block_somatic_flanking_ok,
         _build_variant_to_amplicon,
@@ -386,7 +449,7 @@ def _best_loh_block_support_for_clone_arm(
         if len(run_indices) < min_len:
             continue
 
-        ok, reason = _block_somatic_flanking_ok(vars_sorted, list(map(int, run_indices)), cfg)
+        ok, _reason = _block_somatic_flanking_ok(vars_sorted, list(map(int, run_indices)), cfg)
         if not ok:
             continue
 
@@ -395,7 +458,7 @@ def _best_loh_block_support_for_clone_arm(
         all_amps = {
             str(v2a.get(v))
             for v in run_vars
-            if v2a.get(v) not in (None, "", "nan", "None")
+            if v2a.get(v) not in _MISSING_AMPLICON_VALUES
         }
         amps = info_amps if info_amps else all_amps
         n_amps = int(len(amps))
@@ -406,7 +469,7 @@ def _best_loh_block_support_for_clone_arm(
         amp_to_vars: dict[str, list[str]] = {}
         amp_to_variant_dirs: dict[str, dict[str, str]] = {}
         for v in run_vars:
-            amp = str(v2a.get(v)) if v2a.get(v) not in (None, "", "nan", "None") else str(v)
+            amp = str(v2a.get(v)) if v2a.get(v) not in _MISSING_AMPLICON_VALUES else str(v)
             if amp not in amps:
                 continue
             amp_to_vars.setdefault(amp, []).append(str(v))
@@ -441,15 +504,11 @@ def _best_loh_block_support_for_clone_arm(
     return sorted(candidates, key=lambda d: (-d["n_amplicons"], -d["n_variants"], d["chr_arm"]))[0]
 
 
-
-
 def _binom_sf_geq(k: int, n: int, p: float) -> float:
     """
     Exact binomial survival P[X >= k] for small/moderate k, stable enough for
     Phase 5 QC alerts. Returns 1.0 for k <= 0 and 0.0 for impossible cases.
     """
-    import math
-
     k = int(k)
     n = int(n)
     p = float(p)
@@ -492,8 +551,6 @@ def _base_lineage_size_for_clone(state: "PipelineState", clone_label: str) -> in
     practical denominator for asking whether an LOH-like subclone could arise
     from stochastic multi-amplicon ADO within its original clone background.
     """
-    from .loh_config import get_base_clone
-
     base = get_base_clone(str(clone_label))
     n = 0
     for lbl, cells in state.clone_to_cells.items():
@@ -503,7 +560,6 @@ def _base_lineage_size_for_clone(state: "PipelineState", clone_label: str) -> in
         except Exception:
             pass
     return int(max(n, len(state.clone_to_cells.get(clone_label, []))))
-
 
 
 def _loh_confidence_from_min_amplicons(min_amplicons: int | None) -> tuple[str, str]:
@@ -532,8 +588,6 @@ def _background_cells_for_empirical_ado(
     If no non-LOH same-base background exists, fall back to all same-base cells
     excluding the queried LOH clone.
     """
-    from .loh_config import LOH_TAG, get_base_clone
-
     base = get_base_clone(str(clone_label))
     primary: list[str] = []
     fallback: list[str] = []
@@ -569,10 +623,16 @@ def _estimate_empirical_ado_rates_for_block(
     DP < cfg.phase5_qc_alert_empirical_min_depth are treated as missingness and
     are not counted as ADO-like events.  This makes the Phase 5 QC alert a
     coverage-aware empirical estimate rather than AF-only extreme counting.
-    """
-    import math
-    import numpy as np
 
+    Each background cell counts as ADO-like for an amplicon when at least
+    ``phase5_qc_alert_empirical_amplicon_extreme_frac`` (default 1.0) of its
+    covered variants match the block direction (LOW ≤ low threshold, HIGH ≥
+    high threshold). Rates are Beta-smoothed
+    ``(events + alpha) / (valid + alpha + beta)`` with defaults alpha=1,
+    beta=9. The result is ``usable`` only if every amplicon has at least
+    ``phase5_qc_alert_empirical_min_background_cells`` (default 50) valid
+    cells; then ``p_cell`` is the product of the per-amplicon rates.
+    """
     low = float(getattr(cfg, "low_allele_threshold", 10.0))
     high = float(getattr(cfg, "high_allele_threshold", 90.0))
     min_frac = float(getattr(cfg, "phase5_qc_alert_empirical_amplicon_extreme_frac", 1.0))
@@ -711,10 +771,12 @@ def _ado_plausibility_for_boundary_amp_alert(
     from same-base non-LOH background cells. If empirical estimation is disabled
     or insufficient background cells are available, it falls back to the fixed
     per-amplicon rate cfg.phase5_qc_alert_ado_rate_per_amplicon.
-    """
-    import math
-    import numpy as np
 
+    The observed LOH clone size is compared with Binomial(N, p_cell), where N
+    is the base-lineage size; ``P(X >= observed)`` below
+    ``phase5_qc_alert_ado_unlikely_pvalue`` (default 0.01) gives the verdict
+    "unlikely from ADO alone".
+    """
     n_amplicons = int(max(0, block.get("n_amplicons", 0)))
     n_observed = int(max(0, n_observed))
     n_original = _base_lineage_size_for_clone(state, clone_label)
@@ -805,6 +867,7 @@ def _ado_plausibility_for_boundary_amp_alert(
         "ado_explanation": explanation,
     }
 
+
 def _final_clone_loh_block_qc(state: "PipelineState", cfg: "LOHConfig", clone_label: str) -> tuple[str, str, int | None, dict]:
     """
     Return (details, qc_alert, min_amplicons, ado_qc) for final LOH clone summary.
@@ -815,8 +878,6 @@ def _final_clone_loh_block_qc(state: "PipelineState", cfg: "LOHConfig", clone_la
     calculated for every final LOH confidence tier by default, so mid/high
     calls receive the same empirical-background QC readout as low calls.
     """
-    from .loh_config import extract_chr_arms
-
     if not bool(getattr(cfg, "phase5_alert_three_amplicon_loh_blocks", True)):
         return "", "", None, {}
 
@@ -873,6 +934,14 @@ def _final_clone_loh_block_qc(state: "PipelineState", cfg: "LOHConfig", clone_la
     return details, "; ".join(alerts), min_amp, ado_qc
 
 
+def _yes_flags(row: pd.Series) -> tuple[str, str, str]:
+    """Return the Hem?/TP53?/17p? table cells (" Yes" or four blanks) for a row."""
+    hem_str = " Yes" if row["is_hem"] else "    "
+    tp53_str = " Yes" if row["is_tp53"] else "    "
+    p17_str = " Yes" if row["has_chr17p_loh"] else "    "
+    return hem_str, tp53_str, p17_str
+
+
 def run_phase5(
     state: "PipelineState",
     cfg: "LOHConfig | None" = None,
@@ -884,29 +953,42 @@ def run_phase5(
     Build an LOH clone summary table and check for Hem-TP53 clones
     missing chr17p LOH.
 
-    ``loh_min_cells`` optionally relaxes the small-clone prune floor for LOH
-    labels only (used by the Phase 6 residual scan). When None, the standard
-    ``min_final_clone_size`` floor applies to every label.
+    Parameters
+    ----------
+    state : PipelineState
+        Pipeline state after Phase 4. Its clone labels are modified in place
+        by the pre-summary cleanup (similar-LOH merge, small-clone prune).
+    cfg : LOHConfig, optional
+        Configuration; defaults to ``state.config``.
+    loh_min_cells : int, optional
+        Optionally relaxes the small-clone prune floor for LOH labels only
+        (used by the Phase 6 residual scan). When None, the standard
+        ``min_final_clone_size`` floor applies to every label.
+    heading : str, default "PHASE 5: LOH CLONE SUMMARY"
+        Banner text; the part before ``:`` (title-cased) prefixes the cleanup
+        message. A blank heading falls back to the default.
 
-    Returns a DataFrame with one row per surviving clone.
+    Returns
+    -------
+    pandas.DataFrame
+        One row per surviving clone (columns as in ``_SUMMARY_COLUMNS``).
+        Also stored in ``state.results["phase5_summary"]``.
+
+    Notes
+    -----
+    Sets ``state.ado_probability`` to an empty DataFrame. Prints (via
+    ``vprint``) partition counts, per-category clone tables, detected LOH
+    arms, confidence counts, QC alerts for blocks at exactly
+    ``phase5_qc_alert_amplicons`` amplicons, ADO-plausibility readouts and a
+    Hem-TP53 / chr17p consistency check.
     """
-    import re as _re
-
-    from .loh_config import (
-        LOH_TAG,
-        extract_chr_arms,
-        is_hem_like,
-        is_small_label,
-        sort_chromosome_arms,
-        vprint,
-    )
-
     if cfg is None:
         cfg = state.config
 
-    min_size = cfg.min_final_clone_size
+    # Kept from the original: unused, but fails fast if cfg lacks the field.
+    min_size = cfg.min_final_clone_size  # noqa: F841
 
-    heading = str(heading).strip() or "PHASE 5: LOH CLONE SUMMARY"
+    heading = str(heading).strip() or _DEFAULT_HEADING
     phase_tag = heading.split(":", 1)[0].title()
     vprint("\n" + "=" * 60, cfg)
     vprint(heading, cfg)
@@ -925,10 +1007,8 @@ def run_phase5(
             cfg,
         )
 
-    # ── ADO-combination probability QC removed from default Phase 5 ─────
-    # Phase 5 no longer requires amplicon_ado_rates and does not run the
-    # ADO-combination probability model. WT/Het→Hem/Hom ADO handling is done
-    # in Phase 4b by profile similarity while excluding the somatic amplicon.
+    # The ADO-combination probability model is no longer run here; WT/Het→
+    # Hem/Hom ADO handling happens in Phase 4b. Keep the attribute, empty.
     state.ado_probability = pd.DataFrame()
 
     # ── Build per-clone records ───────────────────────────────────────
@@ -946,7 +1026,7 @@ def run_phase5(
 
         arms = extract_chr_arms(label)
         is_hem = is_hem_like(label)
-        is_tp53 = bool(_re.search(r"TP53", str(label), flags=_re.IGNORECASE))
+        is_tp53 = bool(re.search(r"TP53", str(label), flags=re.IGNORECASE))
         has_17p = "chr17p" in arms
         loh_block_details = ""
         loh_qc_alert = ""
@@ -998,38 +1078,7 @@ def run_phase5(
     summary = pd.DataFrame(records)
 
     if summary.empty:
-        summary = pd.DataFrame(
-            columns=[
-                "clone_label",
-                "n_cells",
-                "is_loh",
-                "is_subclonal",
-                "is_small",
-                "loh_arms",
-                "is_hem",
-                "is_tp53",
-                "has_chr17p_loh",
-                "loh_block_details",
-                "loh_block_min_amplicons",
-                "loh_confidence",
-                "loh_confidence_reason",
-                "qc_alert",
-                "ado_alert_explanation",
-                "ado_rate_source",
-                "ado_assumed_amplicon_rate",
-                "ado_empirical_background_cells",
-                "ado_empirical_dp_used",
-                "ado_empirical_min_depth",
-                "ado_empirical_amplicon_rates",
-                "ado_cell_probability",
-                "ado_original_clone_size",
-                "ado_observed_loh_cells",
-                "ado_expected_cells",
-                "ado_pvalue_ge_observed",
-                "ado_verdict",
-                "ado_qc_scope",
-            ]
-        )
+        summary = pd.DataFrame(columns=list(_SUMMARY_COLUMNS))
         state.results["phase5_summary"] = summary
         vprint("\n  No surviving clones to summarize.", cfg)
         vprint(f"\n  Result keys: {sorted(state.results.keys())}", cfg)
@@ -1071,9 +1120,7 @@ def run_phase5(
 
     loh_rows = summary[mask_loh].sort_values("n_cells", ascending=False)
     for _, row in loh_rows.iterrows():
-        hem_str = " Yes" if row["is_hem"] else "    "
-        tp53_str = " Yes" if row["is_tp53"] else "    "
-        p17_str = " Yes" if row["has_chr17p_loh"] else "    "
+        hem_str, tp53_str, p17_str = _yes_flags(row)
         conf_str = str(row.get("loh_confidence", "") or "")
         vprint(
             f"  {row['clone_label']:<60s} {row['n_cells']:>5d}   Yes  "
@@ -1114,9 +1161,7 @@ def run_phase5(
 
     non_loh_rows = summary[mask_non].sort_values("n_cells", ascending=False)
     for _, row in non_loh_rows.iterrows():
-        hem_str = " Yes" if row["is_hem"] else "    "
-        tp53_str = " Yes" if row["is_tp53"] else "    "
-        p17_str = " Yes" if row["has_chr17p_loh"] else "    "
+        hem_str, tp53_str, p17_str = _yes_flags(row)
         vprint(
             f"  {row['clone_label']:<60s} {row['n_cells']:>5d}     —  "
             f"{'—':<30s}  {'—':>6s}  {hem_str:>5s}  {tp53_str:>5s}  {p17_str:>5s}",

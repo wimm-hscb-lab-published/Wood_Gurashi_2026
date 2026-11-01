@@ -1,12 +1,16 @@
-# CNV_Utils package
-# Split from monolithic CNV_Utils.py into logical modules
+"""CNV_Utils: copy-number and allelic-imbalance analysis for single-cell DNA.
 
-from .cytoband_mapping import (
-    map_loh_to_cytobands,
-    summarize_loh_cytobands_by_cluster,
-    analyze_loh_heterogeneity,
-    compare_all_loh_heterogeneity,
-)
+Modules
+-------
+variant_grouping  Group informative variants by chromosome arm.
+informativeness   Test which variants are informative between clones (AF shifts vs wild type).
+cnv_extraction    Per-amplicon ploidy / read depth per clone.
+explore_gene_cnv  Inputs for per-gene ploidy region plots; RefSeq GTF exon loading.
+visualization     Variant-by-clone and integrated CNV/BAF plots.
+
+See README.md for details.
+"""
+
 
 from .variant_grouping import (
     group_informative_variants_by_chr_arm,
@@ -14,7 +18,6 @@ from .variant_grouping import (
 
 from .informativeness import (
     test_variant_informativeness,
-    test_cnv_informative_variants,
     expand_informative_variants,
 )
 
@@ -29,14 +32,6 @@ from .explore_gene_cnv import (
 )
 
 from .visualization import (
-    plot_subclones,
-    plot_all_loh_subclones_summary,
-    plot_all_chromosomes_single_figure,
     visualise_variants_by_clone,
-    visualise_binary_variants_by_clone,
-    visualise_variants_by_clone_grouped,
-    visualise_variants_ploidy_by_clone,
-    visualise_binary_variants_ploidy_by_clone,
-    visualise_variants_ploidy_by_clone_grouped,
     plot_integrated_cnv_baf_with_significance,
 )

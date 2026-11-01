@@ -24,6 +24,22 @@ column to ``object`` holding a mix of ints, floats and *strings*. A downstream
 The cache is a cache, not a source of truth: dropped rows are simply re-pulled
 from the API on the next annotation run, so repair costs API calls rather than
 information.
+
+Main entry points
+-----------------
+Chromosome / variant-ID parsing
+    :func:`extract_chr_num`, :func:`extract_chr`, :func:`extract_position`,
+    :func:`chrom_key`.
+Assay hygiene
+    :func:`sanitize_row_attrs`, :func:`drop_scalar_row_attrs`,
+    :func:`subset_assay_to_cells`.
+Varsome cache maintenance
+    :func:`varsome_db_path`, :func:`varsome_db_lock`, :func:`repair_varsome_db`.
+Annotation
+    :func:`annotate_with_repair`, :func:`annotate_assay_in_chunks`.
+Export
+    :func:`variant_metadata_frame`, :func:`export_assay_layers`,
+    :func:`export_cell_subset_matrices`.
 """
 
 from __future__ import annotations
@@ -31,7 +47,6 @@ from __future__ import annotations
 import copy
 import csv
 import gc
-import math
 import os
 import shutil
 import sys
@@ -47,8 +62,25 @@ import pandas as pd
 # ── Chromosome helpers ────────────────────────────────────────────────────────
 
 def extract_chr_num(variant: str) -> int:
-    """Return a sortable integer for the chromosome in a variant ID like
-    ``'chr17:7577538:C/T'``.  chrX → 23, chrY → 24, chrM/chrMT → 25."""
+    """Return a sortable integer for the chromosome of a variant ID.
+
+    Parameters
+    ----------
+    variant : str
+        Variant ID such as ``'chr17:7577538:C/T'``.
+
+    Returns
+    -------
+    int
+        ``chrX`` → 23, ``chrY`` → 24, ``chrM``/``chrMT`` → 25, otherwise the
+        integer after the first three characters of the chromosome token, or
+        999 if that is not an integer.
+
+    Notes
+    -----
+    The first three characters are stripped without checking that they are
+    ``'chr'``, so ``'17:...'`` yields 999 rather than 17.
+    """
     chr_part = variant.split(":")[0]
     mapping = {"chrX": 23, "chrY": 24, "chrM": 25, "chrMT": 25}
     if chr_part in mapping:
@@ -60,13 +92,35 @@ def extract_chr_num(variant: str) -> int:
 
 
 def extract_chr(col: str) -> str:
-    """Return the chromosome token from a variant column name."""
+    """Return the text before the first ``':'`` of a variant column name.
+
+    Parameters
+    ----------
+    col : str
+        Variant column name, e.g. ``'chr17:7577538:C/T'``.
+
+    Returns
+    -------
+    str
+        The chromosome token, e.g. ``'chr17'``.
+    """
     return col.split(":")[0]
 
 
 def extract_position(variant: str) -> int:
-    """Return the 1-based position from a variant ID like
-    ``'chr17:7577538:C/T'``, or -1 if unparseable."""
+    """Return the position field of a variant ID.
+
+    Parameters
+    ----------
+    variant : str
+        Variant ID such as ``'chr17:7577538:C/T'`` (cast with ``str``).
+
+    Returns
+    -------
+    int
+        The integer second ``':'``-separated field, or -1 when there is no
+        second field or it is not an integer.
+    """
     parts = str(variant).split(":")
     if len(parts) < 2:
         return -1
@@ -77,10 +131,24 @@ def extract_position(variant: str) -> int:
 
 
 def chrom_key(s: pd.Series) -> pd.Series:
-    """Map chromosome labels to sortable integers (1‒22, X=23, Y=24, MT=25).
+    """Map chromosome labels to sortable integers.
 
-    Handles optional ``chr`` prefix, mixed case, and pushes non-standard
-    contigs to the end.
+    Parameters
+    ----------
+    s : pd.Series
+        Chromosome labels, with or without a ``chr`` prefix, any case.
+
+    Returns
+    -------
+    pd.Series
+        Integer keys: 1–22, X → 23, Y → 24, MT/M → 25. Non-standard contigs
+        get ``1_000_000 + k`` where ``k`` is their order of first appearance
+        (``pd.factorize``), so they sort after the standard chromosomes.
+
+    Notes
+    -----
+    Every occurrence of the substring ``'chr'`` is removed (before
+    upper-casing), not only a leading prefix.
     """
     s = s.astype(str).str.replace("chr", "", regex=False).str.upper().str.strip()
     mapping = {str(i): i for i in range(1, 23)}
@@ -98,7 +166,15 @@ def chrom_key(s: pd.Series) -> pd.Series:
 # ── Array / assay helpers ─────────────────────────────────────────────────────
 
 def sanitize_row_attrs(assay):
-    """Drop ``row_attrs`` that would break slicing (0-D or wrong length)."""
+    """Delete ``row_attrs`` that would break mosaic slicing, in place.
+
+    Parameters
+    ----------
+    assay
+        Mosaic assay. Entries that are 0-D, or 1-D with a length different
+        from ``assay.shape[0]``, are deleted. Arrays with 2+ dimensions are
+        kept regardless of shape.
+    """
     n = assay.shape[0]
     bad = [
         k for k, v in list(assay.row_attrs.items())
@@ -109,28 +185,18 @@ def sanitize_row_attrs(assay):
 
 
 def drop_scalar_row_attrs(assay):
-    """Drop 0-D ``row_attrs`` from *assay* (in-place)."""
+    """Delete 0-D ``row_attrs`` from an assay, in place.
+
+    Parameters
+    ----------
+    assay
+        Mosaic assay, or None (no-op).
+    """
     if assay is None:
         return
     for k, v in list(assay.row_attrs.items()):
         if np.asarray(v).ndim == 0:
             del assay.row_attrs[k]
-
-
-def heatmap_shape(fig) -> tuple:
-    """Return ``(n_rows, n_cols)`` from the first heatmap-like trace in a
-    Plotly figure."""
-    for tr in fig.data:
-        z = getattr(tr, "z", None)
-        if z is None:
-            continue
-        try:
-            n_rows = len(z)
-            n_cols = len(z[0]) if n_rows else 0
-            return n_rows, n_cols
-        except Exception:
-            pass
-    return 0, 0
 
 
 # ── Varsome cache: schema ─────────────────────────────────────────────────────
@@ -181,6 +247,16 @@ def varsome_db_path() -> Path:
     Resolved from the installed package rather than hardcoded, so this stays
     correct if the conda env is rebuilt or the module is imported from a
     different environment.
+
+    Returns
+    -------
+    pathlib.Path
+        ``Varsome().db_path`` from ``missionbio.annotation.varsome``.
+
+    Raises
+    ------
+    AttributeError
+        If the ``Varsome`` instance has no ``db_path`` attribute.
     """
     from missionbio.annotation.varsome import Varsome
 
@@ -207,11 +283,31 @@ def varsome_db_lock(path=None, *, timeout: float = 600.0, poll: float = 0.5,
 
     Parameters
     ----------
+    path
+        Cache path; None resolves it with :func:`varsome_db_path`. The lock
+        file is ``<path>.lock`` (its parent directory is created).
     timeout
         Seconds to wait for the lock before raising. Annotating a large variant
         space can legitimately take several minutes, hence the generous default.
     poll
         Seconds between acquisition attempts.
+    verbose
+        Print a line on every failed attempt while waiting.
+
+    Yields
+    ------
+    pathlib.Path
+        The cache path the lock protects.
+
+    Raises
+    ------
+    TimeoutError
+        If the lock is not acquired within ``timeout`` seconds.
+
+    Notes
+    -----
+    Uses ``fcntl.flock`` (POSIX only). The lock file is left on disk after
+    release.
     """
     import fcntl  # POSIX only; fine on the cluster and on macOS
 
@@ -331,124 +427,6 @@ def _varsome_normalize_position(row) -> bool:
     return False
 
 
-def _varsome_position_style(row) -> str:
-    """Classify a row's ``Position`` formatting as ``'int'``, ``'float'``,
-    ``'blank'`` or ``'other'`` — used for reporting in :func:`inspect_varsome_db`."""
-    raw = str(row[VARSOME_POSITION_IDX]).strip()
-    if raw == "" or raw.lower() in {"nan", "none"}:
-        return "blank"
-    try:
-        float(raw)
-    except ValueError:
-        return "other"
-    return "float" if "." in raw else "int"
-
-
-# ── Varsome cache: inspection ─────────────────────────────────────────────────
-
-def inspect_varsome_db(path=None, *, max_examples: int = 10,
-                       verbose: bool = True) -> dict:
-    """Report on the health of the cache without modifying it.
-
-    Covers both failure modes: structural damage (bad field counts, torn lines)
-    and ``Position`` formatting heterogeneity. A cache that is structurally
-    perfect but mixes ``'148386525.0'`` with ``'101917521'`` will still break
-    annotation, so ``needs_repair`` accounts for both.
-
-    Returns
-    -------
-    dict
-        ``{'path', 'n_lines', 'n_ok', 'n_bad', 'n_duplicate_keys',
-        'position_styles', 'position_mixed', 'needs_repair', 'reasons',
-        'examples'}``
-    """
-    def vprint(msg):
-        if verbose:
-            print(msg)
-
-    db = Path(path) if path is not None else varsome_db_path()
-
-    empty_result = {
-        "path": str(db), "n_lines": 0, "n_ok": 0, "n_bad": 0,
-        "n_duplicate_keys": 0, "position_styles": {}, "position_mixed": False,
-        "needs_repair": False, "reasons": {}, "examples": [],
-    }
-
-    if not db.exists():
-        vprint(f"  Cache does not exist: {db}")
-        return empty_result
-
-    reasons, examples = {}, []
-    seen_keys, dup_keys = set(), 0
-    pos_styles = {}
-    n_lines = n_ok = 0
-
-    with open(db, newline="", encoding="utf-8", errors="replace") as fh:
-        reader = csv.reader(fh)
-
-        try:
-            header = next(reader)
-        except StopIteration:
-            vprint(f"  Cache is empty: {db}")
-            return empty_result
-
-        if header != VARSOME_DB_COLUMNS:
-            vprint(f"  ⚠️  Header differs from the expected {VARSOME_N_FIELDS}-column "
-                   f"schema (found {len(header)} fields)")
-
-        for line_no, row in enumerate(reader, start=2):
-            n_lines += 1
-            reason = _varsome_classify_row(row)
-
-            if reason == "ok":
-                n_ok += 1
-                key = (row[0].strip(), row[1].strip())
-                if key in seen_keys:
-                    dup_keys += 1
-                seen_keys.add(key)
-
-                style = _varsome_position_style(row)
-                pos_styles[style] = pos_styles.get(style, 0) + 1
-            else:
-                reasons[reason] = reasons.get(reason, 0) + 1
-                if len(examples) < max_examples:
-                    examples.append((line_no, reason, ",".join(row)[:160]))
-
-    n_bad = n_lines - n_ok
-
-    # Only int-vs-float heterogeneity matters; blanks read back as NaN and do
-    # not push the column to object dtype on their own.
-    numeric_styles = {s for s in pos_styles if s in {"int", "float"}}
-    position_mixed = len(numeric_styles) > 1 or "other" in pos_styles
-
-    needs_repair = bool(n_bad or dup_keys or position_mixed)
-
-    vprint(f"  Cache: {db}")
-    vprint(f"  {n_lines} data line(s): {n_ok} valid, {n_bad} malformed, "
-           f"{dup_keys} duplicate key(s)")
-    vprint(f"  Position formatting: {pos_styles}")
-    if position_mixed:
-        vprint("  ⚠️  Mixed Position formatting — this causes "
-               "\"invalid literal for int()\" during annotation")
-    if reasons:
-        vprint(f"  Drop reasons: {reasons}")
-    for line_no, reason, preview in examples:
-        vprint(f"    line {line_no}  [{reason}]  {preview}")
-
-    return {
-        "path": str(db),
-        "n_lines": n_lines,
-        "n_ok": n_ok,
-        "n_bad": n_bad,
-        "n_duplicate_keys": dup_keys,
-        "position_styles": pos_styles,
-        "position_mixed": position_mixed,
-        "needs_repair": needs_repair,
-        "reasons": reasons,
-        "examples": examples,
-    }
-
-
 # ── Varsome cache: repair ─────────────────────────────────────────────────────
 
 def repair_varsome_db(path=None, *, backup: bool = True, dry_run: bool = False,
@@ -466,6 +444,8 @@ def repair_varsome_db(path=None, *, backup: bool = True, dry_run: bool = False,
 
     Parameters
     ----------
+    path
+        Cache path; None resolves it with :func:`varsome_db_path`.
     backup
         Copy the file to ``<name>.<timestamp>.bak`` before rewriting.
     dry_run
@@ -476,12 +456,33 @@ def repair_varsome_db(path=None, *, backup: bool = True, dry_run: bool = False,
         multiple rows for a single variant.
     normalize_positions
         Rewrite the ``Position`` field to a consistent bare-integer form.
+    verbose
+        Print the summary and progress lines.
 
     Returns
     -------
     dict
         ``{'path', 'backup', 'n_before', 'n_kept', 'n_dropped', 'n_deduped',
         'n_positions_fixed', 'reasons'}``
+
+    Raises
+    ------
+    FileNotFoundError
+        If the cache file does not exist.
+    AssertionError
+        If the rewritten file does not re-parse (via
+        ``pd.read_csv(index_col=[0, 1])``) with 16 data columns, the expected
+        row count and (when normalising) a non-object ``Position`` dtype.
+
+    Notes
+    -----
+    Steps, in order: classify each data line with
+    :func:`_varsome_classify_row` (drop anything not ``'ok'``); normalise
+    ``Position``; dedupe on ``(Genome, Variant ID)`` keeping the first row
+    unless a later one has strictly more populated fields; skip the rewrite if
+    nothing changed and the header is canonical; back up; write to
+    ``<path>.tmp`` and ``os.replace`` it over the cache; re-parse to verify.
+    The canonical header is always written, whatever the original header was.
     """
     def vprint(msg):
         if verbose:
@@ -609,38 +610,6 @@ def repair_varsome_db(path=None, *, backup: bool = True, dry_run: bool = False,
             "n_positions_fixed": n_positions_fixed, "reasons": reasons}
 
 
-def reset_varsome_db(path=None, *, backup: bool = True,
-                     verbose: bool = True) -> dict:
-    """Clear the cache back to a bare header.
-
-    Preferred over ``rm``-ing the file: the header-only form is guaranteed to
-    parse, whereas a missing file depends on how ``load_database`` handles a
-    non-existent path. Every variant is re-pulled from the API on the next run,
-    so reach for :func:`repair_varsome_db` first.
-    """
-    def vprint(msg):
-        if verbose:
-            print(msg)
-
-    db = Path(path) if path is not None else varsome_db_path()
-    db.parent.mkdir(parents=True, exist_ok=True)
-
-    backup_path = None
-    if backup and db.exists():
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = db.with_suffix(f"{db.suffix}.{stamp}.bak")
-        shutil.copy2(db, backup_path)
-        vprint(f"  ✓ Backup: {backup_path}")
-
-    tmp_path = db.with_suffix(db.suffix + ".tmp")
-    with open(tmp_path, "w", newline="", encoding="utf-8") as fh:
-        csv.writer(fh, lineterminator="\n").writerow(VARSOME_DB_COLUMNS)
-    os.replace(tmp_path, db)
-
-    vprint(f"  ✓ Reset {db} to a bare header")
-    return {"path": str(db), "backup": str(backup_path) if backup_path else None}
-
-
 # ── Annotation ────────────────────────────────────────────────────────────────
 
 def _is_varsome_cache_dtype_error(exc) -> bool:
@@ -674,12 +643,29 @@ def annotate_with_repair(assay, *, max_attempts: int = 2, lock: bool = True,
 
     Parameters
     ----------
+    assay
+        Mosaic DNA assay (or slice) with a ``get_annotations()`` method.
+    max_attempts
+        Total number of ``get_annotations()`` calls allowed.
     lock
         Hold the advisory cache lock for the duration of the call. Set False
         only if the caller already holds it.
     repair_on_parse_error
         Repair and retry on the cache-shaped errors above. Set False to let
         them propagate.
+    verbose
+        Print the repair notice and forward ``verbose`` to the lock / repair.
+
+    Returns
+    -------
+    pd.DataFrame
+        Whatever ``assay.get_annotations()`` returns.
+
+    Raises
+    ------
+    Exception
+        Any non-cache error immediately, and the cache error itself on the
+        last attempt.
     """
     def vprint(msg):
         if verbose:
@@ -843,7 +829,7 @@ def subset_assay_to_cells(
     require_any: bool = True,
     verbose: bool = True,
 ):
-    """Return a copy of *assay* restricted to *barcodes*.
+    """Return a copy of an assay restricted to a set of barcodes.
 
     Accepts a barcode iterable or any object with an ``.index`` (e.g. a
     per-cell DataFrame such as ``df_aberrancies``). Row attrs are sanitized
@@ -853,10 +839,29 @@ def subset_assay_to_cells(
     ----------
     preserve_assay_order
         Keep the assay's own barcode ordering (recommended — keeps row_attrs
-        interpretable and deduplicates). If False, use the order given.
+        interpretable and deduplicates). If False, the barcodes are passed to
+        the slice in the order given, but mosaic's barcode slicing returns rows
+        in assay order regardless.
     require_any
         Raise if no barcode overlaps; the usual cause is a table indexed by
         variant rather than by cell.
+    verbose
+        Print match counts and up to three missing barcodes.
+
+    Returns
+    -------
+    assay
+        ``copy.copy(assay)`` sliced to the matched barcodes.
+
+    Raises
+    ------
+    ValueError
+        If no barcode matches and ``require_any`` is True.
+
+    Notes
+    -----
+    Barcodes are compared as strings. :func:`sanitize_row_attrs` is applied to
+    the *input* assay (mutating it) before slicing.
     """
     def vprint(msg):
         if verbose:
@@ -906,7 +911,7 @@ def variant_metadata_frame(
     sort_genomic: bool = False,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """Build a per-variant metadata table for *assay*.
+    """Build a per-variant metadata table for an assay.
 
     Collects every 1-D ``col_attrs`` entry whose length matches the variant
     axis — which after :func:`annotate_assay_in_chunks` includes the API
@@ -919,11 +924,15 @@ def variant_metadata_frame(
 
     Parameters
     ----------
+    assay
+        Mosaic DNA assay.
     annotations
         Optional annotation DataFrame indexed by variant id, for the case where
         :func:`annotate_assay_in_chunks` was run with ``add_col_attrs=False``.
         Columns already present as ``col_attrs`` are suffixed ``_annot`` rather
         than overwriting.
+    id_key
+        ``col_attrs`` key holding variant ids; used as the index name.
     include_subset_stats
         Append per-variant genotype summaries computed over the cells present
         on *this* assay: WT/HET/HOM/missing counts, genotype rate, mutated
@@ -932,14 +941,29 @@ def variant_metadata_frame(
         Also append mean AF and mean DP over genotyped cells only. This holds
         two full matrices in memory at once — avoid on the unfiltered variant
         space unless the cell subset is small.
+    ngt_layer
+        Genotype layer used for the summaries (codes 0=WT, 1=HET, 2=HOM,
+        3=missing).
     sort_genomic
         Sort by chromosome then position. Note this breaks the row-order
         correspondence with the exported matrix columns.
+    verbose
+        Print progress and warnings.
 
     Returns
     -------
     pd.DataFrame
-        Indexed by variant id (index name ``id``).
+        Indexed by variant id (index name ``id_key``). ``chrom`` and
+        ``position`` columns parsed from the id are inserted first when not
+        already present.
+
+    Notes
+    -----
+    ``genotype_rate = (WT+HET+HOM) / n_cells``,
+    ``mutated_cell_frac = (HET+HOM) / (WT+HET+HOM)`` and
+    ``vaf_by_cell_count = 100 * (HET + 2*HOM) / (2 * (WT+HET+HOM))``, with
+    NaN where no cell is genotyped. Mean AF / DP use only cells with
+    NGT != 3.
     """
     def vprint(msg):
         if verbose:
@@ -1061,8 +1085,13 @@ def export_assay_layers(
 
     Parameters
     ----------
+    assay
+        Mosaic assay to export.
+    out_dir
+        Output directory (created if needed).
     layers
-        Layer names to export; None exports every layer on the assay.
+        Layer names to export; None exports every layer on the assay. Missing
+        layers are skipped with a warning.
     suffix
         Appended to the layer name, e.g. ``'_all_variants'``.
     parquet
@@ -1076,8 +1105,17 @@ def export_assay_layers(
         `parquet` when given; `parquet` remains the single-format default
         for backward compatibility. Note this must be a tuple — ``("csv")``
         is the string ``"csv"``, which iterates to ``('c', 's', 'v')``.
+    label_key
+        Only used in the warning printed when ``assay.get_labels()`` fails
+        (labels then become ``'NA'``); labels are always read via
+        ``get_labels()``.
     downcast
-        Cast NGT to int8 and float layers to float32 before writing.
+        Cast NGT to int8 and float layers to float32 before writing; a cast
+        failing with TypeError/ValueError leaves the dtype unchanged.
+    size_warn_gb
+        Warn when the estimated CSV size (≈6 bytes per value) exceeds this.
+    verbose
+        Print progress and warnings.
 
     Returns
     -------
@@ -1187,9 +1225,34 @@ def export_cell_subset_matrices(
 
     Parameters
     ----------
+    assay
+        Full mosaic DNA assay (annotated in place when ``annotate=True``;
+        scalar row_attrs are dropped from it first).
+    barcodes
+        Cell barcodes, or an object with an ``.index`` of barcodes; see
+        :func:`subset_assay_to_cells`.
+    out_dir
+        Output directory.
+    annotate, annot_chunk_size
+        Run :func:`annotate_assay_in_chunks` with this chunk size first.
     use_cache_lock, repair_on_parse_error
         Forwarded to :func:`annotate_assay_in_chunks`; ignored when
         ``annotate=False``.
+    layers, suffix, parquet, formats, downcast
+        Forwarded to :func:`export_assay_layers`.
+    export_metadata, metadata_stem, metadata_formats
+        Write :func:`variant_metadata_frame` of the subset to
+        ``<out_dir>/<metadata_stem><suffix>.<fmt>`` for each format.
+    include_subset_stats, include_af_dp_stats
+        Forwarded to :func:`variant_metadata_frame`.
+    verbose
+        Print section banners and progress.
+
+    Notes
+    -----
+    The annotation frame returned by the annotation step is *not* passed to
+    :func:`variant_metadata_frame` (``annotations=None`` is hard-coded); it
+    relies on the annotations having been added as ``col_attrs``.
 
     Typical use — full variant space, cells from the aberrancy table::
 
@@ -1253,8 +1316,8 @@ def export_cell_subset_matrices(
         vprint("\n" + "=" * 70)
         vprint("EXPORTING VARIANT METADATA")
         vprint("=" * 70)
-        # Annotations are already col_attrs on `sub` when add_col_attrs ran, so
-        # only pass the frame through if it would otherwise be lost.
+        # Annotations are already col_attrs on `sub` (add_col_attrs defaults
+        # to True in annotate_assay_in_chunks), so no frame is passed here.
         metadata = variant_metadata_frame(
             sub,
             annotations=None,
@@ -1286,13 +1349,3 @@ def export_cell_subset_matrices(
         "metadata": metadata,
         "paths": paths,
     }
-
-
-# ── Statistics ────────────────────────────────────────────────────────────────
-
-def binomial_pval_right_tail(n: int, N: int, p: float) -> float:
-    """Exact right-tail binomial p-value  P(X >= n)."""
-    pval = 0.0
-    for k in range(n, N + 1):
-        pval += math.comb(N, k) * (p ** k) * ((1 - p) ** (N - k))
-    return pval

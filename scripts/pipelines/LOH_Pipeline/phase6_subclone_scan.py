@@ -28,6 +28,7 @@ returns a per-parent/per-arm audit table.  Replot with
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 import numpy as np
@@ -45,8 +46,53 @@ from .loh_config import (
 )
 from .phase5 import run_phase5
 
+# Amplicon values treated as "no amplicon annotation".
+_MISSING_AMPLICON_VALUES = (None, "", "nan", "None")
+
+
+# ── small shared helpers ─────────────────────────────────────────────
+def _sample_idx_for_cell(state, cell_id):
+    """Positional Sample index of a DataFrame cell id (via its barcode), or None."""
+    return state.sample_idx_for_barcode(str(state.cell_to_barcode.get(cell_id, cell_id)))
+
+
+def _cells_with_label(state, cells, labels: pd.Series, label) -> list:
+    """Cells (in input order) whose positional label in ``labels`` equals ``str(label)``."""
+    out = []
+    for cell_id in cells:
+        sample_idx = _sample_idx_for_cell(state, cell_id)
+        if sample_idx is not None and str(labels.iloc[sample_idx]) == str(label):
+            out.append(cell_id)
+    return out
+
+
+def _min_child_size(cfg) -> int:
+    """Phase-6 child size floor: ``phase6_residual_min_child_size`` else ``min_final_clone_size`` (5)."""
+    return int(
+        getattr(
+            cfg,
+            "phase6_residual_min_child_size",
+            getattr(cfg, "min_final_clone_size", 5),
+        )
+    )
+
+
+def _to_float_array(values) -> np.ndarray:
+    """Coerce a Series/DataFrame of AFs to a float ndarray (non-numeric → NaN)."""
+    return values.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+
+def _clone_label_series(state) -> pd.Series:
+    """Current ``Clone`` row attribute as a string Series (positional index)."""
+    return pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
+
 
 def _normalise_clone_labels(clone_labels: Iterable[str] | str | None) -> list[str]:
+    """Return stripped, de-duplicated (order-kept) parent labels.
+
+    A single string is treated as one label. Raises ValueError if
+    ``clone_labels`` is None or contains no non-empty label.
+    """
     if clone_labels is None:
         raise ValueError(
             "clone_labels is required. Provide explicit final parent labels, "
@@ -109,14 +155,7 @@ def _parent_has_possible_loh_block(
         return False
 
     if min_candidate_cells is None:
-        min_candidate_cells = max(
-            2,
-            int(getattr(
-                cfg,
-                "phase6_residual_min_child_size",
-                getattr(cfg, "min_final_clone_size", 5),
-            )),
-        )
+        min_candidate_cells = max(2, _min_child_size(cfg))
 
     low = float(getattr(cfg, "low_allele_threshold", 10.0))
     high = float(getattr(cfg, "high_allele_threshold", 90.0))
@@ -128,9 +167,7 @@ def _parent_has_possible_loh_block(
         ]
         if len(arm_vars) < min_block:
             continue
-        mat = state.df_numeric.loc[cells, arm_vars].apply(
-            pd.to_numeric, errors="coerce"
-        ).to_numpy(dtype=float)
+        mat = _to_float_array(state.df_numeric.loc[cells, arm_vars])
         # NaN -> not extreme, which also breaks a contiguous run (conservative).
         extreme = (mat <= low) | (mat >= high)
         n_candidate = 0
@@ -222,8 +259,8 @@ def _auto_select_scan_parents(
     return candidates
 
 
-
 def _variant_position(variant: str) -> int:
+    """Genomic start of ``chr:pos[-end]:...`` ids; unparseable ids sort last (10**18)."""
     try:
         return int(str(variant).split(":")[1].split("-")[0])
     except Exception:
@@ -231,6 +268,7 @@ def _variant_position(variant: str) -> int:
 
 
 def _variant_to_amplicon(state) -> dict[str, str]:
+    """Map variant id → amplicon from DNA ``col_attrs``; {} if unavailable or misaligned."""
     try:
         ids = list(state.Sample.dna.col_attrs.get("id", []))
         amps = list(state.Sample.dna.col_attrs.get("amplicon", []))
@@ -243,14 +281,12 @@ def _variant_to_amplicon(state) -> dict[str, str]:
 
 def _remove_arm_token(label: str, chr_arm: str) -> str:
     """Remove the post-scan LOH token for exactly one chromosome arm."""
-    import re
     out = re.sub(
         rf"\s+LOH-C\d+\s+{re.escape(str(chr_arm))}(?::\S+)?",
         "",
         str(label),
     ).strip()
     return re.sub(r"\s+", " ", out)
-
 
 
 def _sample_row_attr_array(state, key: str, *, fill_value: str = "") -> np.ndarray:
@@ -267,6 +303,7 @@ def _sample_row_attr_array(state, key: str, *, fill_value: str = "") -> np.ndarr
 
 
 def _write_sample_row_attr(state, key: str, arr: np.ndarray) -> None:
+    """Store ``arr`` as an object array in ``Sample.dna.row_attrs[key]``."""
     state.Sample.dna.row_attrs[key] = np.asarray(arr, dtype=object)
 
 
@@ -293,8 +330,7 @@ def _set_phase6_primary_metadata(
     member_role_arr = _sample_row_attr_array(state, "phase6_primary_loh_member_role")
 
     for cell_id in cell_ids:
-        barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-        sample_idx = state.sample_idx_for_barcode(barcode)
+        sample_idx = _sample_idx_for_cell(state, cell_id)
         if sample_idx is None:
             continue
         primary_child[sample_idx] = str(child_label)
@@ -310,8 +346,7 @@ def _record_phase6_secondary_arm_evidence(state, cell_ids, chr_arm: str) -> None
     """Record an additional LOH arm without fragmenting the primary child."""
     secondary = _sample_row_attr_array(state, "phase6_secondary_loh_arms")
     for cell_id in cell_ids:
-        barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-        sample_idx = state.sample_idx_for_barcode(barcode)
+        sample_idx = _sample_idx_for_cell(state, cell_id)
         if sample_idx is None:
             continue
         secondary[sample_idx] = _append_semicolon_token(secondary[sample_idx], chr_arm)
@@ -354,9 +389,18 @@ def _expand_primary_child_with_similar_members(
     expansion does *not* turn a weak pattern into an LOH clone. It only adds
     cells that remain close to the core representative over the accepted block,
     retain substantial extreme-AF evidence, and agree with the core's signed
-    allelic direction at their informative block positions. The complete child
-    is revalidated after every accepted addition, so expansion cannot dilute a
-    passing primary LOH block below the ordinary Phase-6 QC threshold.
+    allelic direction at their informative block positions.
+
+    Notes
+    -----
+    Only the strict core is validated (``_strict_arm_metrics_for_cells``).
+    Every residual-parent cell that passes the per-cell gates (default:
+    r ≥ 0.85 to the core median profile, median |ΔAF| ≤ 15, block extreme
+    fraction ≥ 0.75, signed agreement ≥ 0.75 over at least
+    ``max(2, ceil(0.75 * n_block))`` signed positions) is relabelled to the
+    child; the combined child is *not* re-validated after additions, and
+    ``strict_child_pass_after_addition`` is simply set True for accepted rows.
+    Returns one audit row per evaluated parent cell.
     """
     cfg = state.config
     state.refresh()
@@ -373,12 +417,7 @@ def _expand_primary_child_with_similar_members(
 
     parent_cells = [c for c in parent_cells if c in state.df_numeric.index]
     labels = state.current_clones.copy().astype(str)
-    core_cells = []
-    for cell_id in parent_cells:
-        barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-        sample_idx = state.sample_idx_for_barcode(barcode)
-        if sample_idx is not None and str(labels.iloc[sample_idx]) == str(child_label):
-            core_cells.append(cell_id)
+    core_cells = _cells_with_label(state, parent_cells, labels, child_label)
     if not core_cells:
         return pd.DataFrame(columns=columns)
 
@@ -404,9 +443,7 @@ def _expand_primary_child_with_similar_members(
     if not block_vars:
         return pd.DataFrame(columns=columns)
 
-    core_values = state.df_numeric.loc[core_cells, block_vars].apply(
-        pd.to_numeric, errors="coerce"
-    ).to_numpy(dtype=float)
+    core_values = _to_float_array(state.df_numeric.loc[core_cells, block_vars])
     representative = np.nanmedian(core_values, axis=0)
     low = float(getattr(cfg, "low_allele_threshold", 10.0))
     high = float(getattr(cfg, "high_allele_threshold", 90.0))
@@ -431,9 +468,7 @@ def _expand_primary_child_with_similar_members(
         sample_idx = state.sample_idx_for_barcode(barcode)
         if sample_idx is None or str(labels.iloc[sample_idx]) != str(parent_label):
             continue
-        row = state.df_numeric.loc[cell_id, block_vars].apply(
-            pd.to_numeric, errors="coerce"
-        ).to_numpy(dtype=float)
+        row = _to_float_array(state.df_numeric.loc[cell_id, block_vars])
         r, med_delta, n_compared = _safe_profile_similarity(
             row,
             representative,
@@ -511,8 +546,7 @@ def _expand_primary_child_with_similar_members(
         for _neg_r, _delta, cell_id, record in candidates:
             if record.get("member_action") != "expanded_similarity":
                 continue
-            barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-            sample_idx = state.sample_idx_for_barcode(barcode)
+            sample_idx = _sample_idx_for_cell(state, cell_id)
             if sample_idx is not None and str(updated.iloc[sample_idx]) == str(parent_label):
                 updated.iloc[sample_idx] = str(child_label)
         state.set_clone_labels(updated)
@@ -578,12 +612,7 @@ def _expand_primary_child_with_partial_block_members(
 
     parent_cells = [c for c in parent_cells if c in state.df_numeric.index]
     labels = state.current_clones.copy().astype(str)
-    core_cells = []
-    for cell_id in parent_cells:
-        barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-        sample_idx = state.sample_idx_for_barcode(barcode)
-        if sample_idx is not None and str(labels.iloc[sample_idx]) == str(child_label):
-            core_cells.append(cell_id)
+    core_cells = _cells_with_label(state, parent_cells, labels, child_label)
     if not core_cells:
         return pd.DataFrame(columns=columns)
 
@@ -610,9 +639,7 @@ def _expand_primary_child_with_partial_block_members(
     if not block_vars:
         return pd.DataFrame(columns=columns)
 
-    core_values = state.df_numeric.loc[core_cells, block_vars].apply(
-        pd.to_numeric, errors="coerce"
-    ).to_numpy(dtype=float)
+    core_values = _to_float_array(state.df_numeric.loc[core_cells, block_vars])
     representative = np.nanmedian(core_values, axis=0)
     low = float(getattr(cfg, "low_allele_threshold", 10.0))
     high = float(getattr(cfg, "high_allele_threshold", 90.0))
@@ -649,9 +676,7 @@ def _expand_primary_child_with_partial_block_members(
         if sample_idx is None or str(labels.iloc[sample_idx]) != str(parent_label):
             continue
 
-        row = state.df_numeric.loc[cell_id, block_vars].apply(
-            pd.to_numeric, errors="coerce"
-        ).to_numpy(dtype=float)
+        row = _to_float_array(state.df_numeric.loc[cell_id, block_vars])
         signs = np.where(row <= low, -1, np.where(row >= high, 1, 0))
         signed_match = np.isfinite(row) & (signs != 0) & (signs == core_sign)
         runs = _contiguous_runs_from_mask(signed_match)
@@ -677,7 +702,7 @@ def _expand_primary_child_with_partial_block_members(
             amps = {
                 str(v2a.get(v)) for v in run_vars
                 if (info_set is None or v in info_set)
-                and v2a.get(v) not in (None, "", "nan", "None")
+                and v2a.get(v) not in _MISSING_AMPLICON_VALUES
             }
             candidate = {
                 "start": int(start),
@@ -767,8 +792,7 @@ def _expand_primary_child_with_partial_block_members(
         updated = state.current_clones.copy().astype(str)
         accepted_cells = []
         for _neg_r, _delta, cell_id, rec in accepted:
-            barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-            sample_idx = state.sample_idx_for_barcode(barcode)
+            sample_idx = _sample_idx_for_cell(state, cell_id)
             if sample_idx is None or str(updated.iloc[sample_idx]) != str(parent_label):
                 continue
             updated.iloc[sample_idx] = str(child_label)
@@ -819,8 +843,7 @@ def _collapse_secondary_arm_subset_to_primary_family(
 
     parent_sample_indices: set[int] = set()
     for cell_id in parent_cells:
-        barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-        sample_idx = state.sample_idx_for_barcode(barcode)
+        sample_idx = _sample_idx_for_cell(state, cell_id)
         if sample_idx is not None:
             parent_sample_indices.add(int(sample_idx))
 
@@ -865,11 +888,11 @@ def _collapse_secondary_arm_subset_to_primary_family(
                     if "barcode" in state.Sample.dna.row_attrs else str(idx)
                     for idx in indices]
         # Use state mappings for the metadata update when available.
+        index_set = set(indices)
         cell_ids = []
         for cell_id in parent_cells:
-            barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-            sample_idx = state.sample_idx_for_barcode(barcode)
-            if sample_idx in set(indices):
+            sample_idx = _sample_idx_for_cell(state, cell_id)
+            if sample_idx in index_set:
                 cell_ids.append(cell_id)
         _record_phase6_secondary_arm_evidence(state, cell_ids, chr_arm)
         rows.append({
@@ -932,13 +955,7 @@ def _strict_arm_metrics_for_cells(state, cells, chr_arm: str) -> dict:
     low = float(getattr(cfg, "low_allele_threshold", 10.0))
     high = float(getattr(cfg, "high_allele_threshold", 90.0))
     min_block = int(getattr(cfg, "min_contiguous_variants_initial", 4))
-    min_child = int(
-        getattr(
-            cfg,
-            "phase6_residual_min_child_size",
-            getattr(cfg, "min_final_clone_size", 5),
-        )
-    )
+    min_child = _min_child_size(cfg)
     min_extreme = float(getattr(cfg, "min_extreme_fraction", 0.90))
     min_corr = float(getattr(cfg, "phase3_min_mean_corr_to_mean", 0.80))
     min_good_frac = float(getattr(cfg, "min_homogeneity_fraction", 0.80))
@@ -953,9 +970,7 @@ def _strict_arm_metrics_for_cells(state, cells, chr_arm: str) -> dict:
         out["reason"] = f"child_too_small:{len(cells)}<{min_child}"
         return out
 
-    X = state.df_numeric.loc[cells, arm_vars].apply(
-        pd.to_numeric, errors="coerce"
-    ).to_numpy(dtype=float)
+    X = _to_float_array(state.df_numeric.loc[cells, arm_vars])
     finite_full = np.isfinite(X)
     extreme_full = ((X <= low) | (X >= high)) & finite_full
     n_finite_per_variant = finite_full.sum(axis=0)
@@ -1036,7 +1051,7 @@ def _strict_arm_metrics_for_cells(state, cells, chr_arm: str) -> dict:
     block_amps = {
         str(v2a.get(v)) for v in block_vars
         if (info_set is None or v in info_set)
-        and v2a.get(v) not in (None, "", "nan", "None")
+        and v2a.get(v) not in _MISSING_AMPLICON_VALUES
     }
     n_amps = len(block_amps)
 
@@ -1095,8 +1110,7 @@ def _strict_validate_new_arm_children(state, parent_cells, chr_arm: str) -> pd.D
 
     candidate_labels: list[str] = []
     for cell_id in parent_cells:
-        barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-        sample_idx = state.sample_idx_for_barcode(barcode)
+        sample_idx = _sample_idx_for_cell(state, cell_id)
         if sample_idx is None:
             continue
         label = str(labels.iloc[sample_idx])
@@ -1107,12 +1121,7 @@ def _strict_validate_new_arm_children(state, parent_cells, chr_arm: str) -> pd.D
     rows: list[dict] = []
     failed_labels: set[str] = set()
     for label in candidate_labels:
-        cells: list = []
-        for cell_id in parent_cells:
-            barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-            sample_idx = state.sample_idx_for_barcode(barcode)
-            if sample_idx is not None and str(labels.iloc[sample_idx]) == label:
-                cells.append(cell_id)
+        cells = _cells_with_label(state, parent_cells, labels, label)
         metrics = _strict_arm_metrics_for_cells(state, cells, chr_arm)
         metrics["child_label"] = label
         rows.append(metrics)
@@ -1135,25 +1144,21 @@ def _strict_validate_new_arm_children(state, parent_cells, chr_arm: str) -> pd.D
 
 
 def _contiguous_true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
-    """Return inclusive start/end intervals for contiguous True values."""
-    out: list[tuple[int, int]] = []
-    start = None
-    for i, val in enumerate(np.asarray(mask, dtype=bool)):
-        if val and start is None:
-            start = i
-        elif not val and start is not None:
-            out.append((start, i - 1))
-            start = None
-    if start is not None:
-        out.append((start, len(mask) - 1))
-    return out
+    """Return inclusive start/end intervals for contiguous True values.
+
+    Identical to ``_contiguous_runs_from_mask``; kept as a separate name for
+    existing callers.
+    """
+    return _contiguous_runs_from_mask(mask)
 
 
 def _next_phase6_child_number(state, parent_label: str) -> int:
-    """Return a non-conflicting LOH-C integer for a Phase-6 child."""
-    import re
+    """Return a non-conflicting LOH-C integer for a Phase-6 child.
 
-    labels = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
+    One more than the largest ``LOH-C<n>`` found in any label starting with
+    ``parent_label``; 0 if none exist.
+    """
+    labels = _clone_label_series(state)
     prefix = str(parent_label).strip()
     numbers: list[int] = []
     for label in labels:
@@ -1199,18 +1204,10 @@ def _signed_block_partition_children(state, parent_cells, parent_label: str, chr
     low = float(getattr(cfg, "low_allele_threshold", 10.0))
     high = float(getattr(cfg, "high_allele_threshold", 90.0))
     min_block = int(getattr(cfg, "min_contiguous_variants_initial", 4))
-    min_child = int(
-        getattr(
-            cfg,
-            "phase6_residual_min_child_size",
-            getattr(cfg, "min_final_clone_size", 5),
-        )
-    )
+    min_child = _min_child_size(cfg)
     min_shared = int(getattr(cfg, "min_shared_variants", 4))
 
-    X = state.df_numeric.loc[parent_cells, arm_vars].apply(
-        pd.to_numeric, errors="coerce"
-    ).to_numpy(dtype=float)
+    X = _to_float_array(state.df_numeric.loc[parent_cells, arm_vars])
     signed = np.where(X <= low, -1, np.where(X >= high, 1, 0)).astype(int)
 
     # Each seed defines an allelic LOW/HIGH signature across a contiguous block.
@@ -1310,8 +1307,7 @@ def _signed_block_partition_children(state, parent_cells, parent_label: str, chr
             token = f" LOH-C{child_id} {chr_arm}"
             child_labels: set[str] = set()
             for cell_id in rec["_cells"]:
-                barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-                sample_idx = state.sample_idx_for_barcode(barcode)
+                sample_idx = _sample_idx_for_cell(state, cell_id)
                 if sample_idx is None:
                     continue
                 current = str(labels.iloc[sample_idx])
@@ -1337,6 +1333,66 @@ def _signed_block_partition_children(state, parent_cells, parent_label: str, chr
         rec.setdefault("child_label", "")
         output_rows.append(rec)
     return pd.DataFrame(output_rows, columns=columns)
+
+
+def _skipped_parent_audit_row(parent_label: str, n_parent: int, reason: str) -> dict:
+    """Audit row for a parent that is not scanned at all."""
+    return {
+        "parent_clone": parent_label,
+        "scan_pass": pd.NA,
+        "chr_arm": pd.NA,
+        "n_parent_cells": n_parent,
+        "n_residual_cells_before": n_parent,
+        "n_residual_cells_after": n_parent,
+        "status": "SKIPPED",
+        "reason": reason,
+        "n_detected_cells": 0,
+        "n_relabelled_cells": 0,
+        "n_child_labels": 0,
+        "child_labels": "",
+    }
+
+
+def _has_strict_pass_column(validation: pd.DataFrame) -> bool:
+    """True when a validation frame is non-empty and has a ``strict_pass`` column."""
+    return not validation.empty and "strict_pass" in validation.columns
+
+
+def _strict_passing_child_labels(validation: pd.DataFrame) -> list[str]:
+    """``child_label`` values of rows that passed strict validation."""
+    if not _has_strict_pass_column(validation):
+        return []
+    return validation.loc[
+        validation["strict_pass"].fillna(False),
+        "child_label",
+    ].astype(str).tolist()
+
+
+def _n_strict_passing(validation: pd.DataFrame) -> int:
+    """Number of strict-passing rows (0 for an empty / column-less frame)."""
+    return int(validation["strict_pass"].sum()) if _has_strict_pass_column(validation) else 0
+
+
+def _strict_fail_reasons(validation: pd.DataFrame) -> str:
+    """'; '-joined ``reason`` of rows that failed strict validation."""
+    if not _has_strict_pass_column(validation):
+        return ""
+    return "; ".join(
+        validation.loc[~validation["strict_pass"].fillna(False), "reason"].astype(str).tolist()
+    )
+
+
+def _freeze_residual_reference(
+    frozen_reference_by_barcode: dict,
+    sample_barcodes: pd.Series,
+    labels: pd.Series,
+    residual_barcodes: set,
+) -> None:
+    """Copy the current labels of residual-parent barcodes into the frozen reference."""
+    for barcode, label in zip(sample_barcodes, labels):
+        if str(barcode) in residual_barcodes:
+            frozen_reference_by_barcode[str(barcode)] = str(label)
+
 
 def run_post_phase5_subclone_scan(
     *,
@@ -1377,6 +1433,48 @@ def run_post_phase5_subclone_scan(
 
     In automatic modes the exact ``WT`` parent is excluded by default. Set
     ``auto_include_wt=True`` only for a deliberate WT-focused scan.
+
+    Parameters
+    ----------
+    state : PipelineState
+        Final state after Phase 5; ``Sample.dna.row_attrs['Clone']`` and the
+        ``phase6_*`` row attributes are modified in place.
+    clone_labels : str or iterable of str
+        Explicit parent labels, or ``"auto"`` / ``"all"`` (case-insensitive).
+        ``"all"`` scans every eligible parent at/above the size floor without
+        the possible-LOH-block pre-screen.
+    chr_arms : iterable of str, optional
+        Arms to scan; defaults to ``state.chr_arms``. Unknown arms are skipped
+        (with a warning when ``verbose``).
+    min_parent_cells : int, optional
+        Parent/residual size floor; defaults to
+        ``max(2 * min_cluster_size, min_final_clone_size)``.
+    rerun_phase5_summary : bool, default True
+        Run ``run_phase5`` afterwards (as "PHASE 7", with the LOH prune floor
+        relaxed to the Phase-6 child size).
+    merge_back_after_scan : bool, default True
+        Run the scoped Phase-4 small-LOH merge with equal arm sets allowed.
+    auto_exclude_labels : iterable of str, optional
+        Labels never auto-selected.
+    auto_include_wt : bool, default False
+        Allow the exact ``WT`` parent in auto modes.
+    verbose : bool, default True
+        Print per-parent / per-arm progress. Banner lines are always printed.
+
+    Returns
+    -------
+    dict
+        ``audit_df`` (one row per parent/pass/arm), ``parent_results``,
+        ``summary_df``, ``merge_back_df``, ``clone_labels``, ``chr_arms``,
+        ``min_parent_cells``, ``auto_include_wt`` and ``scan_mode``; also stored
+        in ``state.results["phase6_post_phase5_subclone_scan"]``. If auto mode
+        finds no parents, a smaller dict is returned early (not stored).
+
+    Raises
+    ------
+    ValueError
+        No scannable arms, ``min_parent_cells < 1``, or unusable explicit
+        ``clone_labels``.
     """
     cfg = state.config
     state.refresh()
@@ -1441,13 +1539,7 @@ def run_post_phase5_subclone_scan(
     else:
         requested = _normalise_clone_labels(clone_labels)
 
-    min_child = int(
-        getattr(
-            cfg,
-            "phase6_residual_min_child_size",
-            getattr(cfg, "min_final_clone_size", 5),
-        )
-    )
+    min_child = _min_child_size(cfg)
     # A finite cap protects against unexpected label cycles.  In ordinary use
     # each successful pass removes >=min_child cells from the residual parent,
     # so this cannot be reached for realistic clone sizes.
@@ -1490,39 +1582,21 @@ def run_post_phase5_subclone_scan(
         n_initial_parent = len(initial_parent_cells)
 
         if not parent_ok:
-            audit_rows.append({
-                "parent_clone": parent_label,
-                "scan_pass": pd.NA,
-                "chr_arm": pd.NA,
-                "n_parent_cells": n_initial_parent,
-                "n_residual_cells_before": n_initial_parent,
-                "n_residual_cells_after": n_initial_parent,
-                "status": "SKIPPED",
-                "reason": parent_reason,
-                "n_detected_cells": 0,
-                "n_relabelled_cells": 0,
-                "n_child_labels": 0,
-                "child_labels": "",
-            })
+            audit_rows.append(
+                _skipped_parent_audit_row(parent_label, n_initial_parent, parent_reason)
+            )
             if verbose:
                 print(f"\n  {parent_label}: SKIP ({parent_reason})")
             continue
 
         if n_initial_parent < min_parent_cells:
-            audit_rows.append({
-                "parent_clone": parent_label,
-                "scan_pass": pd.NA,
-                "chr_arm": pd.NA,
-                "n_parent_cells": n_initial_parent,
-                "n_residual_cells_before": n_initial_parent,
-                "n_residual_cells_after": n_initial_parent,
-                "status": "SKIPPED",
-                "reason": f"parent_too_small:{n_initial_parent}<{min_parent_cells}",
-                "n_detected_cells": 0,
-                "n_relabelled_cells": 0,
-                "n_child_labels": 0,
-                "child_labels": "",
-            })
+            audit_rows.append(
+                _skipped_parent_audit_row(
+                    parent_label,
+                    n_initial_parent,
+                    f"parent_too_small:{n_initial_parent}<{min_parent_cells}",
+                )
+            )
             if verbose:
                 print(
                     f"\n  {parent_label}: SKIP "
@@ -1569,7 +1643,7 @@ def run_post_phase5_subclone_scan(
                 str(state.cell_to_barcode.get(cell_id, cell_id))
                 for cell_id in parent_cells
             }
-            current_labels = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
+            current_labels = _clone_label_series(state)
             frozen_reference_by_barcode = dict(zip(sample_barcodes, current_labels))
             for barcode in residual_barcodes:
                 frozen_reference_by_barcode[barcode] = str(parent_label)
@@ -1599,7 +1673,7 @@ def run_post_phase5_subclone_scan(
                     })
                     continue
 
-                labels_before = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str).copy()
+                labels_before = _clone_label_series(state).copy()
 
                 segments, loh_cells, correlations, homogeneity = (
                     detect_loh_and_update_clones(
@@ -1639,7 +1713,7 @@ def run_post_phase5_subclone_scan(
                     chr_arm,
                 )
                 state.refresh()
-                labels_after = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
+                labels_after = _clone_label_series(state)
                 changed = labels_after.ne(labels_before)
                 changed_barcodes = set(sample_barcodes.loc[changed].astype(str))
 
@@ -1656,17 +1730,18 @@ def run_post_phase5_subclone_scan(
                         chr_arm,
                     )
                     state.refresh()
-                    labels_after = pd.Series(
-                        state.Sample.dna.row_attrs["Clone"]
-                    ).astype(str)
+                    labels_after = _clone_label_series(state)
                     changed = labels_after.ne(labels_before)
                     changed_barcodes = set(sample_barcodes.loc[changed].astype(str))
                     if bool(changed.any()):
                         # Allow one accepted signed child to accumulate an
                         # additional arm later in this same residual pass.
-                        for barcode, label in zip(sample_barcodes, labels_after):
-                            if str(barcode) in residual_barcodes:
-                                frozen_reference_by_barcode[str(barcode)] = str(label)
+                        _freeze_residual_reference(
+                            frozen_reference_by_barcode,
+                            sample_barcodes,
+                            labels_after,
+                            residual_barcodes,
+                        )
 
                 # Core / signed children are strict primary discoveries.  Expand
                 # a primary LOH family only with residual-parent cells that are
@@ -1674,7 +1749,7 @@ def run_post_phase5_subclone_scan(
                 # real, slightly imperfect members without accepting unrelated
                 # extreme-AF cells.
                 primary_expansion = pd.DataFrame()
-                labels_after = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
+                labels_after = _clone_label_series(state)
                 newly_created_primary_labels = []
                 for child_label in sorted(set(labels_after.loc[labels_after.ne(labels_before)].astype(str))):
                     primary_label_without_arm = _remove_arm_token(child_label, chr_arm)
@@ -1686,12 +1761,7 @@ def run_post_phase5_subclone_scan(
                         newly_created_primary_labels.append(child_label)
 
                 for child_label in newly_created_primary_labels:
-                    core_cells = []
-                    for cell_id in parent_cells:
-                        barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-                        sample_idx = state.sample_idx_for_barcode(barcode)
-                        if sample_idx is not None and str(labels_after.iloc[sample_idx]) == str(child_label):
-                            core_cells.append(cell_id)
+                    core_cells = _cells_with_label(state, parent_cells, labels_after, child_label)
                     if core_cells:
                         _set_phase6_primary_metadata(
                             state,
@@ -1726,7 +1796,7 @@ def run_post_phase5_subclone_scan(
                             )
 
                 state.refresh()
-                labels_after = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
+                labels_after = _clone_label_series(state)
 
                 # Do not fragment an already established primary child when a
                 # different arm is present only in a subset of that family.
@@ -1734,20 +1804,8 @@ def run_post_phase5_subclone_scan(
                 # row-level evidence, so phase-5 pruning cannot discard the
                 # remainder of the same primary LOH block.
                 passing_labels = set()
-                if not strict_validation.empty and "strict_pass" in strict_validation.columns:
-                    passing_labels.update(
-                        strict_validation.loc[
-                            strict_validation["strict_pass"].fillna(False),
-                            "child_label",
-                        ].astype(str).tolist()
-                    )
-                if not signed_partition_validation.empty and "strict_pass" in signed_partition_validation.columns:
-                    passing_labels.update(
-                        signed_partition_validation.loc[
-                            signed_partition_validation["strict_pass"].fillna(False),
-                            "child_label",
-                        ].astype(str).tolist()
-                    )
+                passing_labels.update(_strict_passing_child_labels(strict_validation))
+                passing_labels.update(_strict_passing_child_labels(signed_partition_validation))
                 secondary_annotation = _collapse_secondary_arm_subset_to_primary_family(
                     state,
                     parent_cells=parent_cells,
@@ -1756,7 +1814,7 @@ def run_post_phase5_subclone_scan(
                     passing_child_labels=passing_labels,
                 )
                 state.refresh()
-                labels_after = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
+                labels_after = _clone_label_series(state)
                 changed = labels_after.ne(labels_before)
                 changed_barcodes = set(sample_barcodes.loc[changed].astype(str))
 
@@ -1764,14 +1822,16 @@ def run_post_phase5_subclone_scan(
                 # Secondary nested evidence remains in metadata and therefore
                 # cannot produce a flat-label sub-split.
                 if bool(changed.any()):
-                    for barcode, label in zip(sample_barcodes, labels_after):
-                        if str(barcode) in residual_barcodes:
-                            frozen_reference_by_barcode[str(barcode)] = str(label)
+                    _freeze_residual_reference(
+                        frozen_reference_by_barcode,
+                        sample_barcodes,
+                        labels_after,
+                        residual_barcodes,
+                    )
 
                 parent_child_labels = []
                 for cell_id in parent_cells:
-                    barcode = str(state.cell_to_barcode.get(cell_id, cell_id))
-                    sample_idx = state.sample_idx_for_barcode(barcode)
+                    sample_idx = _sample_idx_for_cell(state, cell_id)
                     if sample_idx is None:
                         continue
                     child_label = str(labels_after.iloc[sample_idx])
@@ -1786,37 +1846,10 @@ def run_post_phase5_subclone_scan(
                 ))
                 pass_changed_cells.update(changed_barcodes)
 
-                n_strict_passing_children = (
-                    int(strict_validation["strict_pass"].sum())
-                    if not strict_validation.empty and "strict_pass" in strict_validation.columns
-                    else 0
-                )
-                strict_fail_reasons = (
-                    "; ".join(
-                        strict_validation.loc[
-                            ~strict_validation["strict_pass"].fillna(False), "reason"
-                        ].astype(str).tolist()
-                    )
-                    if not strict_validation.empty and "strict_pass" in strict_validation.columns
-                    else ""
-                )
-                n_signed_partition_children = (
-                    int(signed_partition_validation["strict_pass"].sum())
-                    if not signed_partition_validation.empty
-                    and "strict_pass" in signed_partition_validation.columns
-                    else 0
-                )
-                signed_partition_fail_reasons = (
-                    "; ".join(
-                        signed_partition_validation.loc[
-                            ~signed_partition_validation["strict_pass"].fillna(False),
-                            "reason",
-                        ].astype(str).tolist()
-                    )
-                    if not signed_partition_validation.empty
-                    and "strict_pass" in signed_partition_validation.columns
-                    else ""
-                )
+                n_strict_passing_children = _n_strict_passing(strict_validation)
+                strict_fail_reasons = _strict_fail_reasons(strict_validation)
+                n_signed_partition_children = _n_strict_passing(signed_partition_validation)
+                signed_partition_fail_reasons = _strict_fail_reasons(signed_partition_validation)
                 n_nested_secondary_evidence_cells = int(
                     secondary_annotation.get("n_secondary_cells", pd.Series(dtype=int)).sum()
                 ) if isinstance(secondary_annotation, pd.DataFrame) and not secondary_annotation.empty else 0
@@ -1861,15 +1894,9 @@ def run_post_phase5_subclone_scan(
                     "strict_validation": strict_validation.to_dict("records"),
                     "n_signed_partition_children": n_signed_partition_children,
                     "signed_partition_validation": signed_partition_validation.to_dict("records"),
-                    "n_primary_similarity_expanded": int(
-                        primary_expansion.get("member_action", pd.Series(dtype=object)).isin(
-                        ["expanded_similarity", "expanded_partial_block"]
-                    ).sum()
-                    ) if isinstance(primary_expansion, pd.DataFrame) and not primary_expansion.empty else 0,
+                    "n_primary_similarity_expanded": n_primary_similarity_expanded,
                     "primary_similarity_expansion": primary_expansion.to_dict("records") if isinstance(primary_expansion, pd.DataFrame) else [],
-                    "n_nested_secondary_evidence_cells": int(
-                        secondary_annotation.get("n_secondary_cells", pd.Series(dtype=int)).sum()
-                    ) if isinstance(secondary_annotation, pd.DataFrame) and not secondary_annotation.empty else 0,
+                    "n_nested_secondary_evidence_cells": n_nested_secondary_evidence_cells,
                     "nested_secondary_arm_evidence": secondary_annotation.to_dict("records") if isinstance(secondary_annotation, pd.DataFrame) else [],
                 })
 

@@ -1,6 +1,45 @@
-"""Germline variant discovery, blacklist filtering, and visualisation."""
+"""Germline variant discovery, validation and CNV-marker auditing for Tapestri DNA.
 
+The module grew out of several notebook scripts and is organised in sections,
+in file order:
+
+1. Legacy germline discovery and plotting:
+   :func:`get_real_somatic_variants`, :func:`visualize_found_germline_variants`,
+   :func:`find_germline_variants` (AF-window + NGT/DP + blacklist filter).
+2. AF-shape validation: :func:`validate_germline_by_af`,
+   :func:`review_failed_variants`, :func:`genotype_af_cutoffs`.
+3. All-variant germline profiling (one CSV row per panel variant):
+   :func:`compute_genotype_structure`, :func:`variant_level_ngt_af_dp_profile`,
+   :func:`build_and_save_all_variant_germline_profile`,
+   :func:`run_all_variant_germline_profile_export`.
+4. Genotype-defined WT/clean-cell population and concordance:
+   :func:`build_wt_cell_subset`, :func:`population_structure_table`,
+   :func:`add_population_concordance`.
+5. Cohort-calibrated HET rules: :func:`resolve_calibration_columns`,
+   :func:`apply_calibrated_germline_rules` and the calibration constants.
+6. Notebook workflow wrappers: :func:`run_empirical_all_variant_germline_export`
+   (step 1), :func:`add_wt_concordance_and_finalize_germline` (step 2),
+   :func:`check_significant_variants_against_all_variant_germline_df`,
+   :func:`apply_final_no_loss_cnv_marker_rules`, :func:`run_af_clustering_only`,
+   :func:`rename_af_clusters_and_update_filtered_germline`.
+7. Step-2 barcode-level CNV/BAF audit:
+   :func:`build_all_variant_matrices_from_step2_clone_labels`,
+   :func:`run_all_variant_cnv_baf_audit_pipeline`,
+   :func:`run_step2_barcode_cnv_audit_pipeline`.
+
+Conventions: Mission Bio NGT codes are 0 = WT, 1 = HET, 2 = HOM-ALT and
+3 = no call; AF layers are percentages (0-100); variant IDs look like
+``chr1:12345:A/T``. Optional heavy dependencies (matplotlib, seaborn, chrov,
+sklearn, missionbio.mosaic, IPython) are imported inside the functions that
+need them.
+"""
+
+from __future__ import annotations
+
+import os
 import re
+from typing import Any, Iterable, Mapping, Sequence
+
 import numpy as np
 import pandas as pd
 
@@ -8,29 +47,46 @@ from .utils import drop_scalar_row_attrs
 
 
 def get_real_somatic_variants(
-    differential_variants,
-    filtered_germline_in_samples,
-    sample,
+    differential_variants: Iterable[Any] | np.ndarray,
+    filtered_germline_in_samples: Iterable[Any] | None,
+    sample: Any,
     use_consequence_if_available: bool = True,
 ) -> np.ndarray:
-    """Return differential variants present in ``sample.dna``, not in the
-    germline list, and not intronic.
+    """Return differential variants that are in ``sample.dna``, not germline,
+    and not intronic.
 
     Parameters
     ----------
     differential_variants : array-like
-        Variant IDs (nested OK).
+        Variant IDs; nested arrays are flattened with ``np.ravel`` and each ID is
+        stripped of surrounding whitespace.
     filtered_germline_in_samples : array-like, set, or None
-        Variant IDs to exclude as germline.
-    sample : object
-        Must have ``sample.dna.col_attrs`` with at least ``'id'`` and
-        ideally ``'Protein'`` (optionally ``'Consequence'``).
-    use_consequence_if_available : bool
-        Use the ``'Consequence'`` column when present.
+        Variant IDs to exclude as germline. ``None`` excludes nothing.
+    sample : Mosaic Sample-like
+        Must expose ``sample.dna.col_attrs`` with an ``'id'`` column and ideally
+        ``'Protein'`` (optionally ``'Consequence'``).
+    use_consequence_if_available : bool, default True
+        When a ``'Consequence'`` column is present, call a variant intronic if
+        its consequence contains "intron" (case-insensitive).
 
     Returns
     -------
-    np.ndarray[str]
+    np.ndarray of str
+        Surviving variant IDs in their input order (duplicates kept). Empty when
+        nothing remains after germline removal.
+
+    Raises
+    ------
+    KeyError
+        If ``sample.dna.col_attrs`` has no ``'id'`` column.
+
+    Notes
+    -----
+    Without a usable ``'Consequence'`` column a variant is treated as intronic
+    when its ``'Protein'`` string contains the literal ``p.p.?`` or is blank
+    (a missing ``'Protein'`` column, or NaN values, become the string "nan" and
+    are therefore kept). Differential variants absent from ``sample.dna`` are
+    dropped.
     """
     dv_flat = [str(x).strip() for x in np.ravel(differential_variants)]
     germline_set = (
@@ -70,57 +126,89 @@ def get_real_somatic_variants(
 
 
 def visualize_found_germline_variants(
-    Sample_T_subset,
+    Sample_T_subset: Any,
     wd: str,
     MBio_batch: str,
     Patient_ID: str,
-    variant_ids=None,
-    variant_df: pd.DataFrame = None,
+    variant_ids: Iterable[str] | None = None,
+    variant_df: pd.DataFrame | None = None,
     variant_class_col: str = "germline_broad_class",
-    variant_classes=None,
-    seed_col: str = None,
-    output_label: str = None,
-    cytobands_path: str = None,
+    variant_classes: Iterable[str] | None = None,
+    seed_col: str | None = None,
+    output_label: str | None = None,
+    cytobands_path: str | None = None,
     save_plots: bool = True,
     show_plots: bool = True,
     min_variants_per_chr: int = 2,
 ) -> pd.DataFrame:
-    """
-    Visualise selected germline variants with:
-      1. VAF histogram
-      2. genome-wide stem plot
-      3. per-chromosome stem plots
-      4. faceted scatter plot
+    """Plot the pseudobulk VAF of selected germline variants.
+
+    Four figures are produced: (1) a log-scale VAF histogram, (2) a genome-wide
+    stem plot, (3) one stem plot per chromosome with at least
+    ``min_variants_per_chr`` variants, and (4) a faceted VAF-vs-position scatter
+    per chromosome.
 
     Parameters
     ----------
-    Sample_T_subset
-        T-cell subset sample.
-
+    Sample_T_subset : Mosaic Sample-like
+        Sample whose ``dna`` assay (or, if absent, ``dna_subset``) holds the AF
+        layer; usually the T-cell subset from :func:`find_germline_variants`.
+    wd : str
+        Project working directory; used for the output folder and the default
+        cytoband table.
+    MBio_batch, Patient_ID : str
+        Batch and patient identifiers used in the output path.
     variant_ids : list-like, optional
-        Explicit variant IDs to plot.
-
+        Explicit variant IDs to plot. When given, it is authoritative:
+        ``variant_df`` only filters/annotates these IDs.
     variant_df : pd.DataFrame, optional
-        All-variant germline dataframe, e.g. all_variant_germline_df.
-
-    variant_class_col : str
-        Column in variant_df used for class filtering.
-
+        All-variant germline table (e.g. ``all_variant_germline_df``) with a
+        ``variant`` column. Without ``variant_ids`` its (filtered) variants are
+        plotted; selected evidence columns are merged into the result.
+    variant_class_col : str, default "germline_broad_class"
+        Column in ``variant_df`` used for ``variant_classes`` filtering.
     variant_classes : list-like, optional
-        Classes to keep from variant_class_col.
-
+        Classes to keep from ``variant_class_col``.
     seed_col : str, optional
-        Boolean seed column to filter variant_df, e.g.
-        "usable_germline_het_seed", "clean_germline_het_seed",
-        or "rescued_germline_het_seed".
-
+        Boolean seed column of ``variant_df`` to filter on, e.g.
+        ``"usable_germline_het_seed"``.
     output_label : str, optional
-        Label appended to output plot filenames.
+        Label for plot titles and filenames. Defaults to ``seed_col``, the joined
+        ``variant_classes``, or ``"selected_germline_variants"``; it is made
+        filesystem-safe.
+    cytobands_path : str, optional
+        Cytoband TSV; defaults to ``{wd}/resources/references/cytobands.tsv``.
+    save_plots : bool, default True
+        Save each figure as PNG and PDF (300 dpi).
+    show_plots : bool, default True
+        Show figures; otherwise close them.
+    min_variants_per_chr : int, default 2
+        Minimum variants for a per-chromosome stem plot.
 
     Returns
     -------
-    col_attrs_df : pd.DataFrame
-        Variant annotations with pseudobulk VAF values.
+    pd.DataFrame
+        One row per plotted variant: ``variant``, ``gene symbol``,
+        ``chromosome``, ``position``, pseudobulk ``VAF`` (mean AF across cells),
+        ``Annotation``, plus available evidence columns from ``variant_df``.
+
+    Raises
+    ------
+    RuntimeError
+        If the sample has no DNA assay or none of the requested variants are in
+        it.
+    ValueError
+        If ``variant_df`` lacks ``variant``, ``variant_class_col`` or
+        ``seed_col`` when they are needed.
+
+    Notes
+    -----
+    Figures are written to
+    ``{wd}/results/per_sample/{MBio_batch}/{Patient_ID}/dna_cnv/variants/germline_variants``
+    as ``Pseudobulk_VAFs_T_cells_<label>``,
+    ``Germline_variants_distribution_<label>[_<chr>]`` and
+    ``Pseudobulk_VAFs_T_cells_<label>_across_chrs``. Requires
+    ``chrov.viz.figure.plot_with_chroms``.
     """
     import os
     import re
@@ -538,9 +626,9 @@ def visualize_found_germline_variants(
 
 
 def find_germline_variants(
-    Sample,
-    keep_labels,
-    annotation_df: pd.DataFrame = None,
+    Sample: Any,
+    keep_labels: Iterable[str],
+    annotation_df: pd.DataFrame | None = None,
     annotation_variant_id_col: str = "Variant ID",
 
     # AF windows after per-variant NGT/DP filtering
@@ -564,46 +652,119 @@ def find_germline_variants(
 
     # annotation/resource filters
     exclude_pathogenic: bool = True,
-    common_variant_paths: list = None,
-    known_het_variants: list = None,
-    known_het_variant_paths: list = None,
+    common_variant_paths: list[str] | None = None,
+    known_het_variants: Iterable[str] | None = None,
+    known_het_variant_paths: list[str] | None = None,
     treat_known_het_as_common: bool = True,
-    blacklist_paths: list = None,
+    blacklist_paths: list[str] | None = None,
     common_requires: str = "either",  # "either" or "both"
 
     # output/debug
     return_qc: bool = False,
     verbose: bool = True,
 ):
-    """
-    Find likely germline HET variants in selected cells.
+    """Find likely germline HET variants in a protein-labelled cell subset.
+
+    This is the original ("legacy") AF-window germline filter. Its per-variant
+    QC table is also the master table for the all-variant profiling in
+    :func:`build_and_save_all_variant_germline_profile`.
 
     Filtering order
     ---------------
-    1. Subset to selected protein labels.
-    2. For each variant, remove NGT == 3 cells.
-    3. Apply DP >= min_dp to the remaining called cells.
-    4. Compute AF/genotype summaries only from valid cells.
-    5. Exclude Pathogenic / Likely_pathogenic ClinVar variants.
-    6. Exclude variants in genomic blacklist intervals.
-    7. Split variants into common-resource versus novel:
-       - common-resource variants: mean AF between af_min_common and af_max_common.
-       - novel variants: mean AF between af_min_novel and af_max_novel.
+    1. Subset to cells whose protein label is in ``keep_labels``.
+    2. For each variant, drop cells with NGT == 3 (no call).
+    3. Of the remaining cells keep those with DP >= ``min_dp``.
+    4. Compute AF/genotype summaries only from those valid cells.
+    5. Exclude ClinVar Pathogenic / Likely_pathogenic variants (a ClinVar text
+       containing "pathogenic" but not "benign").
+    6. Exclude variants inside any genomic blacklist interval.
+    7. Apply an AF window to the mean valid-cell AF: ``af_min_common`` to
+       ``af_max_common`` for common-resource variants, ``af_min_novel`` to
+       ``af_max_novel`` otherwise.
     8. Require HET calls to dominate HOM_ALT calls:
-       - N_HET_valid / N_HOM_ALT_valid >= min_het_to_hom_alt_ratio.
-       - N_HET_valid / (N_HET_valid + N_HOM_ALT_valid) >= min_het_frac_among_alt_valid.
+       ``N_HET / N_HOM_ALT >= min_het_to_hom_alt_ratio`` (infinite when there
+       are no HOM_ALT cells) and
+       ``N_HET / (N_HET + N_HOM_ALT) >= min_het_frac_among_alt_valid``.
 
-    Notes
-    -----
-    known_het_variants can be your in-memory germline_whitelist list.
+    Parameters
+    ----------
+    Sample : missionbio.mosaic Sample
+        Sample with ``dna`` and ``protein`` assays; protein labels must be set.
+    keep_labels : list-like of str
+        Protein labels defining the normal (usually T-cell) subset.
+    annotation_df : pd.DataFrame, optional
+        Variant annotation table with a ``ClinVar`` column; skipped when None.
+    annotation_variant_id_col : str, default "Variant ID"
+        Variant-ID column of ``annotation_df``; its index is used if absent.
+    af_min_common, af_max_common : float, default 25, 75
+        AF window (percent) for dbSNP/gnomAD-common (and, by default,
+        known-HET) variants.
+    af_min_novel, af_max_novel : float, default 40, 60
+        AF window (percent) for all other variants.
+    max_hom_frac : float, default 0.25
+        Maximum HOM_ALT fraction among valid cells.
+    max_ngt_frac : float, default 0.80
+        Maximum fraction of all subset cells with NGT == 3.
+    min_dp : int, default 5
+        Minimum read depth for a called cell to be valid. When ``min_dp <= 0``
+        or the DP layer is unavailable, the DP filter is disabled.
+    min_valid_cells : int, default 20
+        Minimum number of valid cells.
+    min_call_rate_after_ngt_dp : float, default 0.20
+        Minimum fraction of subset cells that are valid.
+    require_het_hom_alt_ratio : bool, default True
+        Apply the HET-vs-HOM_ALT dominance filter (step 8).
+    min_het_to_hom_alt_ratio : float, default 3.0
+        Minimum N_HET / N_HOM_ALT.
+    min_het_frac_among_alt_valid : float, default 0.75
+        Minimum N_HET / (N_HET + N_HOM_ALT).
+    min_het_valid_cells : int, default 3
+        Minimum number of valid HET cells.
+    exclude_pathogenic : bool, default True
+        Apply the ClinVar pathogenic exclusion.
+    common_variant_paths : list of str, optional
+        Text files of common-variant IDs (one per line). Defaults to the
+        project's dbSNP v155 and gnomAD r2.1.1 hg19 lists.
+    known_het_variants : list-like of str, optional
+        In-memory curated HET whitelist (e.g. ``germline_whitelist``).
+    known_het_variant_paths : list of str, optional
+        Additional ID files whose union is added to the known-HET set.
+    treat_known_het_as_common : bool, default True
+        Add the known-HET set to the common set so it gets the wider AF window.
+    blacklist_paths : list of str, optional
+        BED/TSV/TXT (first 3 columns) or CSV (chr/start/end-like headers)
+        interval files. Defaults to the project's two hg19 blacklists.
+    common_requires : {"either", "both"}, default "either"
+        Combine ``common_variant_paths`` by union ("either") or intersection
+        ("both").
+    return_qc : bool, default False
+        Also return the per-variant QC table.
+    verbose : bool, default True
+        Print progress and the top passing variants.
 
     Returns
     -------
-    By default:
-        filtered_germline_variants, Sample_T_subset
+    filtered_germline_variants : list of str
+        Variants passing every filter, in QC-table sort order.
+    Sample_T_subset : missionbio.mosaic Sample
+        The cell subset, with ``dna_subset`` (passing variants, or None when
+        nothing passes) and ``germline_qc`` (the QC table) attributes attached.
+    germline_qc : pd.DataFrame
+        Only when ``return_qc=True``: one row per variant with call counts and
+        fractions, AF summaries, resource/exclusion flags and ``pass_*`` columns.
 
-    If return_qc=True:
-        filtered_germline_variants, Sample_T_subset, germline_qc
+    Raises
+    ------
+    ValueError
+        If ``common_requires`` is invalid or no barcodes match ``keep_labels``.
+
+    Notes
+    -----
+    Scalar row attributes are dropped in place from ``Sample.dna`` and
+    ``Sample.protein`` (via ``drop_scalar_row_attrs``) before subsetting.
+    When no known-HET IDs are supplied, the common-variant IDs are used as the
+    known-HET set, so ``is_known_het_whitelist`` then marks every common
+    variant. Unreadable resource or blacklist files are reported and skipped.
     """
 
     import copy
@@ -1223,14 +1384,11 @@ def find_germline_variants(
 # AF-shape germline validation helpers
 # -----------------------------------------------------------------------------
 
-import re
-import numpy as np
-import pandas as pd
-
-
 def _is_indel(variant_id: str) -> bool:
     """True for indels / complex alleles, whose Tapestri AF is not
     interpretable as a diploid 0.5 expectation (and so cannot be AF-validated).
+
+    IDs that cannot be parsed as ``...:REF/ALT`` are also treated as indels.
     """
     s = str(variant_id)
     try:
@@ -1242,7 +1400,8 @@ def _is_indel(variant_id: str) -> bool:
     return len(ref) != 1 or len(alt) != 1
 
 
-def _cell_by_variant(dna, layer, keep):
+def _cell_by_variant(dna: Any, layer: str, keep: set[str]) -> pd.DataFrame:
+    """Cell x variant frame of ``layer`` restricted to the variant IDs in ``keep``."""
     df = dna.get_attribute(layer, constraint="row+col")
     if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(
@@ -1254,10 +1413,10 @@ def _cell_by_variant(dna, layer, keep):
 
 
 def validate_germline_by_af(
-    Sample_T_subset,
-    candidate_variants,
-    common_variant_ids=None,
-    known_het_ids=None,
+    Sample_T_subset: Any,
+    candidate_variants: Iterable[str],
+    common_variant_ids: Iterable[str] | None = None,
+    known_het_ids: Iterable[str] | None = None,
     *,
     # which cells define each variant's AF distribution
     selection_mode: str = "het_calls",   # "het_calls" or "af_band"
@@ -1286,50 +1445,94 @@ def validate_germline_by_af(
     keep_indels: bool = False,
 
     verbose: bool = True,
-):
+) -> tuple[list[str], pd.DataFrame, dict[str, float]]:
     """Validate candidate germline HETs by AF-distribution shape.
 
-    NOTE
-    ----
-    The AF profile is computed only over HET-called cells, so it is blind to a
-    dominant WT or HOM-ALT population. A site that is hom-ref or hom-alt in the
-    donor, but has a handful of HET-called cells pooling near 50%, can pass
-    this AF test. Use the genotype-call structure (see ``build_and_save_all_
-    variant_germline_profile`` / ``donor_genotype``) to gate on the donor's
-    actual genotype before trusting an AF-validated status.
+    Method
+    ------
+    1. For every candidate, pool the selected cells' reads: depth-weighted
+       ``pooled_af``, binomial ``se_pooled_af = 50 / sqrt(total DP)``,
+       ``median_af`` and a robust SD (1.4826 x MAD) of the per-cell z-score
+       ``z = 2 sqrt(DP) (AF/100 - 0.5)``.
+    2. Learn a sample-specific HET reference from clean exemplars (common or
+       whitelisted, non-indel, ``>= ref_min_cells`` cells,
+       ``>= ref_min_total_dp`` reads, pooled AF in [``ref_af_lo``,
+       ``ref_af_hi``]): centre = median pooled AF, spread =
+       max(SD, ``min_ref_spread``), z-SD = median robust SD. With fewer than
+       ``ref_min_n`` exemplars the fallback is centre 50, spread 7, z-SD 1.5.
+    3. Score each candidate: tolerance =
+       ``min(k_tol * sqrt(spread^2 + se_pooled^2), tol_cap)``; evidence needs
+       ``total_dp >= min_eval_total_dp`` and ``n_het_cells >= min_eval_cells``;
+       dispersion needs ``z_robust_sd <= k_disp * z-SD``.
+    4. Status: ``indel_af_unreliable`` > ``absent`` > (low evidence:
+       ``whitelist_low_evidence`` if whitelisted with ``>= min_weak_cells``
+       cells and centred, else ``insufficient_evidence``) > ``af_skewed`` >
+       ``overdispersed`` > ``validated``.
+
+    The AF profile is computed only over the selected (by default HET-called)
+    cells, so it is blind to a dominant WT or HOM-ALT population. A site that
+    is hom-ref or hom-alt in the donor, but has a handful of HET-called cells
+    pooling near 50%, can pass this AF test. Use the genotype-call structure
+    (see :func:`build_and_save_all_variant_germline_profile` /
+    ``donor_genotype``) to gate on the donor's actual genotype before trusting
+    an AF-validated status.
 
     Parameters
     ----------
     Sample_T_subset : MosaicSample
-        The T-cell subset (must expose NGT / AF / DP layers via
-        ``Sample_T_subset.dna``).
+        Cell subset exposing NGT / AF / DP layers via ``Sample_T_subset.dna``.
     candidate_variants : iterable of str
-        Variant IDs surviving pathogenic / blacklist exclusion.
-    common_variant_ids, known_het_ids : set, optional
+        Variant IDs to profile.
+    common_variant_ids, known_het_ids : iterable of str, optional
         dbSNP/gnomAD common IDs and the curated HET whitelist. Used to pick
-        reference exemplars and to extend benefit of the doubt to known
-        germline that is under-sampled here.
-
-    selection_mode : {"het_calls", "af_band"}
-        How the cells contributing to a variant's AF distribution are chosen.
-        ``"het_calls"`` uses NGT == HET cells; the Mission Bio caller tolerates
+        reference exemplars; the whitelist also earns benefit of the doubt for
+        under-sampled variants.
+    selection_mode : {"het_calls", "af_band"}, default "het_calls"
+        ``"het_calls"`` uses NGT == 1 cells; the Mission Bio caller tolerates
         skewed HETs (e.g. reference-biased loci still get HET calls at ~75% AF),
         so genuine skew remains visible. ``"af_band"`` instead takes any
-        alt-carrying cell with AF inside ``af_band``, avoiding reliance on the
-        genotype caller at the cost of admitting more ref-dropout noise.
-    k_tol : float
-        Acceptance is ``|pooled_af - centre| <= k_tol * sqrt(ref_spread^2 +
-        se_pooled^2)``. The ``se_pooled`` term (= 50 / sqrt(total reads)) is the
-        depth-dependent part: shallow variants get a wide tolerance, deep ones
-        must sit tightly on the reference centre.
+        NGT 1/2 cell with AF inside ``af_band``.
+    af_band : tuple of float, default (15.0, 95.0)
+        Inclusive AF band for ``selection_mode="af_band"``.
+    min_dp_af : int, default 2
+        Minimum DP for a cell to contribute.
+    ref_min_cells, ref_min_total_dp, ref_af_lo, ref_af_hi, ref_min_n, min_ref_spread
+        Reference-exemplar criteria (see Method step 2).
+    k_tol, tol_cap : float, default 3.0, 20.0
+        Centre tolerance multiplier and its cap (AF percentage points).
+    enable_dispersion : bool, default True
+        Apply the over-dispersion test.
+    k_disp : float, default 2.5
+        Dispersion multiplier on the reference z-SD.
+    min_eval_total_dp, min_eval_cells : int, default 100, 5
+        Evidence requirement for a full evaluation.
+    keep_known_low_evidence : bool, default True
+        Pass ``whitelist_low_evidence`` variants.
+    min_weak_cells : int, default 3
+        Minimum cells for the whitelist low-evidence and indel exceptions.
+    keep_indels : bool, default False
+        Pass whitelisted indels with ``>= min_weak_cells`` cells.
+    verbose : bool, default True
+        Print the reference profile and status counts.
 
     Returns
     -------
-    germline : list[str]
+    germline : list of str
+        Passing variants, in profile sort order.
     profile : pd.DataFrame
-        Per-variant AF-distribution diagnostics and disposition.
+        Per-variant diagnostics (``n_het_cells``, ``total_dp``, ``pooled_af``,
+        ``median_af``, ``se_pooled_af``, ``z_robust_sd``, ``af_tol``,
+        ``af_deviation``, ``*_ok`` flags, ``status``, ``pass_germline``), sorted
+        passing-first, then by status and deviation.
     ref_summary : dict
-        Reference centre, spread, and dispersion learned from the sample.
+        ``n_reference``, ``centre``, ``spread`` and ``z_sd``.
+
+    Raises
+    ------
+    RuntimeError
+        If the DP layer cannot be read.
+    ValueError
+        If ``selection_mode`` is not recognised.
     """
 
     def vprint(*a):
@@ -1507,17 +1710,17 @@ def validate_germline_by_af(
 
 
 def review_failed_variants(
-    prof,
+    prof: pd.DataFrame,
     *,
     ref_z_sd: float,
-    review_status=("af_skewed", "insufficient_evidence"),
+    review_status: Iterable[str] = ("af_skewed", "insufficient_evidence"),
     min_review_cells: int = 30,
     consistency_mult: float = 1.0,
     ref_like_below: float = 15.0,
     hom_like_above: float = 82.0,
     near_window: int = 50_000,
     verbose: bool = True,
-):
+) -> pd.DataFrame:
     """Second-pass triage of AF-failed variants.
 
     A variant that fails AF-centre validation is not necessarily unusable: a
@@ -1526,28 +1729,43 @@ def review_failed_variants(
     demultiplexing can use it. This pass separates those from genuine
     homozygous sites, near-reference noise, and likely mapping artefacts.
 
-    Flags, surfaced as columns for human judgement rather than baked into a
-    single verdict:
+    Flags, surfaced as columns for human judgement:
 
-      consistent      : tight per-cell AF (z_robust_sd <= consistency_mult ×
-                        reference z-SD) across >= min_review_cells cells — the
+      consistent      : tight per-cell AF (z_robust_sd <= consistency_mult x
+                        reference z-SD) across >= min_review_cells cells; the
                         skew is systematic, not noise.
-      af_zone         : ref_like (<ref_like_below) / biased_het_low /
-                        biased_het_high / hom_like (>hom_like_above).
-      chrX_nonPAR     : chrX outside PAR1/PAR2 (hg19) — a diploid-style HET is
-                        impossible here in a male donor; scrutinise.
-      n_near_failed   : other failed variants within ``near_window`` bp on the
-                        same chromosome — a tight pack can indicate a region-
-                        level CNV / mismapping (weaker signal in a targeted
-                        panel, where amplicons legitimately cluster on genes).
+      af_zone         : ref_like (< ref_like_below) / biased_het_low (< 50) /
+                        biased_het_high / hom_like (> hom_like_above) / na.
+      chrX_nonPAR     : chrX outside PAR1/PAR2 (hg19); a diploid-style HET is
+                        impossible here in a male donor.
+      n_near_failed   : other reviewed variants within ``near_window`` bp on the
+                        same chromosome; a tight pack can indicate a
+                        region-level CNV / mismapping.
 
     verdict
-      likely_usable_het : consistent, many cells, AF skewed but not at a
-                          homozygous/reference extreme — candidate to add back.
-      review_hom_or_ref : AF sits at a homozygous or near-reference value;
-                          probably not a HET (may still be a valid germline
-                          marker, just not heterozygous).
-      inconclusive      : dispersed or too few cells to judge.
+      review_hom_or_ref : AF zone is hom_like or ref_like.
+      inconclusive      : otherwise, when not ``consistent``.
+      likely_usable_het : consistent and not at an extreme; candidate to add back.
+
+    Parameters
+    ----------
+    prof : pd.DataFrame
+        Profile from :func:`validate_germline_by_af`.
+    ref_z_sd : float
+        Reference z-SD (``ref_summary["z_sd"]``).
+    review_status : iterable of str, default ("af_skewed", "insufficient_evidence")
+        Statuses to review; indels are always skipped.
+    min_review_cells, consistency_mult, ref_like_below, hom_like_above, near_window
+        Thresholds described above.
+    verbose : bool, default True
+        Print verdict counts and the top 40 rows.
+
+    Returns
+    -------
+    pd.DataFrame
+        Reviewed rows with ``chrom``, ``pos``, the flags above and ``verdict``,
+        sorted by verdict (usable, hom/ref, inconclusive) then by descending
+        ``n_het_cells``. Empty if nothing is reviewable.
     """
     df = prof[prof["status"].isin(review_status) & ~prof["is_indel"]].copy()
     if df.empty:
@@ -1618,39 +1836,60 @@ def review_failed_variants(
 
 
 def genotype_af_cutoffs(
-    Sample_T_subset,
+    Sample_T_subset: Any,
     *,
     min_dp: int = 5,
     af_bin: float = 2.0,
     min_bin_n: int = 50,
-    dp_bands=((5, 15), (15, 40), (40, np.inf)),
-    evaluate_variants=None,
+    dp_bands: Sequence[tuple[float, float]] = ((5, 15), (15, 40), (40, np.inf)),
+    evaluate_variants: Iterable[str] | None = None,
     plot: bool = True,
-    ax=None,
-):
+    ax: Any = None,
+) -> tuple[dict[str, float], pd.DataFrame | None, pd.DataFrame, pd.DataFrame | None]:
     """Empirically locate the AF thresholds at which the genotype caller
-    switches cells out of HET — into WT below and HOM-ALT above — by pooling
+    switches cells out of HET (into WT below and HOM-ALT above) by pooling
     every cell's (AF, NGT) across all variants.
 
-    The crossover where HET overtakes WT is the lower cutoff; where HOM-ALT
-    overtakes HET is the upper cutoff. Between them, HET is the caller's
-    dominant decision: that is the AF range in which a heterozygous genotype
-    is credible at this depth. The cutoffs widen at low depth, so they are
-    also reported per DP band.
+    Cells are binned by AF (``af_bin`` wide); bins with at least ``min_bin_n``
+    cells are used. The lower cutoff is the smallest bin centre where the HET
+    fraction exceeds the WT fraction; the upper cutoff is the largest bin
+    centre where HET exceeds HOM-ALT. The cutoffs widen at low depth, so they
+    are also reported per DP band.
 
-    With ``evaluate_variants`` set, returns a per-variant placement table:
-    the WT/HET/HOM-ALT call structure and where the HET-cell AF sits relative
-    to the band. A reproducibly biased true HET shows HET-dominant calls with
-    a WT (dropout) tail, ~no HOM-ALT, and a HET-AF distribution sitting wholly
-    above the lower cutoff; a homozygous site shows a HOM-ALT mass with the
-    HET calls as its low tail.
+    With ``evaluate_variants`` set, also returns a per-variant placement table
+    (:func:`compute_genotype_structure`): the WT/HET/HOM-ALT call structure and
+    where the HET-cell AF sits relative to the band.
+
+    Parameters
+    ----------
+    Sample_T_subset : Mosaic Sample-like
+        Sample whose ``dna`` assay has NGT, AF and DP layers.
+    min_dp : int, default 5
+        Minimum DP for the pooled cutoffs and the placement table.
+    af_bin : float, default 2.0
+        AF bin width (percent).
+    min_bin_n : int, default 50
+        Minimum cells per bin for it to contribute to a cutoff.
+    dp_bands : sequence of (lo, hi), default ((5, 15), (15, 40), (40, inf))
+        Half-open DP bands ``lo <= DP < hi`` for per-band cutoffs.
+    evaluate_variants : iterable of str, optional
+        Variants for the placement table.
+    plot : bool, default True
+        Draw WT/HET/HOM-ALT fraction vs AF with the cutoffs marked.
+    ax : matplotlib Axes, optional
+        Axes to draw on; a new 7 x 4 figure is created when None.
 
     Returns
     -------
-    cutoffs : dict           {"lower", "upper"} for the pooled data
-    binned  : pd.DataFrame    per-AF-bin call fractions (for plotting/inspection)
-    bands   : pd.DataFrame    cutoffs per DP band
-    placement : pd.DataFrame | None
+    cutoffs : dict
+        ``{"lower": float, "upper": float}`` (NaN when undetermined).
+    binned : pd.DataFrame or None
+        Per-bin ``af_centre``, ``n``, ``frac_WT``, ``frac_HET``, ``frac_HOM``;
+        None when no cell passes the pooled filter.
+    bands : pd.DataFrame
+        ``dp_lo``, ``dp_hi``, ``n_cells``, ``lower``, ``upper`` per DP band.
+    placement : pd.DataFrame or None
+        Placement table, or None without ``evaluate_variants``.
     """
     dna = Sample_T_subset.dna
 
@@ -1742,21 +1981,14 @@ def genotype_af_cutoffs(
 # All-variant germline profiling helpers
 # -----------------------------------------------------------------------------
 
-import os
-import glob
-import re
-import numpy as np
-import pandas as pd
-
-
 GERMLINE_PATTERN_DIR = (
     "/project/meadlab/shared/02__Projects/02b__Tapestri/"
     "resources/variants_patterns_tapestri"
 )
 
 
-def _dedupe_keep_order(items):
-    """Return unique stringified values, preserving input order."""
+def _dedupe_keep_order(items: Iterable[Any]) -> list[str]:
+    """Return unique stringified values, preserving input order and skipping NaN."""
     seen = set()
     out = []
 
@@ -1771,10 +2003,11 @@ def _dedupe_keep_order(items):
     return out
 
 
-def _normalise_variant_list(x):
-    """
-    Normalise whitelist/common/resource inputs to a list of variant strings.
-    Accepts list/set/tuple/Index/Series/DataFrame.
+def _normalise_variant_list(x: Any) -> list[str]:
+    """Normalise whitelist/common/resource inputs to a list of variant strings.
+
+    Accepts None, list/set/tuple, Index, Series or DataFrame (first of
+    ``variant``/``id``/``ID``/``Variant``, else the first column).
     """
     if x is None:
         return []
@@ -1794,10 +2027,11 @@ def _normalise_variant_list(x):
     return _dedupe_keep_order(list(x))
 
 
-def _coerce_bool_series(s):
-    """
-    Robust bool conversion for columns that may contain bools, 0/1, strings,
-    missing values, etc.
+def _coerce_bool_series(s: pd.Series | None) -> pd.Series | None:
+    """Robust bool conversion for columns holding bools, 0/1, strings or NaN.
+
+    Strings count as True when they are one of true/1/yes/y/t (case- and
+    whitespace-insensitive); numbers when non-zero; missing values are False.
     """
     if s is None:
         return None
@@ -1816,10 +2050,8 @@ def _coerce_bool_series(s):
     )
 
 
-def _full_layer_df(dna, layer):
-    """
-    Return a cell × variant dataframe for a Tapestri DNA layer.
-    """
+def _full_layer_df(dna: Any, layer: str) -> pd.DataFrame:
+    """Return a cell x variant dataframe (string index/columns) for a DNA layer."""
     df = dna.get_attribute(layer, constraint="row+col")
 
     if not isinstance(df, pd.DataFrame):
@@ -1836,19 +2068,40 @@ def _full_layer_df(dna, layer):
 
 
 def compute_genotype_structure(
-    Sample_T_subset,
-    variants,
+    Sample_T_subset: Any,
+    variants: Iterable[str],
     *,
     min_dp: int = 5,
-    lower=np.nan,
-    upper=np.nan,
-):
+    lower: float = np.nan,
+    upper: float = np.nan,
+) -> pd.DataFrame:
     """Per-variant WT/HET/HOM-ALT call structure over cells with DP >= min_dp.
 
     This is the donor-genotype evidence: it sees the whole called population,
     not just HET-called cells, so it distinguishes a heterozygous donor (HET
     present with a WT dropout tail and ~no HOM-ALT) from a homozygous-ref site
     (WT-dominated, sporadic HET noise) and a homozygous-alt site (HOM-dominated).
+
+    Parameters
+    ----------
+    Sample_T_subset : Mosaic Sample-like
+        Sample whose ``dna`` assay has NGT, AF and DP layers.
+    variants : iterable of str
+        Variants to profile (deduplicated; IDs not in the assay are skipped).
+    min_dp : int, default 5
+        Minimum DP for a called (NGT 0/1/2) cell to count.
+    lower, upper : float, default NaN
+        Caller AF cutoffs from :func:`genotype_af_cutoffs`, used for the margin
+        columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        ``variant``, ``n_cells``, ``frac_WT``, ``frac_HET``, ``frac_HOM``,
+        ``het_af_p10``/``het_af_median``/``het_af_p90`` (AF of HET cells), and,
+        when non-empty, ``het_pop_above_lower`` (p10 >= lower),
+        ``hom_dominated`` (frac_HOM > frac_HET), ``margin_to_lower`` and
+        ``margin_to_upper``.
     """
     dna = Sample_T_subset.dna
     df_ngt = _full_layer_df(dna, "NGT")
@@ -1885,22 +2138,19 @@ def compute_genotype_structure(
     return out
 
 
-def _donor_genotype_call(fwt, fhet, fhom, n_cells, *, min_het, max_hom, max_wt,
-                         min_cells=1):
+def _donor_genotype_call(fwt: float | None, fhet: float | None, fhom: float | None,
+                         n_cells: float | None, *, min_het: float, max_hom: float,
+                         max_wt: float, min_cells: int = 1) -> str:
     """Infer the donor genotype from the cell-level call structure, independent
     of AF shape.
 
-    A germline HET requires the donor to genotype heterozygous in a majority of
-    confidently-called cells (``fhet >= min_het``), with enough cells to trust
-    the call (``n_cells >= min_cells``). It is disqualified if HOM-ALT-dominated
-    (``fhom >= max_hom``) or WT-dominated (``fwt >= max_wt``). Because WT/HET/HOM
-    partition the called cells, ``fwt`` and ``fhet`` are anti-correlated, so
-    ``min_het`` is effectively the anti-WT-dominance knob: a site that is mostly
-    WT cannot be told apart from a hom-ref site with sporadic noise HET calls,
-    so it is not a credible germline HET.
-
-    Returns one of: "het", "hom_alt", "hom_ref", "low_occupancy",
-    "low_coverage", "uncalled".
+    Rules are applied in order: no HET fraction or no cells -> "uncalled";
+    ``n_cells < min_cells`` -> "low_coverage"; ``fhom >= max_hom`` ->
+    "hom_alt"; ``fwt >= max_wt`` -> "hom_ref"; ``fhet >= min_het`` -> "het";
+    otherwise "low_occupancy". Because WT/HET/HOM partition the called cells,
+    ``fwt`` and ``fhet`` are anti-correlated, so ``min_het`` is effectively the
+    anti-WT-dominance knob: a mostly-WT site cannot be told apart from a hom-ref
+    site with sporadic noise HET calls.
     """
     n = n_cells or 0
     if fhet is None or pd.isna(fhet) or n == 0:
@@ -1917,16 +2167,34 @@ def _donor_genotype_call(fwt, fhet, fhom, n_cells, *, min_het, max_hom, max_wt,
 
 
 def variant_level_ngt_af_dp_profile(
-    Sample_T_subset,
-    variants,
+    Sample_T_subset: Any,
+    variants: Iterable[str],
     *,
     min_dp: int = 2,
-):
-    """
-    Build broad per-variant NGT / AF / DP summaries.
+) -> pd.DataFrame:
+    """Build broad per-variant NGT / AF / DP summaries.
 
-    This is deliberately descriptive rather than decisive. It is intended for
+    This is deliberately descriptive rather than decisive; it is intended for
     cross-patient threshold discovery.
+
+    Parameters
+    ----------
+    Sample_T_subset : Mosaic Sample-like
+        Sample whose ``dna`` assay has NGT, AF and DP layers.
+    variants : iterable of str
+        Variants to summarise (deduplicated, order kept).
+    min_dp : int, default 2
+        Minimum DP for a called cell with finite AF to be valid.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per variant. Variants missing from the assay only have
+        ``present_in_T_subset=False``. Others carry cell counts (``n_WT``,
+        ``n_HET``, ``n_HOM_ALT``, ``n_valid_called``, ...), genotype fractions
+        (``frac_WT``, ``frac_HET``, ``frac_HOM_ALT``), DP summaries, the
+        depth-weighted ``pooled_AF_all_valid``, and p10/median/p90 AF over all
+        valid, HET and alt-like (HET or HOM) cells.
     """
     dna = Sample_T_subset.dna
 
@@ -2023,13 +2291,13 @@ def variant_level_ngt_af_dp_profile(
 
 
 def build_and_save_all_variant_germline_profile(
-    Sample,
-    DNA_Utils=None,
+    Sample: Any,
+    DNA_Utils: Any = None,
     *,
     patient_id: str,
-    annotation_df,
-    known_het_variants=None,
-    keep_labels=("CD4_T", "CD8_T", "Other_T"),
+    annotation_df: pd.DataFrame | None,
+    known_het_variants: Any = None,
+    keep_labels: Iterable[str] = ("CD4_T", "CD8_T", "Other_T"),
     out_dir: str = GERMLINE_PATTERN_DIR,
     descriptive_min_dp: int = 2,
     placement_min_dp: int = 5,
@@ -2040,35 +2308,86 @@ def build_and_save_all_variant_germline_profile(
     min_called_cells_for_genotype: int = 20,
     min_cells_for_run: int = 50,
     verbose: bool = True,
-):
-    """
-    Save one CSV containing all available per-variant germline evidence.
+) -> tuple[pd.DataFrame, Any, dict[str, Any]]:
+    """Save one CSV containing all available per-variant germline evidence.
 
-    One row per variant.
-
-    Includes:
-      - original DNA_Utils.find_germline_variants QC flags
-      - AF-shape validation metrics
-      - NGT / AF / DP descriptive metrics
-      - empirical genotype-caller AF placement metrics
-      - donor genotype inferred from the call structure (``donor_genotype``)
-      - second-pass review / rescue verdict
-      - broad seed labels for cross-patient threshold learning
+    One row per variant of the panel (no variant is dropped). Combines:
+      - the :func:`find_germline_variants` QC table (master table)
+      - AF-shape validation metrics (:func:`validate_germline_by_af`, run on
+        every variant)
+      - second-pass review verdicts (:func:`review_failed_variants`)
+      - NGT / AF / DP descriptive metrics (:func:`variant_level_ngt_af_dp_profile`)
+      - genotype-caller AF placement metrics (:func:`genotype_af_cutoffs`)
+      - the donor genotype inferred from the call structure (``donor_genotype``)
+      - a broad class and seed flags for cross-patient threshold learning
 
     Classification
     --------------
     A germline HET (clean or rescued) requires the DONOR to genotype as
     heterozygous, decided from the WT/HET/HOM-ALT call structure
-    (``donor_genotype``) *before* AF shape is considered. The AF profile is
-    computed only over HET-called cells and is therefore blind to a dominant
-    WT or HOM-ALT population; the structure gate corrects for that, so a
-    93%-WT (hom-ref) or 99%-HOM (hom-alt) site can never be seeded even if its
-    handful of HET-called cells pool near 50%.
+    (``donor_genotype``, using the DP >= ``placement_min_dp`` structure with
+    the descriptive structure as fallback) *before* AF shape is considered.
+    The AF profile is computed only over HET-called cells and is therefore
+    blind to a dominant WT or HOM-ALT population; the structure gate corrects
+    for that, so a 93%-WT (hom-ref) or 99%-HOM (hom-alt) site can never be
+    seeded even if its handful of HET-called cells pool near 50%.
 
-    ``min_frac_het_for_het`` is the primary cross-patient knob. It is set
-    conservatively by default; lower-occupancy candidates are retained in the
-    output under ``het_low_occupancy_review`` (not seeded) so the cohort can
-    decide the floor empirically. No variant is dropped from the CSV.
+    ``germline_broad_class`` is then: excluded_pathogenic / excluded_blacklisted
+    / missing_from_T_subset_or_unprofiled / indel_af_unreliable / a
+    donor-genotype class (absent, low_coverage_review, likely_hom_alt,
+    likely_hom_ref, het_low_occupancy_review) / for HET donors, the AF-shape
+    class (clean_germline_het, rescued_germline_het_whitelist_low_evidence,
+    rescued_germline_het_candidate, likely_hom_or_ref, insufficient_evidence,
+    af_skewed_not_rescued, overdispersed, absent).
+
+    Parameters
+    ----------
+    Sample : missionbio.mosaic Sample
+        Full sample with protein labels.
+    DNA_Utils : module, optional
+        Object exposing ``find_germline_variants``; this module's function is
+        used when None.
+    patient_id : str
+        Used as the ``patient_id`` column and CSV prefix.
+    annotation_df : pd.DataFrame or None
+        Passed to :func:`find_germline_variants` for the ClinVar filter.
+    known_het_variants : list-like or DataFrame, optional
+        Curated known-HET whitelist.
+    keep_labels : iterable of str, default ("CD4_T", "CD8_T", "Other_T")
+        Protein labels of the normal subset.
+    out_dir : str, default GERMLINE_PATTERN_DIR
+        Output directory (created if needed).
+    descriptive_min_dp, placement_min_dp : int, default 2, 5
+        DP floors for the descriptive and placement summaries.
+    min_frac_het_for_het, max_frac_hom_for_het, max_frac_wt_for_het : float
+        Donor-genotype thresholds (see ``_donor_genotype_call``).
+        ``min_frac_het_for_het`` is the main cross-patient knob.
+    min_called_cells_for_genotype : int, default 20
+        Minimum called cells for a donor-genotype call.
+    min_cells_for_run : int, default 50
+        Subset size below which a warning is printed and
+        ``run_underpowered=True`` is recorded (the CSV is still written).
+    verbose : bool, default True
+        Print the output path and class/seed counts.
+
+    Returns
+    -------
+    all_info : pd.DataFrame
+        The saved table, sorted usable/clean/rescued seeds first.
+    Sample_T_subset : missionbio.mosaic Sample
+        The cell subset from :func:`find_germline_variants`.
+    meta : dict
+        ``germline``, ``ref``, ``cutoffs``, ``binned``, ``bands``, ``prof``,
+        ``review``, ``out_csv``, ``n_T_cells``, ``run_underpowered``.
+
+    Raises
+    ------
+    RuntimeError
+        If the QC table is empty or lacks a ``variant`` column.
+
+    Notes
+    -----
+    Writes ``{out_dir}/{patient_id}_variants_germline_data.csv``.
     """
 
     os.makedirs(out_dir, exist_ok=True)
@@ -2424,7 +2743,7 @@ def build_and_save_all_variant_germline_profile(
 # Notebook-facing all-variant germline profiling wrapper
 # -----------------------------------------------------------------------------
 
-def _safe_patient_export_id(experiment, patient_id):
+def _safe_patient_export_id(experiment: Any, patient_id: Any) -> str:
     """Return a filesystem-safe export identifier from experiment and patient ID."""
     import re
 
@@ -2435,14 +2754,14 @@ def _safe_patient_export_id(experiment, patient_id):
 
 
 def run_all_variant_germline_profile_export(
-    Sample,
+    Sample: Any,
     *,
     experiment: str,
     patient_id: str,
-    annotation_df,
-    known_het_variants=None,
-    DNA_Utils=None,
-    keep_labels=("CD4_T", "CD8_T", "Other_T"),
+    annotation_df: pd.DataFrame | None,
+    known_het_variants: Any = None,
+    DNA_Utils: Any = None,
+    keep_labels: Iterable[str] = ("CD4_T", "CD8_T", "Other_T"),
     out_dir: str = GERMLINE_PATTERN_DIR,
     descriptive_min_dp: int = 2,
     placement_min_dp: int = 5,
@@ -2453,7 +2772,7 @@ def run_all_variant_germline_profile_export(
     min_called_cells_for_genotype: int = 20,
     min_cells_for_run: int = 50,
     verbose: bool = True,
-):
+) -> tuple[pd.DataFrame, Any, dict[str, Any]]:
     """Run the all-variant germline profiling export for one patient.
 
     This is a notebook-friendly wrapper around
@@ -2471,7 +2790,7 @@ def run_all_variant_germline_profile_export(
     ----------
     Sample
         Mission Bio Mosaic sample object.
-    experiment, patient_id
+    experiment, patient_id : str
         Values used to create a safe export ID and CSV prefix.
     annotation_df
         Variant annotation dataframe passed to germline discovery.
@@ -2479,8 +2798,7 @@ def run_all_variant_germline_profile_export(
         Optional curated germline/known-HET variant list.
     DNA_Utils
         Optional module/object exposing ``find_germline_variants``. Leave as
-        ``None`` when calling this function from inside the same DNA_Utils
-        module.
+        ``None`` to use this module's implementation.
     keep_labels
         Protein labels used to define the normal/T-cell subset.
     out_dir
@@ -2490,15 +2808,27 @@ def run_all_variant_germline_profile_export(
     min_frac_het_for_het, max_frac_hom_for_het, max_frac_wt_for_het
         Donor-genotype structure thresholds. A germline HET requires HET
         occupancy >= ``min_frac_het_for_het`` and HOM-ALT occupancy
-        < ``max_frac_hom_for_het``; WT occupancy >= ``max_frac_wt_for_het`` with
-        too little HET is called hom-ref. ``min_frac_het_for_het`` is the main
-        cross-patient knob.
+        < ``max_frac_hom_for_het``; WT occupancy >= ``max_frac_wt_for_het`` is
+        called hom-ref. ``min_frac_het_for_het`` is the main cross-patient knob.
+    min_called_cells_for_genotype
+        Minimum called cells for a donor-genotype call.
+    min_cells_for_run
+        Accepted but not forwarded: the wrapped builder always uses its own
+        default (50).
     verbose
         Print run summary.
 
     Returns
     -------
-    all_variant_germline_df, Sample_T_subset, germline_profile_meta
+    all_variant_germline_df : pd.DataFrame
+    Sample_T_subset : missionbio.mosaic Sample
+    germline_profile_meta : dict
+        The builder's metadata plus the handles listed above.
+
+    Raises
+    ------
+    ValueError
+        If ``experiment`` or ``patient_id`` is missing or blank.
     """
 
     if experiment is None or str(experiment).strip() == "":
@@ -2595,9 +2925,10 @@ _EXCLUDE_CLONE_DF_PATTERNS = [
 ]
 
 
-def _get_clone_columns_from_clone_df(clone_df):
+def _get_clone_columns_from_clone_df(clone_df: Any) -> list[str]:
     """Return informative clone columns from a Mosaic VariantSubcloneTable
-    dataframe, excluding variant-name and non-informative clone-summary columns.
+    dataframe, excluding variant-name and non-informative clone-summary columns
+    (missing / small / ADO / FP). Non-DataFrame input gives an empty list.
     """
     if clone_df is None or not isinstance(clone_df, pd.DataFrame):
         return []
@@ -2614,7 +2945,9 @@ def _get_clone_columns_from_clone_df(clone_df):
     return clone_cols
 
 
-def _clone_barcode_table_from_labeled_sample(sample_like, clone_labels):
+def _clone_barcode_table_from_labeled_sample(
+    sample_like: Any, clone_labels: Iterable[Any]
+) -> tuple[pd.DataFrame, pd.Series]:
     """Build a barcode-level clone table from a Mosaic sample/assay carrying
     VariantSubcloneTable labels.
 
@@ -2623,12 +2956,13 @@ def _clone_barcode_table_from_labeled_sample(sample_like, clone_labels):
     sample_like : Mosaic Sample-like object
         Object whose ``dna`` assay still has labels such as WT, TP53_Het, etc.
     clone_labels : iterable[str]
-        Clone labels to recover barcode membership for.
+        Clone labels to recover barcode membership for. Labels whose barcode
+        lookup fails contribute no cells.
 
     Returns
     -------
     clone_barcode_df : pd.DataFrame
-        Columns: barcode, clone_label.
+        Columns: barcode, clone_label (first label wins for duplicate barcodes).
     cell_clone_labels : pd.Series
         Index = barcode, value = clone_label.
     """
@@ -2662,41 +2996,77 @@ def _clone_barcode_table_from_labeled_sample(sample_like, clone_labels):
     )
     return clone_barcode_df, cell_clone_labels
 
+
 def build_wt_cell_subset(
-    Sample_for_clustering,
-    whitelist,
+    Sample_for_clustering: Any,
+    whitelist: Iterable[str],
     *,
-    DNA_Utils=None,
-    ms_module=None,
+    DNA_Utils: Any = None,
+    ms_module: Any = None,
     max_ado_score: float = 0.8,
     min_clone_cells: int = 5,
-    total_barcodes: int = None,
-    drop_labels=("missing", "small", "ADO", "FP"),
+    total_barcodes: int | None = None,
+    drop_labels: Iterable[str] = ("missing", "small", "ADO", "FP"),
     verbose: bool = True,
-):
+) -> tuple[Any, pd.DataFrame]:
     """Build a genotype-defined clean-cell ("WT") population, regardless of
     protein cell-type label, via the Mosaic VariantSubcloneTable workflow on the
     germline whitelist.
 
     Mirrors the standard subclone QC: cluster on the whitelist genotypes, then
     drop the cells the workflow flags as missing / small / ADO / FP. The
-    survivors are the cells with clean, consistent germline genotypes — a much
+    survivors are the cells with clean, consistent germline genotypes, a much
     larger normal-evidence population than the protein-labelled lymphoid subset
-    when cell-typing is sparse (e.g. the 9-cell MDS001 case).
+    when cell-typing is sparse.
 
-    Clustering is run on a whitelist-restricted view of the sample (the workflow
+    Clustering is run on a whitelist-restricted copy of the sample (the workflow
     annotates every variant it is given, and the full panel exceeds the Varsome
     annotation cap); the resulting clean-cell selection is then applied to the
-    full panel so all candidate variants remain available downstream. Depends on
-    ``ms.workflows.VariantSubcloneTable`` and ``DNA_Utils.clones_to_dataframe``.
+    full panel so all candidate variants remain available downstream.
+
+    Parameters
+    ----------
+    Sample_for_clustering : missionbio.mosaic Sample
+        Full sample.
+    whitelist : iterable of str
+        Germline whitelist; only IDs present in the sample are used.
+    DNA_Utils : module
+        Must expose ``clones_to_dataframe``.
+    ms_module : module, optional
+        ``missionbio.mosaic`` (imported when None); provides
+        ``workflows.VariantSubcloneTable``.
+    max_ado_score : float, default 0.8
+        Passed to ``clones_to_dataframe``.
+    min_clone_cells : int, default 5
+        Minimum clone size in cells; converted to a percentage of
+        ``total_barcodes`` for ``clones_to_dataframe``.
+    total_barcodes : int, optional
+        Denominator for the clone-size percentage; defaults to the sample's
+        barcode count.
+    drop_labels : iterable of str, default ("missing", "small", "ADO", "FP")
+        Workflow labels whose cells are removed.
+    verbose : bool, default True
+        Print the subset size.
 
     Returns
     -------
-    Sample_wt : the full-panel sample restricted to the clean clone cells
-    clone_df  : the clone table from clones_to_dataframe. Barcode-level clone
-                membership is stored in clone_df.attrs under
-                'clone_barcode_df', 'cell_clone_labels', and
-                'step2_clone_labels_used'.
+    Sample_wt : missionbio.mosaic Sample
+        Shallow copy of the full-panel sample without the dropped cells.
+    clone_df : pd.DataFrame
+        Clone table from ``clones_to_dataframe``. Barcode-level clone membership
+        is stored in ``clone_df.attrs`` under ``'clone_barcode_df'``,
+        ``'cell_clone_labels'`` and ``'step2_clone_labels_used'``.
+
+    Raises
+    ------
+    ValueError
+        If ``DNA_Utils`` lacks ``clones_to_dataframe`` or no whitelist variant
+        is in the sample.
+
+    Notes
+    -----
+    The clustering copy gets ``NGT_FILTERED = NGT``; the workflow labels its
+    DNA assay in place.
     """
     import copy
 
@@ -2772,8 +3142,8 @@ def build_wt_cell_subset(
 
 
 def population_structure_table(
-    Sample_like,
-    variants,
+    Sample_like: Any,
+    variants: Iterable[str],
     *,
     label: str = "wt",
     min_dp: int = 5,
@@ -2781,11 +3151,33 @@ def population_structure_table(
     max_hom: float = 0.20,
     max_wt: float = 0.90,
     min_cells: int = 20,
-):
+) -> pd.DataFrame:
     """Per-variant WT/HET/HOM call structure and donor genotype for an arbitrary
-    cell population, with columns prefixed by ``label`` (e.g. ``wt_frac_HET``,
-    ``wt_donor_genotype``). Uses the same structure logic and thresholds as the
-    primary pass, so the two populations are directly comparable.
+    cell population.
+
+    Uses the same structure logic (:func:`compute_genotype_structure`) and
+    thresholds as the primary pass, so two populations are directly comparable.
+
+    Parameters
+    ----------
+    Sample_like : Mosaic Sample-like
+        Population to profile.
+    variants : iterable of str
+        Variants to profile.
+    label : str, default "wt"
+        Column prefix.
+    min_dp : int, default 5
+        Minimum DP per called cell.
+    min_het, max_hom, max_wt, min_cells
+        Donor-genotype thresholds (see ``_donor_genotype_call``).
+
+    Returns
+    -------
+    pd.DataFrame
+        ``variant`` plus ``{label}_n_cells``, ``{label}_frac_WT``,
+        ``{label}_frac_HET``, ``{label}_frac_HOM``, ``{label}_het_af_median``
+        and ``{label}_donor_genotype``. Only ``variant`` when nothing is
+        profiled.
     """
     struct = compute_genotype_structure(Sample_like, variants, min_dp=min_dp)
     if struct.empty:
@@ -2809,20 +3201,20 @@ def population_structure_table(
 
 
 def add_population_concordance(
-    all_info,
-    secondary_sample,
+    all_info: pd.DataFrame,
+    secondary_sample: Any,
     *,
     label: str = "wt",
-    variants=None,
+    variants: Iterable[str] | None = None,
     min_dp: int = 5,
     min_frac_het_for_het: float = 0.55,
     max_frac_hom_for_het: float = 0.20,
     max_frac_wt_for_het: float = 0.90,
     min_called_cells_for_genotype: int = 20,
     verbose: bool = True,
-):
+) -> pd.DataFrame:
     """Attach a second cell population's call structure to the germline table,
-    as its own columns, for per-patient decision-making — no single combined
+    as its own columns, for per-patient decision-making; no single combined
     rule is imposed.
 
     Adds, all prefixed by ``label`` (e.g. ``wt_``):
@@ -2833,10 +3225,31 @@ def add_population_concordance(
       concordant_germline_het   : donor genotype is HET in BOTH populations
 
     The lymphoid seeds (clean / rescued / usable) are left untouched, and no
-    ``confirmed`` column is created. You combine them per patient — typically
-    trust ``concordant_germline_het`` when the lymphoid subset is well powered,
-    and fall back to ``{label}_germline_het_seed`` when it is not. The printed
+    ``confirmed`` column is created. Typically trust
+    ``concordant_germline_het`` when the lymphoid subset is well powered, and
+    fall back to ``{label}_germline_het_seed`` when it is not. The printed
     summary reports both population sizes so that choice is informed.
+
+    Parameters
+    ----------
+    all_info : pd.DataFrame
+        All-variant germline table with ``variant`` (and ideally
+        ``donor_genotype``).
+    secondary_sample : Mosaic Sample-like
+        Second population, e.g. from :func:`build_wt_cell_subset`.
+    label : str, default "wt"
+        Column prefix.
+    variants : iterable of str, optional
+        Variants to profile; defaults to all of ``all_info["variant"]``.
+    min_dp, min_frac_het_for_het, max_frac_hom_for_het, max_frac_wt_for_het, min_called_cells_for_genotype
+        Structure/donor-genotype thresholds for the secondary population.
+    verbose : bool, default True
+        Print population sizes, seed counts and suggested recipes.
+
+    Returns
+    -------
+    pd.DataFrame
+        A copy of ``all_info`` with the columns above merged on ``variant``.
     """
     all_info = all_info.copy()
     if variants is None:
@@ -2892,14 +3305,13 @@ def add_population_concordance(
 # Cohort-level germline-HET threshold calibration
 # -----------------------------------------------------------------------------
 #
-# Pools the per-patient *_variants_germline_data.csv files, anchors on the
-# known-germline whitelist instances to learn what a genuine germline HET looks
-# like across the cohort, corroborates with cross-donor recurrence, and proposes
-# sample-independent thresholds (frac_HET / frac_HOM / frac_WT and a HET-AF
-# window). No hard ground truth exists, so "accurate" is empirical: whitelist
-# sites called HET are the positive anchor; recurrence corroborates, with the
-# standing caveat that reproducible artefacts (chrX non-PAR paralogues, indel AF
-# miscalibration) also recur and must be read alongside frac_HOM and AF shape.
+# Column resolution and rule application for thresholds calibrated on the
+# pooled per-patient *_variants_germline_data.csv exports. The calibration
+# itself (anchoring on whitelist sites called HET, corroborated by cross-donor
+# recurrence) is run outside this module; its result is stored in
+# EMPIRICAL_COHORT_GERMLINE_THRESHOLDS below. CSV_GLOB, NOT_PRESENT and the
+# CURRENT_* values are reference constants for that cohort workflow and are not
+# used by the functions in this file.
 
 CSV_GLOB = "*_variants_germline_data.csv"
 
@@ -2968,8 +3380,12 @@ CURRENT_MAX_FRAC_HOM = 0.20
 CURRENT_MAX_FRAC_WT = 0.90
 
 
-def resolve_calibration_columns(df):
-    """Map logical feature names to the actual columns present in df."""
+def resolve_calibration_columns(df: pd.DataFrame) -> dict[str, str]:
+    """Map logical feature names to the actual columns present in ``df``.
+
+    For each key of :data:`COL_CANDIDATES` the first candidate column present
+    in ``df`` is used; features with no matching column are omitted.
+    """
     colmap = {}
     for logical, candidates in COL_CANDIDATES.items():
         for c in candidates:
@@ -2979,31 +3395,14 @@ def resolve_calibration_columns(df):
     return colmap
 
 
-def load_germline_cohort(csv_dir=GERMLINE_PATTERN_DIR, pattern=CSV_GLOB):
-    """Pool all per-patient germline CSVs, tagging each row with its sample."""
-    paths = sorted(glob.glob(os.path.join(csv_dir, pattern)))
-    if not paths:
-        raise FileNotFoundError(f"No CSVs matching {pattern} in {csv_dir}")
-    frames = []
-    for p in paths:
-        d = pd.read_csv(p)
-        d["sample_id"] = os.path.basename(p).replace(
-            "_variants_germline_data.csv", "")
-        frames.append(d)
-        print(f"  loaded {os.path.basename(p)}: {d.shape[0]} variants")
-    pooled = pd.concat(frames, ignore_index=True)
-    print(f"\nPooled: {pooled.shape[0]} variant-instances "
-          f"across {len(paths)} samples")
-    return pooled, paths
-
-
-def _cal_col(df, colmap, logical):
+def _cal_col(df: pd.DataFrame, colmap: dict[str, str], logical: str) -> pd.Series | None:
     """Series for a logical feature, or None if the column is absent."""
     col = colmap.get(logical)
     return df[col] if col is not None and col in df.columns else None
 
 
-def _numeric_cal_col(df, colmap, logical, default=np.nan):
+def _numeric_cal_col(df: pd.DataFrame, colmap: dict[str, str], logical: str,
+                     default: float = np.nan) -> pd.Series:
     """Numeric Series for a logical feature, robust to missing columns."""
     s = _cal_col(df, colmap, logical)
     if s is None:
@@ -3011,7 +3410,8 @@ def _numeric_cal_col(df, colmap, logical, default=np.nan):
     return pd.to_numeric(s, errors="coerce")
 
 
-def _bool_cal_col(df, colmap, logical, default=False):
+def _bool_cal_col(df: pd.DataFrame, colmap: dict[str, str], logical: str,
+                  default: bool = False) -> pd.Series:
     """Boolean Series for a logical feature, robust to missing columns."""
     s = _cal_col(df, colmap, logical)
     if s is None:
@@ -3019,7 +3419,8 @@ def _bool_cal_col(df, colmap, logical, default=False):
     return _coerce_bool_series(s).reindex(df.index).fillna(default).astype(bool)
 
 
-def _string_cal_col(df, colmap, logical, default=""):
+def _string_cal_col(df: pd.DataFrame, colmap: dict[str, str], logical: str,
+                    default: str = "") -> pd.Series:
     """String Series for a logical feature, robust to missing columns."""
     s = _cal_col(df, colmap, logical)
     if s is None:
@@ -3027,17 +3428,11 @@ def _string_cal_col(df, colmap, logical, default=""):
     return s.fillna(default).astype(str)
 
 
-def _present_mask(df, colmap):
-    dg = _cal_col(df, colmap, "donor_genotype")
-    if dg is not None:
-        return ~dg.isin(NOT_PRESENT) & dg.notna()
-    nc = _cal_col(df, colmap, "n_cells")
-    if nc is not None:
-        return pd.to_numeric(nc, errors="coerce").fillna(0) >= 1
-    return pd.Series(True, index=df.index)
+def _het_mask(df: pd.DataFrame, colmap: dict[str, str]) -> pd.Series:
+    """Donor-HET mask: ``donor_genotype == "het"``, else the usable-seed flag.
 
-
-def _het_mask(df, colmap):
+    Raises ValueError when neither column is available.
+    """
     dg = _cal_col(df, colmap, "donor_genotype")
     if dg is not None:
         return dg.eq("het")
@@ -3047,377 +3442,68 @@ def _het_mask(df, colmap):
     raise ValueError("Need donor_genotype or usable_germline_het_seed to call HET.")
 
 
-def _not_excluded_mask(df, colmap):
+def _not_excluded_mask(df: pd.DataFrame, colmap: dict[str, str]) -> pd.Series:
+    """Rows that are not pathogenic, not blacklisted and not in a BAD_GERMLINE_CLASSES class."""
     pathogenic = _bool_cal_col(df, colmap, "pathogenic")
     blacklisted = _bool_cal_col(df, colmap, "blacklisted")
     broad_class = _string_cal_col(df, colmap, "broad_class")
     return (~pathogenic) & (~blacklisted) & (~broad_class.isin(BAD_GERMLINE_CLASSES))
 
 
-def germline_recurrence(pooled, colmap):
-    """Per-variant cross-donor recurrence summary."""
-    var = _cal_col(pooled, colmap, "variant")
-    if var is None:
-        raise ValueError("No variant identifier column found.")
-    work = pd.DataFrame({
-        "variant": var,
-        "sample_id": pooled["sample_id"],
-        "present": _present_mask(pooled, colmap).values,
-        "het": _het_mask(pooled, colmap).values,
-    })
-    rec = work.groupby("variant").agg(
-        n_samples=("sample_id", "nunique"),
-        n_present=("present", "sum"),
-        n_het=("het", "sum"),
-    ).reset_index()
-    rec["het_call_rate"] = rec["n_het"] / rec["n_present"].replace(0, np.nan)
-    return rec.sort_values(["n_het", "het_call_rate"], ascending=False)
+def apply_calibrated_germline_rules(
+    pooled: pd.DataFrame,
+    thresholds: Mapping[str, Any],
+    colmap: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Add clean/practical calibrated germline flags to a germline table.
 
+    All tiers require the row to be allowed (not pathogenic, not blacklisted,
+    broad class not in :data:`BAD_GERMLINE_CLASSES`) and donor-HET
+    (``donor_genotype == "het"``, else ``usable_germline_het_seed``).
 
-def germline_anchor_frame(pooled, colmap):
-    """Whitelist instances actually called HET (positive anchor).
-
-    Falls back to recurrent HET instances if no/sparse whitelist column exists.
-    Excluded/pathogenic/blacklisted/bad-class rows are not allowed to define the
-    anchor distribution.
-    """
-    het = _het_mask(pooled, colmap)
-    allowed = _not_excluded_mask(pooled, colmap)
-    known = _cal_col(pooled, colmap, "known_het")
-    if known is not None:
-        known = _coerce_bool_series(known).fillna(False).astype(bool)
-        anchor = pooled[known & het & allowed]
-        if len(anchor) >= 20:
-            return anchor, "whitelist HET instances"
-        print(f"  [warn] only {len(anchor)} whitelist HET instances; "
-              f"augmenting with recurrent HETs")
-    rec = germline_recurrence(pooled[allowed].copy(), colmap)
-    recurrent = set(rec.loc[rec["n_het"] >= 3, "variant"])
-    var = _cal_col(pooled, colmap, "variant")
-    anchor = pooled[allowed & het & var.isin(recurrent)]
-    return anchor, "recurrent HET instances (no/sparse whitelist)"
-
-
-def germline_percentile_table(anchor, colmap):
-    """Empirical percentiles of each feature in the anchor set."""
-    feats = {
-        "frac_het": [1, 2.5, 5, 10, 25, 50],
-        "frac_hom": [50, 75, 90, 95, 97.5, 99],
-        "frac_wt":  [50, 75, 90, 95, 97.5, 99],
-        "het_af_median": [1, 2.5, 5, 50, 95, 97.5, 99],
-        "af_z": [50, 90, 95, 97.5, 99],
-    }
-    rows = []
-    for logical, pcts in feats.items():
-        s = _numeric_cal_col(anchor, colmap, logical).dropna()
-        if s.empty:
-            continue
-        for p in pcts:
-            rows.append({"feature": logical, "percentile": p,
-                         "value": np.percentile(s, p)})
-    return pd.DataFrame(rows)
-
-
-def propose_germline_thresholds(anchor, colmap):
-    """Percentile-derived thresholds for the clean canonical HET tier.
-
-    This function intentionally learns only the clean/canonical tier from the
-    whitelist/recurrent HET anchor distribution. The practical usable tier is
-    learned separately by ``calibrate_practical_germline_thresholds`` using a
-    broader positive anchor and explicit bad-class penalties.
-    """
-    def pc(logical, p):
-        s = _numeric_cal_col(anchor, colmap, logical).dropna()
-        return float(np.percentile(s, p)) if len(s) else None
-
-    clean_min_frac_het = pc("frac_het", 5)
-    clean_max_frac_hom = pc("frac_hom", 95)
-    clean_max_frac_wt = pc("frac_wt", 95)
-    clean_af_lower = pc("het_af_median", 2.5)
-    clean_af_upper = pc("het_af_median", 97.5)
-    max_af_z = pc("af_z", 95)
-
-    return {
-        # Backwards-compatible names = clean canonical tier.
-        "min_frac_het": clean_min_frac_het,
-        "max_frac_hom": clean_max_frac_hom,
-        "max_frac_wt": clean_max_frac_wt,
-        "af_lower": clean_af_lower,
-        "af_upper": clean_af_upper,
-        "max_af_z": max_af_z,
-
-        # Explicit clean tier.
-        "clean_min_frac_het": clean_min_frac_het,
-        "clean_max_frac_hom": clean_max_frac_hom,
-        "clean_max_frac_wt": clean_max_frac_wt,
-        "clean_af_lower": clean_af_lower,
-        "clean_af_upper": clean_af_upper,
-        "clean_max_af_z": max_af_z,
-    }
-
-
-def _bad_practical_mask(df, colmap):
-    """Rows that should never be gained by practical threshold calibration."""
-    broad = _string_cal_col(df, colmap, "broad_class")
-    status = _string_cal_col(df, colmap, "status")
-    review = _string_cal_col(df, colmap, "review_verdict")
-    dg = _string_cal_col(df, colmap, "donor_genotype")
-
-    pathogenic = _bool_cal_col(df, colmap, "pathogenic")
-    blacklisted = _bool_cal_col(df, colmap, "blacklisted")
-
-    return (
-        pathogenic
-        | blacklisted
-        | broad.isin(BAD_GERMLINE_CLASSES)
-        | status.eq("overdispersed")
-        | review.eq("review_hom_or_ref")
-        | dg.isin(["hom_alt", "hom_ref"])
-    )
-
-
-def germline_practical_anchor_frame(pooled, colmap):
-    """Broader empirical positive anchor for practical usable HET thresholds.
-
-    The practical anchor is intentionally broader than the clean anchor. It
-    includes currently usable germline HETs, clean HETs, rescued/skewed HETs,
-    and whitelist HETs, provided they are not excluded or bad-class rows.
-    """
-    het = _het_mask(pooled, colmap)
-    bad = _bad_practical_mask(pooled, colmap)
-
-    known = _bool_cal_col(pooled, colmap, "known_het")
-    usable = _bool_cal_col(pooled, colmap, "usable_seed")
-    clean = _bool_cal_col(pooled, colmap, "clean_seed")
-    rescued = _bool_cal_col(pooled, colmap, "rescued_seed")
-
-    broad = _string_cal_col(pooled, colmap, "broad_class")
-    status = _string_cal_col(pooled, colmap, "status")
-    review = _string_cal_col(pooled, colmap, "review_verdict")
-
-    rescued_like = (
-        rescued
-        | broad.isin([
-            "rescued_germline_het_candidate",
-            "rescued_germline_het_whitelist_low_evidence",
-        ])
-        | (status.eq("af_skewed") & review.eq("likely_usable_het"))
-    )
-
-    anchor_mask = het & ~bad & (usable | clean | rescued_like | known)
-    anchor = pooled.loc[anchor_mask].copy()
-
-    return anchor, "current usable + whitelist + rescued/skewed HET instances"
-
-
-def calibrate_practical_germline_thresholds(
-    pooled,
-    practical_anchor,
-    colmap,
-    *,
-    recall_floor: float = 0.995,
-    current_reject_floor: int = 0,
-    min_het_percentiles=None,
-    max_hom_percentiles=None,
-    max_wt_percentiles=None,
-):
-    """Empirically tune practical genotype-structure thresholds.
-
-    This v1 calibrator removes hand-seeded numeric cutoffs. Candidate
-    thresholds are generated only from percentiles of the practical positive
-    anchor distribution:
-
-      - ``usable_min_frac_het`` = a lower percentile of anchor frac_HET.
-      - ``usable_max_frac_hom`` = an upper percentile of anchor frac_HOM.
-      - ``usable_max_frac_wt``  = an upper percentile of anchor frac_WT.
-
-    The selected operating point is the most stringent empirical percentile
-    combination that satisfies the requested anchor recall/current-retention
-    constraint, while minimising bad-class and non-anchor pass-through. AF is
-    deliberately not used here; AF defines the clean canonical tier only.
-    Rescued skewed HETs are handled by review/genotype support.
-    """
-    fh = _numeric_cal_col(pooled, colmap, "frac_het")
-    fhom = _numeric_cal_col(pooled, colmap, "frac_hom")
-    fwt = _numeric_cal_col(pooled, colmap, "frac_wt")
-
-    valid = fh.notna() & fhom.notna() & fwt.notna()
-    bad = _bad_practical_mask(pooled, colmap)
-    allowed = _not_excluded_mask(pooled, colmap)
-    donor_het = _het_mask(pooled, colmap)
-    current = _bool_cal_col(pooled, colmap, "usable_seed")
-
-    anchor_mask = pd.Series(False, index=pooled.index)
-    anchor_mask.loc[practical_anchor.index] = True
-    anchor_mask &= valid
-
-    a_fh = fh.loc[anchor_mask].dropna()
-    a_fhom = fhom.loc[anchor_mask].dropna()
-    a_fwt = fwt.loc[anchor_mask].dropna()
-
-    if len(a_fh) == 0 or len(a_fhom) == 0 or len(a_fwt) == 0:
-        raise ValueError(
-            "Practical anchor has insufficient frac_HET / frac_HOM / frac_WT values."
-        )
-
-    # Percentile choices, not numeric cutoffs. These are deliberately exposed
-    # in the output table so the operating point is auditable.
-    if min_het_percentiles is None:
-        min_het_percentiles = [0, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
-    if max_hom_percentiles is None:
-        max_hom_percentiles = [90, 95, 97.5, 99, 99.5, 99.75, 99.9, 100]
-    if max_wt_percentiles is None:
-        max_wt_percentiles = [90, 95, 97.5, 99, 99.5, 99.75, 99.9, 100]
-
-    def _pc(values, p):
-        return float(np.percentile(values, p))
-
-    rows = []
-    n_anchor = int(anchor_mask.sum())
-
-    for p_min_het in min_het_percentiles:
-        min_het = _pc(a_fh, p_min_het)
-        for p_max_hom in max_hom_percentiles:
-            max_hom = _pc(a_fhom, p_max_hom)
-            for p_max_wt in max_wt_percentiles:
-                max_wt = _pc(a_fwt, p_max_wt)
-
-                rule = (
-                    valid
-                    & donor_het
-                    & (fh >= min_het)
-                    & (fhom <= max_hom)
-                    & (fwt <= max_wt)
-                )
-
-                anchor_retained = int((rule & anchor_mask).sum())
-                anchor_recall = anchor_retained / n_anchor if n_anchor else np.nan
-
-                bad_passing_raw = int((rule & bad).sum())
-                hard_excluded_passing_raw = int((rule & ~allowed).sum())
-                nonanchor_allowed_passing = int((rule & allowed & ~anchor_mask).sum())
-                current_rejected = int((current & ~rule).sum())
-                current_retained = int((current & rule).sum())
-                total_passing_raw = int(rule.sum())
-                total_passing_after_hard_exclusions = int((rule & allowed).sum())
-
-                labelled_precision = (
-                    anchor_retained / (anchor_retained + bad_passing_raw)
-                    if (anchor_retained + bad_passing_raw) > 0
-                    else np.nan
-                )
-
-                rows.append({
-                    "min_het_percentile": float(p_min_het),
-                    "max_hom_percentile": float(p_max_hom),
-                    "max_wt_percentile": float(p_max_wt),
-                    "usable_min_frac_het": float(min_het),
-                    "usable_max_frac_hom": float(max_hom),
-                    "usable_max_frac_wt": float(max_wt),
-                    "practical_anchor_n": n_anchor,
-                    "practical_anchor_retained": anchor_retained,
-                    "practical_anchor_recall": float(anchor_recall),
-                    "labelled_precision_vs_bad": float(labelled_precision),
-                    "bad_passing_raw": bad_passing_raw,
-                    "hard_excluded_passing_raw": hard_excluded_passing_raw,
-                    "nonanchor_allowed_passing": nonanchor_allowed_passing,
-                    "current_rejected": current_rejected,
-                    "current_retained": current_retained,
-                    "total_passing_raw": total_passing_raw,
-                    "total_passing_after_hard_exclusions": total_passing_after_hard_exclusions,
-                })
-
-    search = pd.DataFrame(rows)
-
-    eligible = search[
-        (search["practical_anchor_recall"] >= recall_floor)
-        & (search["current_rejected"] <= current_reject_floor)
-    ].copy()
-
-    if eligible.empty:
-        eligible = search.copy()
-
-    # No hidden weighted score: the sort order is the operating-point policy.
-    # First satisfy positive-anchor recall/current retention, then minimise bad
-    # pass-through and new non-anchor pass-through. Ties choose the most compact
-    # final set, then the highest observed recall.
-    best_row = (
-        eligible.sort_values(
-            [
-                "bad_passing_raw",
-                "nonanchor_allowed_passing",
-                "total_passing_after_hard_exclusions",
-                "practical_anchor_recall",
-                "min_het_percentile",
-                "max_hom_percentile",
-                "max_wt_percentile",
-            ],
-            ascending=[True, True, True, False, False, True, True],
-        )
-        .iloc[0]
-    )
-
-    practical_thresholds = {
-        "usable_min_frac_het": float(best_row["usable_min_frac_het"]),
-        "usable_max_frac_hom": float(best_row["usable_max_frac_hom"]),
-        "usable_max_frac_wt": float(best_row["usable_max_frac_wt"]),
-        "usable_min_frac_het_percentile": float(best_row["min_het_percentile"]),
-        "usable_max_frac_hom_percentile": float(best_row["max_hom_percentile"]),
-        "usable_max_frac_wt_percentile": float(best_row["max_wt_percentile"]),
-        "usable_anchor_recall": float(best_row["practical_anchor_recall"]),
-        "usable_labelled_precision_vs_bad": float(best_row["labelled_precision_vs_bad"]),
-        "usable_bad_passing_raw": int(best_row["bad_passing_raw"]),
-        "usable_hard_excluded_passing_raw": int(best_row["hard_excluded_passing_raw"]),
-        "usable_nonanchor_allowed_passing": int(best_row["nonanchor_allowed_passing"]),
-        "usable_current_rejected": int(best_row["current_rejected"]),
-        "usable_current_retained": int(best_row["current_retained"]),
-        "usable_total_passing_raw": int(best_row["total_passing_raw"]),
-        "usable_total_passing_after_hard_exclusions": int(best_row["total_passing_after_hard_exclusions"]),
-        "usable_selection_policy": (
-            "percentile_grid; require anchor_recall>=recall_floor and "
-            "current_rejected<=current_reject_floor; minimise bad_passing_raw, "
-            "then nonanchor_allowed_passing, then total passing"
-        ),
-    }
-
-    search = search.sort_values(
-        [
-            "bad_passing_raw",
-            "nonanchor_allowed_passing",
-            "total_passing_after_hard_exclusions",
-            "practical_anchor_recall",
-        ],
-        ascending=[True, True, True, False],
-    ).reset_index(drop=True)
-
-    return practical_thresholds, search
-
-
-def evaluate_min_frac_het(pooled, anchor, colmap, grid=None):
-    """Anchor recall vs permissiveness on the rest, across min_frac_het."""
-    if grid is None:
-        grid = [0.20, 0.30, 0.40, 0.50, 0.55, 0.60, 0.70]
-    af = _numeric_cal_col(anchor, colmap, "frac_het").dropna()
-    all_fh = _numeric_cal_col(pooled, colmap, "frac_het")
-    het = _het_mask(pooled, colmap)
-    known = _bool_cal_col(pooled, colmap, "known_het")
-    allowed = _not_excluded_mask(pooled, colmap)
-    rows = []
-    for thr in grid:
-        recall = float((af >= thr).mean()) if len(af) else np.nan
-        nonwl = allowed & het & ~known & (all_fh >= thr)
-        rows.append({"min_frac_het": thr,
-                     "anchor_recall": round(recall, 3),
-                     "nonwhitelist_het_passing": int(nonwl.sum())})
-    return pd.DataFrame(rows)
-
-
-def apply_calibrated_germline_rules(pooled, thresholds, colmap=None):
-    """Add clean/practical calibrated germline flags to a pooled dataframe.
+    * clean: additionally ``frac_het >= clean_min_frac_het``,
+      ``frac_hom <= clean_max_frac_hom``, ``frac_wt <= clean_max_frac_wt`` and
+      HET-AF median within [``clean_af_lower``, ``clean_af_upper``].
+    * rescued (skewed): an existing rescued seed, or status ``af_skewed`` with
+      review verdict ``likely_usable_het``, or a rescued broad class.
+    * practical (usable): clean OR rescued OR (usable seed AND (passes the
+      ``usable_*`` structure thresholds OR clean seed OR rescued seed)) OR
+      concordant seed.
 
     The practical flag intentionally keeps rescued AF-skewed HETs and existing
     usable/concordant HETs, while preventing numerical thresholds from gaining
     blacklisted, pathogenic, HOM-like, indel-unreliable, or overdispersed rows.
+
+    Parameters
+    ----------
+    pooled : pd.DataFrame
+        One patient's (or a pooled cohort) all-variant germline table.
+    thresholds : mapping
+        Keys ``clean_*`` (falling back to the unprefixed aliases, e.g.
+        ``min_frac_het``) and ``usable_*`` (falling back to the clean values).
+        A threshold that resolves to None is not applied; the AF window needs
+        both bounds.
+    colmap : dict, optional
+        Logical-feature to column mapping; resolved with
+        :func:`resolve_calibration_columns` when None.
+
+    Returns
+    -------
+    pd.DataFrame
+        A copy with ``calibrated_clean_het_seed``,
+        ``calibrated_rescued_het_seed``, ``calibrated_usable_het_seed``,
+        ``calibrated_rejected_het_seed`` (usable seed but not calibrated usable)
+        and ``calibrated_reject_reasons`` (";"-joined: excluded_or_bad_class,
+        not_donor_het, low_frac_HET, high_frac_HOM, high_frac_WT).
+
+    Raises
+    ------
+    ValueError
+        If neither ``donor_genotype`` nor ``usable_germline_het_seed`` exists.
+
+    Notes
+    -----
+    ``clean_max_af_z`` in the thresholds is not used by this function.
     """
     df = pooled.copy()
     if colmap is None:
@@ -3509,249 +3595,6 @@ def apply_calibrated_germline_rules(pooled, thresholds, colmap=None):
     return df
 
 
-def germline_counts_per_sample(pooled, thresholds, colmap=None):
-    """Summarise current vs calibrated germline calls per sample.
-
-    ``n_calibrated_germline_het`` is the practical two-tier usable call, not the
-    stricter clean-only canonical HET count.
-    """
-    if colmap is None:
-        colmap = resolve_calibration_columns(pooled)
-    d = apply_calibrated_germline_rules(pooled, thresholds, colmap=colmap)
-    current = _bool_cal_col(d, colmap, "usable_seed")
-    d["_current_germline_het"] = current
-
-    out = (
-        d.groupby("sample_id")
-        .agg(
-            n_variants=("variant", "size"),
-            n_current_germline_het=("_current_germline_het", "sum"),
-            n_calibrated_clean_germline_het=("calibrated_clean_het_seed", "sum"),
-            n_calibrated_rescued_germline_het=("calibrated_rescued_het_seed", "sum"),
-            n_calibrated_germline_het=("calibrated_usable_het_seed", "sum"),
-            n_rejected_current_germline_het=("calibrated_rejected_het_seed", "sum"),
-        )
-        .reset_index()
-    )
-    out["delta"] = (
-        out["n_calibrated_germline_het"]
-        - out["n_current_germline_het"]
-    )
-    return out.sort_values("sample_id").reset_index(drop=True)
-
-
-def _plot_germline_calibration(anchor, pooled, colmap, thresholds, out_png):
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-
-    ax = axes[0, 0]
-    fh = _numeric_cal_col(anchor, colmap, "frac_het").dropna()
-    if len(fh):
-        ax.hist(fh, bins=30, color="#4C72B0", alpha=0.85)
-    if thresholds.get("clean_min_frac_het") is not None:
-        ax.axvline(thresholds["clean_min_frac_het"], color="k", ls="--",
-                   label=f"clean {thresholds['clean_min_frac_het']:.2f}")
-    if thresholds.get("usable_min_frac_het") is not None:
-        ax.axvline(thresholds["usable_min_frac_het"], color="0.35", ls="-.",
-                   label=f"usable {thresholds['usable_min_frac_het']:.2f}")
-    ax.axvline(CURRENT_MIN_FRAC_HET, color="crimson", ls=":",
-               label=f"current {CURRENT_MIN_FRAC_HET:.2f}")
-    excl = float((fh < CURRENT_MIN_FRAC_HET).mean()) * 100 if len(fh) else 0
-    ax.set_title(f"Anchor frac_HET  (current floor drops {excl:.0f}% of anchors)")
-    ax.set_xlabel("frac_HET")
-    ax.legend(fontsize=8)
-
-    ax = axes[0, 1]
-    fhom = _numeric_cal_col(anchor, colmap, "frac_hom").dropna()
-    if len(fhom):
-        ax.hist(fhom, bins=30, color="#55A868", alpha=0.85)
-    if thresholds.get("clean_max_frac_hom") is not None:
-        ax.axvline(thresholds["clean_max_frac_hom"], color="k", ls="--", label="clean")
-    if thresholds.get("usable_max_frac_hom") is not None:
-        ax.axvline(thresholds["usable_max_frac_hom"], color="0.35", ls="-.", label="usable")
-    ax.set_title("Anchor frac_HOM/HOM_ALT (should sit near 0)")
-    ax.set_xlabel("frac_HOM / frac_HOM_ALT")
-    ax.legend(fontsize=8)
-
-    ax = axes[1, 0]
-    afm = _numeric_cal_col(anchor, colmap, "het_af_median").dropna()
-    if len(afm):
-        ax.hist(afm, bins=30, color="#C44E52", alpha=0.85)
-        for k in ("clean_af_lower", "clean_af_upper"):
-            if thresholds.get(k) is not None:
-                ax.axvline(thresholds[k], color="k", ls="--")
-        ax.set_title("Anchor HET-AF median (clean tier only)")
-        ax.set_xlabel("AF (%)")
-    else:
-        ax.text(0.5, 0.5, "het_af_median not resolved", ha="center",
-                va="center", transform=ax.transAxes, fontsize=9, color="0.4")
-        ax.set_title("Anchor HET-AF median (unavailable)")
-
-    ax = axes[1, 1]
-    fh_all = _numeric_cal_col(pooled, colmap, "frac_het")
-    nc_all = _numeric_cal_col(pooled, colmap, "n_cells")
-    het = _het_mask(pooled, colmap)
-    if nc_all.notna().any():
-        ax.scatter(nc_all[het], fh_all[het], s=8, alpha=0.4, color="#8172B3")
-        ax.set_xscale("log")
-        ax.set_title("frac_HET vs cells (ADO spread = case for usable tier)")
-        ax.set_xlabel("n_cells (log)")
-        ax.set_ylabel("frac_HET")
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=130)
-    print(f"\nFigure: {out_png}")
-
-
-def calibrate_germline_thresholds(csv_dir=GERMLINE_PATTERN_DIR, out_dir="."):
-    """Pool per-patient germline CSVs and calibrate clean + practical HET thresholds.
-
-    Returns ``(pooled, recurrence, anchor, thresholds, curve)`` and writes:
-      - ``cohort_pooled.csv``
-      - ``cohort_recurrence.csv``
-      - ``cohort_per_sample_germline_counts.csv``
-      - ``cohort_practical_threshold_grid_search.csv``
-      - ``cohort_threshold_calibration.png``
-
-    The returned ``pooled`` dataframe contains calibrated flags:
-      - ``calibrated_clean_het_seed``: canonical near-50% clean HETs.
-      - ``calibrated_rescued_het_seed``: rescued/skewed usable HETs.
-      - ``calibrated_usable_het_seed``: practical downstream set.
-    """
-    pooled, _ = load_germline_cohort(csv_dir)
-    colmap = resolve_calibration_columns(pooled)
-
-    print("\nResolved columns:")
-    for k, v in colmap.items():
-        print(f"  {k:14s} -> {v}")
-
-    missing = [k for k in ("variant", "frac_het", "frac_hom", "frac_wt")
-               if k not in colmap]
-    if missing:
-        print(f"\n[warn] missing expected columns: {missing} "
-              f"(edit COL_CANDIDATES)")
-
-    rec = germline_recurrence(pooled, colmap)
-
-    # Clean anchor: whitelist/recurrent canonical HET distribution.
-    anchor, source = germline_anchor_frame(pooled, colmap)
-    print(f"\nClean anchor: {len(anchor)} instances ({source})")
-
-    pct = germline_percentile_table(anchor, colmap)
-    print("\nClean-anchor percentile table:")
-    print(pct.to_string(index=False))
-
-    clean_thr = propose_germline_thresholds(anchor, colmap)
-
-    # Practical anchor: current usable + whitelist + rescued/skewed HETs.
-    practical_anchor, practical_source = germline_practical_anchor_frame(
-        pooled,
-        colmap,
-    )
-    print(f"\nPractical anchor: {len(practical_anchor)} instances "
-          f"({practical_source})")
-
-    practical_pct = germline_percentile_table(practical_anchor, colmap)
-    print("\nPractical-anchor percentile table:")
-    print(practical_pct.to_string(index=False))
-
-    bad_for_pct = pooled.loc[_bad_practical_mask(pooled, colmap)].copy()
-    bad_pct = germline_percentile_table(bad_for_pct, colmap)
-    if not bad_pct.empty:
-        print("\nBad-class percentile table:")
-        print(bad_pct.to_string(index=False))
-
-    practical_thr, practical_search = calibrate_practical_germline_thresholds(
-        pooled,
-        practical_anchor,
-        colmap,
-        recall_floor=0.995,
-        current_reject_floor=0,
-    )
-
-    thr = dict(clean_thr)
-    thr.update(practical_thr)
-
-    print("\nClean canonical HET thresholds:")
-    for k in ["clean_min_frac_het", "clean_max_frac_hom", "clean_max_frac_wt",
-              "clean_af_lower", "clean_af_upper", "clean_max_af_z"]:
-        v = thr.get(k)
-        print(f"  {k:28s} = {v:.3f}" if v is not None else f"  {k:28s} = n/a")
-
-    print("\nEmpirically selected practical usable HET thresholds:")
-    print("  selected from practical-anchor percentiles, not hand-set numeric cutoffs")
-    for k in [
-        "usable_min_frac_het",
-        "usable_min_frac_het_percentile",
-        "usable_max_frac_hom",
-        "usable_max_frac_hom_percentile",
-        "usable_max_frac_wt",
-        "usable_max_frac_wt_percentile",
-        "usable_anchor_recall",
-        "usable_labelled_precision_vs_bad",
-        "usable_bad_passing_raw",
-        "usable_hard_excluded_passing_raw",
-        "usable_nonanchor_allowed_passing",
-        "usable_current_rejected",
-        "usable_current_retained",
-        "usable_total_passing_after_hard_exclusions",
-    ]:
-        v = thr.get(k)
-        if isinstance(v, float):
-            print(f"  {k:38s} = {v:.3f}")
-        else:
-            print(f"  {k:38s} = {v}")
-    print("  AF window is clean-tier only; rescued skewed HETs are retained "
-          "by review/genotype support.")
-
-    curve = evaluate_min_frac_het(pooled, anchor, colmap)
-    print("\nmin_frac_het calibration (clean-anchor recall vs permissiveness):")
-    print(curve.to_string(index=False))
-
-    pooled = apply_calibrated_germline_rules(pooled, thr, colmap=colmap)
-    per_sample = germline_counts_per_sample(pooled, thr, colmap=colmap)
-
-    print("\nPer-sample current vs calibrated practical germline counts:")
-    print(per_sample.to_string(index=False))
-
-    os.makedirs(out_dir, exist_ok=True)
-    pooled.to_csv(os.path.join(out_dir, "cohort_pooled.csv"), index=False)
-    rec.to_csv(os.path.join(out_dir, "cohort_recurrence.csv"), index=False)
-    per_sample.to_csv(
-        os.path.join(out_dir, "cohort_per_sample_germline_counts.csv"),
-        index=False,
-    )
-    practical_search.to_csv(
-        os.path.join(out_dir, "cohort_practical_threshold_grid_search.csv"),
-        index=False,
-    )
-    practical_pct.to_csv(
-        os.path.join(out_dir, "cohort_practical_anchor_percentiles.csv"),
-        index=False,
-    )
-    if not bad_pct.empty:
-        bad_pct.to_csv(
-            os.path.join(out_dir, "cohort_bad_class_percentiles.csv"),
-            index=False,
-        )
-
-    _plot_germline_calibration(
-        anchor,
-        pooled,
-        colmap,
-        thr,
-        os.path.join(out_dir, "cohort_threshold_calibration.png"),
-    )
-
-    print("\nWrote cohort_pooled.csv, cohort_recurrence.csv, "
-          "cohort_per_sample_germline_counts.csv, "
-          "cohort_practical_threshold_grid_search.csv, "
-          "cohort_practical_anchor_percentiles.csv"
-          + (", cohort_bad_class_percentiles.csv" if not bad_pct.empty else ""))
-
-    return pooled, rec, anchor, thr, curve
-
-
 # =============================================================================
 # Notebook-facing germline/CNV marker workflow wrappers
 # =============================================================================
@@ -3763,9 +3606,10 @@ def calibrate_germline_thresholds(csv_dir=GERMLINE_PATTERN_DIR, out_dir="."):
 #   5. AF clustering of variants
 #   6. renamed AF-cluster germline update
 #
-# All functions are explicit and side-effect-light: they return updated objects
-# rather than relying on notebook globals. Optional CSV/plot outputs are still
-# available via save_dir / plot flags.
+# The wrappers return updated objects rather than mutating their inputs.
+# Optional CSV/plot outputs are controlled via save_dir / save_outputs / plot
+# flags. Exception: rename_af_clusters_and_update_filtered_germline may look up
+# a variant-to-amplicon map in the notebook namespace when none is passed.
 
 
 EMPIRICAL_COHORT_GERMLINE_THRESHOLDS = {
@@ -3863,8 +3707,20 @@ DEFAULT_AF_CLUSTER_RENAME_MAP = {
 }
 
 
-def get_empirical_cohort_germline_thresholds(include_audit_metrics: bool = True):
-    """Return a copy of the empirical cohort-calibrated thresholds."""
+def get_empirical_cohort_germline_thresholds(include_audit_metrics: bool = True) -> dict[str, Any]:
+    """Return a copy of :data:`EMPIRICAL_COHORT_GERMLINE_THRESHOLDS`.
+
+    Parameters
+    ----------
+    include_audit_metrics : bool, default True
+        When False, drop the ``usable_*`` audit metrics, keeping only the three
+        ``usable_*`` thresholds and all non-``usable_`` keys.
+
+    Returns
+    -------
+    dict
+        Threshold name to value.
+    """
     thresholds = dict(EMPIRICAL_COHORT_GERMLINE_THRESHOLDS)
     if not include_audit_metrics:
         thresholds = {
@@ -3878,7 +3734,7 @@ def get_empirical_cohort_germline_thresholds(include_audit_metrics: bool = True)
     return thresholds
 
 
-def _display(obj):
+def _display(obj: Any) -> None:
     """Notebook-friendly display without requiring IPython outside notebooks."""
     try:
         from IPython.display import display
@@ -3887,7 +3743,12 @@ def _display(obj):
         print(obj)
 
 
-def _chr_pos_key(v):
+def _chr_pos_key(v: Any) -> tuple:
+    """Sort key ``(chrom_rank, position, id)`` for ``chrN:pos:...`` variant IDs.
+
+    Autosomes rank by number, X=23, Y=24, M/MT=25, others 999; unparsable IDs
+    sort last as ``(999, inf, id)``.
+    """
     import re
     m = re.match(r"^(chr)?([^:]+):(\d+):", str(v))
     if not m:
@@ -3906,7 +3767,8 @@ def _chr_pos_key(v):
     return (chrom_key, int(m.group(3)), str(v))
 
 
-def _variant_key_series(s):
+def _variant_key_series(s: Any) -> pd.Series:
+    """String Series of variant IDs with all whitespace removed."""
     return (
         pd.Series(s, dtype=str)
         .astype(str)
@@ -3915,8 +3777,13 @@ def _variant_key_series(s):
     )
 
 
-def _extract_variant_list(obj, name="variant_source"):
-    """Extract variant strings from a list-like object or a variant dataframe."""
+def _extract_variant_list(obj: Any, name: str = "variant_source") -> list[str]:
+    """Extract unique, whitespace-free variant strings from a list-like object
+    or a variant dataframe (first variant-like column).
+
+    Raises KeyError for a DataFrame without a variant-like column; ``name`` is
+    used in that message.
+    """
     if obj is None:
         return []
     if isinstance(obj, pd.DataFrame):
@@ -3934,7 +3801,10 @@ def _extract_variant_list(obj, name="variant_source"):
     return _variant_key_series([obj]).dropna().drop_duplicates().tolist()
 
 
-def _coerce_bool_like(series):
+def _coerce_bool_like(series: pd.Series | None) -> pd.Series | None:
+    """Lenient bool conversion: like ``_coerce_bool_series`` but also accepts
+    pass/passed/positive/informative strings as True.
+    """
     if series is None:
         return None
     if pd.api.types.is_bool_dtype(series):
@@ -3949,48 +3819,104 @@ def _coerce_bool_like(series):
     )
 
 
-def _first_existing_col(df, candidates):
+def _first_existing_col(df: pd.DataFrame, candidates: Iterable[str]) -> str | None:
+    """Return the first of ``candidates`` that is a column of ``df``, else None."""
     for c in candidates:
         if c in df.columns:
             return c
     return None
 
 
+def _resolve_impl(DNA_Utils: Any, name: str, default: Any) -> Any:
+    """Return ``DNA_Utils.<name>`` when ``DNA_Utils`` provides it, else ``default``.
+
+    Lets notebook callers inject a (possibly reloaded) DNA_Utils module whose
+    functions override this module's own implementations.
+    """
+    if DNA_Utils is not None and hasattr(DNA_Utils, name):
+        return getattr(DNA_Utils, name)
+    return default
+
+
 def run_empirical_all_variant_germline_export(
-    Sample,
+    Sample: Any,
     *,
     experiment: str,
     patient_id: str,
-    annotation_df,
-    known_het_variants=None,
-    DNA_Utils=None,
-    keep_labels=("CD4_T", "CD8_T", "Other_T", "B", "Plasma"),
+    annotation_df: pd.DataFrame | None,
+    known_het_variants: Any = None,
+    DNA_Utils: Any = None,
+    keep_labels: Iterable[str] = ("CD4_T", "CD8_T", "Other_T", "B", "Plasma"),
     out_dir: str = GERMLINE_PATTERN_DIR,
-    thresholds=None,
+    thresholds: Mapping[str, Any] | None = None,
     descriptive_min_dp: int = 2,
     placement_min_dp: int = 5,
     max_frac_wt_for_het_export: float = 0.90,
     verbose: bool = True,
     show_head: bool = False,
-):
-    """Run the first workflow chunk: export all-variant germline evidence and apply
+) -> dict[str, Any]:
+    """Workflow step 1: export all-variant germline evidence and apply the
     calibrated clean/practical HET tiers.
 
-    Returns a dictionary containing ``all_variant_germline_df``,
-    ``Sample_T_subset``, ``germline_profile_meta``, ``germline``,
-    ``clean_germline``, ``rescued_germline``, and ``ref``.
+    Runs :func:`run_all_variant_germline_profile_export` with the donor-genotype
+    thresholds ``usable_min_frac_het`` / ``usable_max_frac_hom`` from
+    ``thresholds`` (and ``max_frac_wt_for_het_export``), then
+    :func:`apply_calibrated_germline_rules`.
+
+    Parameters
+    ----------
+    Sample : missionbio.mosaic Sample
+        Full sample with protein labels.
+    experiment, patient_id : str
+        Used for the export ID / CSV name.
+    annotation_df : pd.DataFrame or None
+        ClinVar annotation table.
+    known_het_variants : list-like or DataFrame, optional
+        Curated known-HET whitelist.
+    DNA_Utils : module, optional
+        When it exposes ``run_all_variant_germline_profile_export`` /
+        ``apply_calibrated_germline_rules`` those are used instead of this
+        module's functions.
+    keep_labels : iterable of str, default ("CD4_T", "CD8_T", "Other_T", "B", "Plasma")
+        Protein labels of the normal subset.
+    out_dir : str, default GERMLINE_PATTERN_DIR
+        CSV output directory.
+    thresholds : mapping, optional
+        Defaults to :data:`EMPIRICAL_COHORT_GERMLINE_THRESHOLDS` (also used when
+        an empty mapping is given).
+    descriptive_min_dp, placement_min_dp : int, default 2, 5
+        DP floors for the profile.
+    max_frac_wt_for_het_export : float, default 0.90
+        WT-fraction ceiling for the donor-genotype call.
+    verbose : bool, default True
+        Print tier counts.
+    show_head : bool, default False
+        Display the first 40 rows of the table.
+
+    Returns
+    -------
+    dict
+        ``thresholds``, ``all_variant_germline_df`` (with calibrated columns),
+        ``Sample_T_subset``, ``germline_profile_meta``, ``germline``
+        (calibrated usable), ``clean_germline``, ``rescued_germline`` and
+        ``ref``.
+
+    Notes
+    -----
+    The CSV written by the profile export does not contain the calibrated
+    columns; they exist only in the returned dataframe.
     """
     thresholds = dict(thresholds or EMPIRICAL_COHORT_GERMLINE_THRESHOLDS)
 
-    run_export = (
-        DNA_Utils.run_all_variant_germline_profile_export
-        if DNA_Utils is not None and hasattr(DNA_Utils, "run_all_variant_germline_profile_export")
-        else run_all_variant_germline_profile_export
+    run_export = _resolve_impl(
+        DNA_Utils,
+        "run_all_variant_germline_profile_export",
+        run_all_variant_germline_profile_export,
     )
-    apply_rules = (
-        DNA_Utils.apply_calibrated_germline_rules
-        if DNA_Utils is not None and hasattr(DNA_Utils, "apply_calibrated_germline_rules")
-        else apply_calibrated_germline_rules
+    apply_rules = _resolve_impl(
+        DNA_Utils,
+        "apply_calibrated_germline_rules",
+        apply_calibrated_germline_rules,
     )
 
     all_variant_germline_df, Sample_T_subset, germline_profile_meta = run_export(
@@ -4046,47 +3972,94 @@ def run_empirical_all_variant_germline_export(
 
 
 def add_wt_concordance_and_finalize_germline(
-    Sample,
-    all_variant_germline_df,
-    whitelist,
+    Sample: Any,
+    all_variant_germline_df: pd.DataFrame,
+    whitelist: Iterable[str],
     *,
-    DNA_Utils=None,
+    DNA_Utils: Any = None,
     label: str = "wt",
-    thresholds=None,
+    thresholds: Mapping[str, Any] | None = None,
     max_ado_score: float = 0.8,
     min_clone_cells: int = 5,
-    total_barcodes: int = None,
+    total_barcodes: int | None = None,
     max_frac_wt_for_het_export: float = 0.90,
     recipe: str = "calibrated_practical_or_confirmed",
     verbose: bool = True,
-):
-    """Run the second workflow chunk: build genotype-defined WT/clean-cell subset,
-    add population concordance, reapply calibrated rules, and choose the final
+) -> dict[str, Any]:
+    """Workflow step 2: build the genotype-defined WT/clean-cell subset, add
+    population concordance, reapply calibrated rules, and choose the final
     downstream ``germline_het_seed``.
 
+    Stale ``{label}_*``, concordance, seed and calibrated columns from a
+    previous run are dropped first. The WT population comes from
+    :func:`build_wt_cell_subset`, concordance from
+    :func:`add_population_concordance` (thresholds ``usable_min_frac_het``,
+    ``usable_max_frac_hom`` and ``max_frac_wt_for_het_export``), then
+    :func:`apply_calibrated_germline_rules` is reapplied.
+
     ``recipe`` options:
-      - ``calibrated_practical_or_confirmed``: calibrated practical lymphoid OR
-        concordant HET in WT population. This matches the user's notebook chunk.
+      - ``calibrated_practical_or_confirmed``: calibrated practical OR
+        concordant HET in both populations (default).
       - ``calibrated_practical_and_confirmed``: stricter intersection.
-      - ``calibrated_practical_or_wt_structure``: fallback for under-powered
-        lymphoid subsets.
+      - ``calibrated_practical_or_wt_structure``: calibrated practical OR a WT
+        donor-HET call that also passes the ``usable_*`` structure thresholds
+        in the WT population (fallback for under-powered lymphoid subsets).
+
+    Parameters
+    ----------
+    Sample : missionbio.mosaic Sample
+        Full sample used for WT clustering.
+    all_variant_germline_df : pd.DataFrame
+        Output table of workflow step 1.
+    whitelist : iterable of str
+        Germline whitelist used for clustering.
+    DNA_Utils : module
+        Must expose ``clones_to_dataframe``; its ``build_wt_cell_subset`` /
+        ``add_population_concordance`` / ``apply_calibrated_germline_rules``
+        override this module's when present.
+    label : str, default "wt"
+        Prefix of the WT-population columns.
+    thresholds : mapping, optional
+        Defaults to :data:`EMPIRICAL_COHORT_GERMLINE_THRESHOLDS`.
+    max_ado_score, min_clone_cells, total_barcodes
+        Passed to :func:`build_wt_cell_subset` (``total_barcodes`` defaults to
+        the sample's barcode count).
+    max_frac_wt_for_het_export : float, default 0.90
+        WT-fraction ceiling for the WT donor-genotype call.
+    recipe : str, default "calibrated_practical_or_confirmed"
+        Final seed recipe (see above).
+    verbose : bool, default True
+        Print clone membership and seed counts.
+
+    Returns
+    -------
+    dict
+        ``all_variant_germline_df`` (with ``germline_het_seed``), ``Sample_wt``,
+        ``clone_df``, ``clone_barcode_df``, ``cell_clone_labels``,
+        ``step2_clone_labels_used``, ``germline``, ``clean_germline``,
+        ``rescued_germline``, the boolean masks ``calibrated_practical``,
+        ``calibrated_clean``, ``calibrated_rescued``, ``lymphoid``,
+        ``confirmed``, ``wt_het``, ``wt_structure_supported``, and ``recipe``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``build_wt_cell_subset`` does not return a tuple of at least two.
+    ValueError
+        If ``recipe`` is unknown.
     """
     thresholds = dict(thresholds or EMPIRICAL_COHORT_GERMLINE_THRESHOLDS)
 
-    build_wt = (
-        DNA_Utils.build_wt_cell_subset
-        if DNA_Utils is not None and hasattr(DNA_Utils, "build_wt_cell_subset")
-        else build_wt_cell_subset
+    build_wt = _resolve_impl(DNA_Utils, "build_wt_cell_subset", build_wt_cell_subset)
+    add_conc = _resolve_impl(
+        DNA_Utils,
+        "add_population_concordance",
+        add_population_concordance,
     )
-    add_conc = (
-        DNA_Utils.add_population_concordance
-        if DNA_Utils is not None and hasattr(DNA_Utils, "add_population_concordance")
-        else add_population_concordance
-    )
-    apply_rules = (
-        DNA_Utils.apply_calibrated_germline_rules
-        if DNA_Utils is not None and hasattr(DNA_Utils, "apply_calibrated_germline_rules")
-        else apply_calibrated_germline_rules
+    apply_rules = _resolve_impl(
+        DNA_Utils,
+        "apply_calibrated_germline_rules",
+        apply_calibrated_germline_rules,
     )
 
     df0 = all_variant_germline_df.copy()
@@ -4241,18 +4214,27 @@ def add_wt_concordance_and_finalize_germline(
 
 def _build_significant_variant_summary(
     *,
-    significant_variant_summary=None,
-    sig_res=None,
-    sig_variants_ordered=None,
-    variant_col=None,
-    clone_col=None,
-    event_col=None,
-    p_col=None,
-    baf_col=None,
-    iqr_col=None,
-    depth_col=None,
-):
-    """Build/standardise the significant-variant summary used by germline/CNV audits."""
+    significant_variant_summary: pd.DataFrame | None = None,
+    sig_res: pd.DataFrame | None = None,
+    sig_variants_ordered: Iterable[str] | None = None,
+    variant_col: str | None = None,
+    clone_col: str | None = None,
+    event_col: str | None = None,
+    p_col: str | None = None,
+    baf_col: str | None = None,
+    iqr_col: str | None = None,
+    depth_col: str | None = None,
+) -> pd.DataFrame:
+    """Build/standardise the one-row-per-variant significant-variant summary.
+
+    A given ``significant_variant_summary`` is copied; otherwise ``sig_res``
+    (one row per significant comparison) is aggregated per variant into
+    ``n_informative_comparisons``, joined chromosome arms / clone labels /
+    event types, ``min_p``, ``max_abs_baf_deviation``, ``max_af_iqr`` and
+    min/max depth ratio (each only when its column is available). Rows are
+    ordered by ``sig_variants_ordered`` or by genomic position, and
+    ``significant_informative`` is set True.
+    """
     if significant_variant_summary is not None:
         out = significant_variant_summary.copy()
         if "variant" not in out.columns:
@@ -4320,23 +4302,23 @@ def _build_significant_variant_summary(
 
 def check_significant_variants_against_all_variant_germline_df(
     *,
-    all_variant_germline_df,
-    df_AF_all,
-    df_DP_all=None,
-    experiment: str = None,
-    patient_id: str = None,
-    significant_variant_summary=None,
-    sig_res=None,
-    sig_variants_ordered=None,
-    variant_col=None,
-    clone_col=None,
-    event_col=None,
-    p_col=None,
-    baf_col=None,
-    iqr_col=None,
-    depth_col=None,
+    all_variant_germline_df: pd.DataFrame,
+    df_AF_all: pd.DataFrame,
+    df_DP_all: pd.DataFrame | None = None,
+    experiment: str | None = None,
+    patient_id: str | None = None,
+    significant_variant_summary: pd.DataFrame | None = None,
+    sig_res: pd.DataFrame | None = None,
+    sig_variants_ordered: Iterable[str] | None = None,
+    variant_col: str | None = None,
+    clone_col: str | None = None,
+    event_col: str | None = None,
+    p_col: str | None = None,
+    baf_col: str | None = None,
+    iqr_col: str | None = None,
+    depth_col: str | None = None,
     save_dir: str = GERMLINE_PATTERN_DIR,
-    wt_labels=("WT",),
+    wt_labels: Iterable[str] = ("WT",),
     min_wt_cells: int = 5,
     min_wt_valid_cells: int = 5,
     min_wt_dp: int = 5,
@@ -4348,15 +4330,81 @@ def check_significant_variants_against_all_variant_germline_df(
     allow_pathogenic_as_cnv_markers: bool = False,
     save_outputs: bool = True,
     verbose: bool = True,
-):
-    """Check significant/informative variants directly against the current
+) -> dict[str, Any]:
+    """Check significant/informative CNV/BAF variants against the current
     ``all_variant_germline_df``.
 
-    This is the post-heatmap audit function that produces:
-      - ``audit_real``: every significant variant checked against the table.
+    Steps: build the per-variant significant summary
+    (``_build_significant_variant_summary``); left-merge it with the germline
+    table (first row per duplicated variant); mark ``downstream_seeded`` from
+    the first available of ``germline_het_seed`` /
+    ``calibrated_usable_het_seed`` / ``usable_germline_het_seed``; compute WT
+    AF statistics per variant over cells whose ``label`` is in ``wt_labels``
+    (cells with DP >= ``min_wt_dp`` when ``df_DP_all`` has the variant); and
+    call a variant ``wt_het_supported`` when it has >= ``min_wt_valid_cells``
+    valid WT cells, median AF in [``wt_het_af_lower``, ``wt_het_af_upper``],
+    AF IQR <= ``max_wt_af_iqr`` and HET-like fraction >=
+    ``min_wt_frac_het_like``.
+
+    Outputs:
+      - ``audit_real``: every significant variant with ``miss_reason``,
+        ``cnv_marker_reason``, WT statistics and the flags
+        ``cnv_informative_het_seed`` (significant, present, WT-HET-supported,
+        not hard-excluded) and ``cnv_informative_het_rescue`` (the seed flag
+        and not already seeded downstream).
       - ``missed_significant_in_all_variant_germline_df``: significant variants
-        present in ``all_variant_germline_df`` but not in the downstream seed.
-      - ``real_missed_variants_df``: stricter WT-HET-supported rescue subset.
+        present in the table but not in the downstream seed.
+      - ``real_missed_variants_df``: the ``cnv_informative_het_rescue`` subset.
+
+    Parameters
+    ----------
+    all_variant_germline_df : pd.DataFrame
+        Germline table with ``variant``.
+    df_AF_all : pd.DataFrame
+        Cell x variant AF matrix (percent) with a ``label`` column.
+    df_DP_all : pd.DataFrame, optional
+        Matching DP matrix for the WT depth filter.
+    experiment, patient_id : str, optional
+        Required when ``save_outputs=True``; used in file names.
+    significant_variant_summary, sig_res, sig_variants_ordered, variant_col, clone_col, event_col, p_col, baf_col, iqr_col, depth_col
+        Inputs for ``_build_significant_variant_summary``.
+    save_dir : str, default GERMLINE_PATTERN_DIR
+        Output directory.
+    wt_labels : iterable of str, default ("WT",)
+        Labels of reference cells.
+    min_wt_cells : int, default 5
+        Minimum reference cells overall.
+    min_wt_valid_cells, min_wt_dp, wt_het_af_lower, wt_het_af_upper, min_wt_frac_het_like, max_wt_af_iqr
+        WT-HET support thresholds (AF in percent).
+    allow_blacklisted_as_cnv_markers, allow_pathogenic_as_cnv_markers : bool
+        Allow hard-excluded variants as CNV markers.
+    save_outputs : bool, default True
+        Write the three tables as CSV.
+    verbose : bool, default True
+        Print a summary.
+
+    Returns
+    -------
+    dict
+        ``audit_real``, ``missed_significant_in_all_variant_germline_df``,
+        ``real_missed_variants_df``, ``downstream_seed_col`` and ``paths``.
+
+    Raises
+    ------
+    KeyError
+        If ``variant`` / ``label`` columns are missing.
+    RuntimeError
+        If fewer than ``min_wt_cells`` reference cells exist, or no summary
+        input is given.
+    ValueError
+        If saving without ``experiment``/``patient_id``.
+
+    Notes
+    -----
+    Files: ``{save_dir}/{experiment}_{patient_id}_significant_variants_checked_against_all_variant_germline_df.csv``,
+    ``..._missed_significant_in_all_variant_germline_df.csv`` and
+    ``..._real_missed_variants.csv``. Ref-like / alt-like WT fractions use
+    fixed AF cut-offs of <= 5 and >= 95.
     """
     if "variant" not in all_variant_germline_df.columns:
         raise KeyError("all_variant_germline_df must contain a 'variant' column.")
@@ -4664,17 +4712,60 @@ def check_significant_variants_against_all_variant_germline_df(
 
 
 def apply_final_no_loss_cnv_marker_rules(
-    all_variant_germline_df,
-    audit_real,
+    all_variant_germline_df: pd.DataFrame,
+    audit_real: pd.DataFrame,
     *,
-    parameters=None,
+    parameters: Mapping[str, Any] | None = None,
     verbose: bool = True,
-):
+) -> dict[str, Any]:
     """Apply the final no-loss CNV marker rule and fold the final flag back
     into ``all_variant_germline_df``.
 
-    Returns a dictionary containing the updated dataframe, updated ``audit_real``,
-    ``filtered_germline_variants``, and ``germline_df_for_plot``.
+    On ``audit_real`` (parameters from
+    :data:`FINAL_NO_LOSS_CNV_MARKER_PARAMETERS`, overridable):
+
+    * CNV event: ``min_p <= p_max`` and ``max_abs_baf_deviation >=
+      baf_deviation_min`` and ``max_af_iqr <= event_af_iqr_max``; event types
+      matched against ``loh_like_events`` / ``amplification_events``.
+    * ``cnv_marker_het_centered_loh_distorted``: WT valid (>= ``min_wt_valid``),
+      WT median AF in [``het_median_lower``, ``het_median_upper``], WT HET-like
+      fraction >= ``loh_relaxed_min_wt_frac_het_like``, LOH-like event.
+    * ``cnv_marker_fixed_like_loh_informative``: WT median <=
+      ``reflike_median_max`` or >= ``altlike_median_min`` with HET-like
+      fraction <= ``fixed_like_max_wt_frac_het_like``, LOH-like event.
+    * ``cnv_marker_amplification_informative``: ``max_depth_ratio >=
+      amp_depth_ratio_min`` with an amplification event.
+    * Hard exclusions (pathogenic / blacklisted) remove all three.
+    * ``final_cnv_informative_marker_no_loss`` = any of the above OR an earlier
+      ``cnv_informative_het_rescue[_loh_aware]`` flag.
+
+    The final flag is merged into the germline table and ``germline_tier`` is
+    set to ``clean_het`` (``germline_het_seed``), ``cnv_informative`` or
+    ``none``.
+
+    Parameters
+    ----------
+    all_variant_germline_df : pd.DataFrame
+        Germline table with ``variant`` (and ``germline_het_seed``).
+    audit_real : pd.DataFrame
+        ``audit_real`` from
+        :func:`check_significant_variants_against_all_variant_germline_df`.
+    parameters : mapping, optional
+        Overrides for the default parameter dictionary.
+    verbose : bool, default True
+        Print marker counts.
+
+    Returns
+    -------
+    dict
+        ``all_variant_germline_df``, ``audit_real`` (with marker columns),
+        ``filtered_germline_variants`` (clean OR CNV-informative),
+        ``germline_df_for_plot`` and ``parameters``.
+
+    Raises
+    ------
+    KeyError
+        If either table lacks ``variant``.
     """
     P = dict(FINAL_NO_LOSS_CNV_MARKER_PARAMETERS)
     if parameters is not None:
@@ -4773,24 +4864,74 @@ def apply_final_no_loss_cnv_marker_rules(
 
 def run_af_clustering_only(
     *,
-    df_AF_all,
-    filtered_germline_variants,
-    original_other_vars_for_cluster=None,
-    other_vars=None,
-    patient_id: str = None,
-    params=None,
+    df_AF_all: pd.DataFrame,
+    filtered_germline_variants: Any,
+    original_other_vars_for_cluster: Any = None,
+    other_vars: Any = None,
+    patient_id: str | None = None,
+    params: Mapping[str, Any] | None = None,
     plot: bool = True,
     show_tables: bool = True,
-):
-    """Run AF clustering only: variant -> AF cluster plus germline-count summaries.
-
-    This wraps the user's second script without applying any rescue or updating
+) -> dict[str, Any]:
+    """Cluster variants by their AF profile (KMeans) and summarise germline
+    counts per cluster, without applying any rescue or updating
     ``all_variant_germline_df``.
 
-    In addition to the per-clone label medians, a pooled WT-vs-non-WT contrast
-    is included as a feature so LOH-distorted variants (het in WT, fixed in the
-    dominant clone) separate onto their own axis regardless of how many clone
-    labels step3 emits.
+    Per variant, features are computed across cells: valid fraction,
+    median/mean AF, IQR, SD, fractions of cells HET-like (25-75), clean-HET
+    (35-65), ref-like (<= 5), alt-like (>= 95) and fixed-like; per-label median
+    AF (one ``label_median__<label>`` column per label) with label-level
+    summaries; and a pooled WT-vs-non-WT median divergence so LOH-distorted
+    variants (het in WT, fixed in the dominant clone) separate onto their own
+    axis regardless of how many clone labels exist. Missing features are
+    median-imputed (0 if all missing), standardised, and KMeans is fitted for
+    k in [``min_k``, ``min(max_k, n_variants - 1)``]; the k with the highest
+    silhouette score is used.
+
+    Parameters
+    ----------
+    df_AF_all : pd.DataFrame
+        Cell x variant AF matrix (percent), optionally with a ``label`` column.
+    filtered_germline_variants : list-like or DataFrame
+        Current germline markers (flagged in the outputs).
+    original_other_vars_for_cluster : list-like or DataFrame, optional
+        Other variants to cluster; preferred when
+        ``params["prefer_original_other_vars"]`` is True.
+    other_vars : list-like or DataFrame, optional
+        Fallback list of other variants; otherwise every AF variant not in the
+        germline list is used.
+    patient_id : str, optional
+        Used in the heatmap title.
+    params : mapping, optional
+        Overrides for :data:`AF_CLUSTER_ONLY_DEFAULT_PARAMS` (k range, seed,
+        ``n_init``, heatmap options).
+    plot : bool, default True
+        Show the cluster-ordered AF heatmap (when
+        ``plot_heatmap_before_summary``).
+    show_tables : bool, default True
+        Display summary tables.
+
+    Returns
+    -------
+    dict
+        ``variant_af_cluster_df``, ``af_cluster_summary_df``,
+        ``filtered_germline_by_cluster_df``,
+        ``filtered_germline_cluster_counts_df``, ``silhouette_df``,
+        ``clustered_af_heatmap_variant_table``, ``af_cluster_color_key_df``,
+        ``af_cluster_blocks_df`` (the last three empty unless plotted),
+        ``af_mat``, ``labels``, ``label_order``, ``cluster_feature_cols`` and
+        ``params``.
+
+    Raises
+    ------
+    ValueError
+        If fewer than 4 variants are available.
+
+    Notes
+    -----
+    Seeds Python's ``random`` and NumPy's global RNG with
+    ``params["random_state"]`` and sets ``os.environ["PYTHONHASHSEED"]``
+    (process-wide side effects). Progress is always printed.
     """
     import os
     import random
@@ -5454,10 +5595,92 @@ def rename_af_clusters_and_update_filtered_germline(
     local_artifact_use_amplicon_blocks : bool, default True
         Use same-amplicon candidate groups whenever a variant-to-amplicon map
         is supplied.
-    local_artifact_fallback_to_position_blocks : bool, default True
+    local_artifact_fallback_to_position_blocks : bool, default False
         Evaluate positional windows only for candidate variants that lack an
         amplicon mapping. This retains backwards-compatible behavior when the
         CNV mapping is unavailable without double-evaluating mapped variants.
+    local_artifact_require_same_raw_af_cluster : bool, default True
+        Require all block members to share the same raw AF cluster.
+    local_artifact_require_profile_concordance : bool, default False
+        Additionally require the pairwise AF-profile concordance criteria.
+
+    Other parameters
+    ----------------
+    variant_af_cluster_df : pd.DataFrame
+        ``variant_af_cluster_df`` from :func:`run_af_clustering_only`; needs
+        ``variant`` and ``af_cluster`` (label-median feature columns are used
+        by the systematic-skew and block gates).
+    af_mat : pd.DataFrame
+        Cell x variant AF matrix (``run_af_clustering_only(...)["af_mat"]``);
+        variants absent from it are dropped.
+    df_AF_all : pd.DataFrame
+        AF matrix whose ``label`` column supplies cell labels when ``labels``
+        is None.
+    filtered_germline_variants : list-like or DataFrame
+        Current germline marker list (provenance only, see above).
+    af_cluster_rename_map : dict, optional
+        Raw cluster id to class name; defaults to
+        :data:`DEFAULT_AF_CLUSTER_RENAME_MAP`. Unmapped clusters become
+        ``cluster_<id>``.
+    all_variant_germline_df, df, df_review : pd.DataFrame, optional
+        Tables searched for baseline-evidence columns and for blacklist /
+        pathogenic flags (by column name and by text content).
+    labels : array-like, optional
+        Per-cell labels aligned with ``af_mat``.
+    patient_id : str, optional
+        Used in plot titles.
+    germline_renamed_cluster_name, excluded_renamed_cluster_name, discarded_poor_qc_renamed_cluster_name : str
+        Output class names for markers, hard exclusions and poor-QC variants.
+    exclude_blacklisted, exclude_pathogenic : bool, default True
+        Apply the hard exclusions.
+    force_original_filtered_germline : bool, default True
+        Only used when ``preserve_baseline_germline_evidence`` is False:
+        relabel original filtered-germline simple SNVs as ``germline_het``.
+    baseline_het_genotype_values : iterable of str, default ("het", "heterozygous")
+        ``donor_genotype`` values counted as HET evidence.
+    plot : bool, default True
+        Draw one AF heatmap per renamed cluster and collect per-cluster
+        variant tables.
+    include_variant_tables : bool, default True
+        Display each per-cluster variant table while plotting.
+    max_xticks : int, default 60
+        Maximum x tick labels per heatmap.
+    verbose : bool, default True
+        Print the local amplicon-artifact QC line; the reassignment and
+        summary tables are printed regardless.
+
+    Returns
+    -------
+    dict
+        Key outputs: ``renamed_cluster_variant_df`` (one row per variant with
+        every flag and ``renamed_cluster``), ``renamed_cluster_summary_df``,
+        ``renamed_cluster_tables`` (filled only when ``plot=True``),
+        ``filtered_germline_variants`` (the updated marker list: simple-SNV,
+        non-excluded ``germline_het`` variants with baseline or LOH
+        evidence), ``filtered_germline_variants_before_renamed_cluster_update``,
+        ``updated_filtered_germline_df``,
+        ``excluded_blacklisted_pathogenic_df``, ``discarded_poor_qc_df``,
+        ``local_linked_artifact_blocks_df``, ``loh_variants``,
+        ``loh_variant_df``, ``loh_cluster_ids``, the amplicon mapping source
+        and count, and an echo of the rename map and QC parameters.
+
+    Raises
+    ------
+    KeyError
+        If ``variant_af_cluster_df`` lacks ``variant`` or ``af_cluster``.
+    TypeError
+        If ``af_mat`` is not a DataFrame.
+    ValueError
+        If a systematic-skew or local-artifact parameter is out of range.
+
+    Notes
+    -----
+    Precedence of the final assignment: hard exclusion (blacklisted /
+    pathogenic) > poor-QC discard (missing baseline evidence, non-SNV,
+    systematically skewed, local amplicon artifact) > baseline/LOH
+    preservation > raw cluster rename. When no amplicon map is passed, the
+    function inspects ``__main__``, the IPython user namespace and caller
+    frames for one.
     """
     import re
     import matplotlib.pyplot as plt
@@ -7776,16 +7999,18 @@ def rename_af_clusters_and_update_filtered_germline(
         "loh_cluster_ids": sorted(loh_cluster_ids_norm, key=str),
     }
 
+
 # =============================================================================
 # Step2 barcode-level all-variant CNV/BAF audit pipeline helpers
 # =============================================================================
 # These helpers turn the post-step2 notebook chunks into reusable pipeline calls:
-#   1. build WT-vs-Non_WT all-variant matrices from step2["cell_clone_labels"]
+#   1. build all-variant matrices labelled WT vs each clone (or WT vs Non_WT)
+#      from step2["cell_clone_labels"]
 #   2. run all-variant CNV/BAF informativeness, audit against
 #      all_variant_germline_df, and fold in final no-loss CNV markers.
 
 
-def _layer_df_from_sample(sample, layer):
+def _layer_df_from_sample(sample: Any, layer: str) -> pd.DataFrame:
     """Return a cell x variant dataframe for a sample DNA layer."""
     df = sample.dna.get_attribute(layer, constraint="row+col")
 
@@ -7801,8 +8026,10 @@ def _layer_df_from_sample(sample, layer):
     return df
 
 
-def _normalise_cell_clone_labels(cell_clone_labels):
-    """Normalise step2['cell_clone_labels'] to a barcode-indexed Series."""
+def _normalise_cell_clone_labels(cell_clone_labels: Any) -> pd.Series:
+    """Normalise step2['cell_clone_labels'] (Series, dict, or barcode/clone_label
+    DataFrame) to a str barcode-indexed Series named ``clone_label``.
+    """
     if isinstance(cell_clone_labels, pd.DataFrame):
         if {"barcode", "clone_label"}.issubset(cell_clone_labels.columns):
             out = pd.Series(
@@ -7834,10 +8061,10 @@ def _normalise_cell_clone_labels(cell_clone_labels):
 
 
 def build_all_variant_matrices_from_step2_clone_labels(
-    step2,
-    Sample,
+    step2: dict[str, Any],
+    Sample: Any,
     *,
-    Sample_backup=None,
+    Sample_backup: Any = None,
     wt_label: str = "WT",
     collapse_non_wt: bool = False,
     min_wt_cells: int = 5,
@@ -7845,7 +8072,7 @@ def build_all_variant_matrices_from_step2_clone_labels(
     min_clone_cells: int = 5,
     verbose: bool = True,
     show_clone_barcode_head: bool = True,
-):
+) -> dict[str, Any]:
     """Build all-variant AF/DP/ALT/REF matrices using barcode-level clone labels
     produced by :func:`add_wt_concordance_and_finalize_germline`.
 
@@ -7853,6 +8080,10 @@ def build_all_variant_matrices_from_step2_clone_labels(
     ...), so informativeness is tested per clone rather than against a pooled
     Non_WT group. Pooling het and hom clones averages out subclonal LOH and was
     masking real markers. Set collapse_non_wt=True for the old WT-vs-Non_WT mode.
+
+    Only barcodes present in both the sample and the clone labels are kept.
+    ``ALT = DP * AF / 100`` and ``REF = max(DP - ALT, 0)``, with non-finite
+    values set to 0.
 
     Parameters
     ----------
@@ -7864,21 +8095,38 @@ def build_all_variant_matrices_from_step2_clone_labels(
     Sample_backup : Mosaic sample, optional
         Full-variant sample object. If omitted, ``Sample`` is used.
     wt_label : str
-        Clone label treated as WT reference.
+        Clone label treated as WT reference (matched case-insensitively and
+        renamed to "WT").
     collapse_non_wt : bool
         If True, collapse every non-WT clone into a single ``Non_WT`` group.
         If False (default), keep each clone label as its own test group.
     min_wt_cells, min_non_wt_cells : int
         Minimum WT and total non-WT cell counts required.
     min_clone_cells : int
-        Per-clone floor; clones below this are flagged (CNV_Utils skips them).
+        Per-clone floor; clones below this are flagged (CNV_Utils skips them)
+        and at least one non-WT clone must reach it.
+    verbose : bool
+        Print label counts and matrix shapes.
+    show_clone_barcode_head : bool
+        With ``verbose``, display the first rows of ``clone_barcode_df``.
 
     Returns
     -------
     dict
-        Contains ``df_AF_all``, ``df_DP_all``, ``df_ALT_all``, ``df_REF_all``,
-        ``df_cell_clone_labels``, ``cell_clone_labels``, ``clone_barcode_df``,
+        Contains ``df_AF_all`` (with a leading ``label`` column), ``df_DP_all``,
+        ``df_ALT_all``, ``df_REF_all``, ``df_cell_clone_labels``,
+        ``cell_clone_labels``, ``clone_barcode_df``,
         ``step2_clone_labels_used``, and ``sample_for_all_variants``.
+
+    Raises
+    ------
+    TypeError
+        If ``step2`` is not a dict or the labels have an unsupported type.
+    RuntimeError
+        If labels are missing, no barcodes are shared, no WT label exists, or
+        the WT / non-WT / per-clone minimums are not met.
+    ValueError
+        If a DataFrame of labels lacks ``barcode``/``clone_label``.
     """
     if not isinstance(step2, dict):
         raise TypeError("step2 must be the dictionary returned by add_wt_concordance_and_finalize_germline.")
@@ -8010,21 +8258,32 @@ def build_all_variant_matrices_from_step2_clone_labels(
         "sample_for_all_variants": sample_for_all_variants,
     }
 
+
 def _build_significant_summary_from_wilcoxon_results(
-    wilcoxon_results_var,
-    df_AF_all,
+    wilcoxon_results_var: pd.DataFrame,
+    df_AF_all: pd.DataFrame,
     *,
     p_threshold: float = 0.01,
     baf_deviation_threshold: float = 0.3,
     max_af_iqr: float = 0.3,
     allow_empty: bool = True,
     verbose: bool = True,
-):
+) -> dict[str, Any]:
     """Resolve CNV_Utils output columns and build significant variant summaries.
+
+    Significance comes from an informative column, else a significant column,
+    else ``p <= p_threshold`` (and ``|BAF deviation| >= baf_deviation_threshold``
+    and ``AF IQR <= max_af_iqr`` when those columns exist).
 
     With allow_empty=True (default), a sample with no informative/significant
     variants returns an empty summary instead of raising, so the caller can fall
     back to the germline seed rather than failing the whole run.
+
+    Returns a dict with ``sig_res``, ``sig_variants_ordered`` (significant
+    variants present in ``df_AF_all``, genomic order),
+    ``significant_variant_summary`` and the resolved ``*_col`` names. Raises
+    ValueError when no variant column (or no significance/p column) is found
+    and RuntimeError when empty and ``allow_empty=False``.
     """
     variant_col = _first_existing_col(
         wilcoxon_results_var,
@@ -8155,21 +8414,22 @@ def _build_significant_summary_from_wilcoxon_results(
         **column_resolution,
     }
 
+
 def run_all_variant_cnv_baf_audit_pipeline(
     *,
-    df_AF_all,
-    df_DP_all,
-    df_ALT_all,
-    df_REF_all,
-    all_variant_germline_df,
-    CNV_Utils,
-    DNA_Utils=None,
-    wd: str = None,
-    experiment: str = None,
-    patient_id: str = None,
-    cytobands=None,
-    cytobands_path: str = None,
-    output_dir: str = None,
+    df_AF_all: pd.DataFrame,
+    df_DP_all: pd.DataFrame,
+    df_ALT_all: pd.DataFrame,
+    df_REF_all: pd.DataFrame,
+    all_variant_germline_df: pd.DataFrame,
+    CNV_Utils: Any,
+    DNA_Utils: Any = None,
+    wd: str | None = None,
+    experiment: str | None = None,
+    patient_id: str | None = None,
+    cytobands: pd.DataFrame | None = None,
+    cytobands_path: str | None = None,
+    output_dir: str | None = None,
     save_dir: str = GERMLINE_PATTERN_DIR,
     p_threshold: float = 0.01,
     baf_deviation_threshold: float = 0.3,
@@ -8179,18 +8439,94 @@ def run_all_variant_cnv_baf_audit_pipeline(
     min_cells: int = 5,
     save_outputs: bool = True,
     apply_final_rules: bool = True,
-    final_marker_parameters=None,
+    final_marker_parameters: Mapping[str, Any] | None = None,
     error_on_empty: bool = False,
     verbose: bool = True,
     show_tables: bool = True,
-):
+) -> dict[str, Any]:
     """Run the post-step2 all-variant CNV/BAF audit pipeline.
+
+    Steps:
+      1. Group every variant by chromosome arm
+         (``CNV_Utils.group_informative_variants_by_chr_arm``).
+      2. Test WT vs each label (``CNV_Utils.test_variant_informativeness``);
+         per-arm result tables are concatenated.
+      3. Resolve significant variants
+         (``_build_significant_summary_from_wilcoxon_results``).
+      4. Audit them against the germline table
+         (:func:`check_significant_variants_against_all_variant_germline_df`).
+      5. Optionally fold in final markers
+         (:func:`apply_final_no_loss_cnv_marker_rules`).
 
     When no CNV/BAF-informative variants are found (e.g. a het-only clone with
     no LOH to detect), the pipeline does not fail: with error_on_empty=False
     (default) it returns empty audit frames and falls back to the existing
-    germline_het_seed with no CNV rescue. Set error_on_empty=True to hard-stop
-    on such samples instead.
+    germline seed (first of ``germline_het_seed`` /
+    ``calibrated_usable_het_seed`` / ``usable_germline_het_seed``) with no CNV
+    rescue. Set error_on_empty=True to hard-stop on such samples instead.
+
+    Parameters
+    ----------
+    df_AF_all : pd.DataFrame
+        Cell x variant AF with a ``label`` column (WT and non-WT labels).
+    df_DP_all, df_ALT_all, df_REF_all : pd.DataFrame
+        Matching depth / alt-read / ref-read matrices (any ``label`` column is
+        dropped from ALT/REF).
+    all_variant_germline_df : pd.DataFrame
+        Germline table to audit.
+    CNV_Utils : module
+        Provides ``group_informative_variants_by_chr_arm`` and
+        ``test_variant_informativeness``.
+    DNA_Utils : module, optional
+        Overrides for the audit and final-rule functions when present.
+    wd, experiment, patient_id : str, optional
+        Used for the cytoband path, the output directory
+        (``{wd}/results/per_sample/{experiment}/{patient_id}/dna_cnv/clonotypes/allele_frequencies``)
+        and audit file names.
+    cytobands : pd.DataFrame, optional
+        Cytoband table; otherwise read from ``cytobands_path`` or
+        ``{wd}/resources/references/cytobands.tsv``.
+    output_dir : str, optional
+        Output directory for ``test_variant_informativeness``; defaults as above
+        or to ``save_dir``.
+    save_dir : str, default GERMLINE_PATTERN_DIR
+        Directory for audit CSVs.
+    p_threshold, baf_deviation_threshold, depth_ratio_deletion, depth_ratio_amplification, max_af_iqr, min_cells
+        Passed to ``test_variant_informativeness``; ``min_cells`` is also the
+        minimum number of WT and of non-WT cells.
+    save_outputs : bool, default True
+        Save audit CSVs.
+    apply_final_rules : bool, default True
+        Run :func:`apply_final_no_loss_cnv_marker_rules` (or the empty-case
+        fallback).
+    final_marker_parameters : mapping, optional
+        Parameters for the final rules.
+    error_on_empty : bool, default False
+        Raise instead of falling back when nothing is significant.
+    verbose, show_tables : bool, default True
+        Print progress / display tables.
+
+    Returns
+    -------
+    dict
+        ``grouped_by_chr_all``, ``grouped_by_chr_arm_all``,
+        ``wilcoxon_results_var_raw``, ``wilcoxon_results_var``, ``sig_res``,
+        ``sig_variants_ordered``, ``significant_variant_summary``,
+        ``audit_out``, ``audit_real``,
+        ``missed_significant_in_all_variant_germline_df``,
+        ``real_missed_variants_df``, ``cnv_out``, ``all_variant_germline_df``,
+        ``filtered_germline_variants``, ``germline_df_for_plot`` and
+        ``column_resolution``.
+
+    Raises
+    ------
+    KeyError
+        If ``df_AF_all`` has no ``label`` column.
+    RuntimeError
+        If there are too few WT / non-WT cells or the informativeness test
+        returns no tables.
+    ValueError
+        If no cytobands source is available.
     """
     if "label" not in df_AF_all.columns:
         raise KeyError("df_AF_all must contain a 'label' column.")
@@ -8346,10 +8682,10 @@ def run_all_variant_cnv_baf_audit_pipeline(
     if show_tables:
         _display(significant_variant_summary)
 
-    audit_fn = (
-        DNA_Utils.check_significant_variants_against_all_variant_germline_df
-        if DNA_Utils is not None and hasattr(DNA_Utils, "check_significant_variants_against_all_variant_germline_df")
-        else check_significant_variants_against_all_variant_germline_df
+    audit_fn = _resolve_impl(
+        DNA_Utils,
+        "check_significant_variants_against_all_variant_germline_df",
+        check_significant_variants_against_all_variant_germline_df,
     )
 
     audit_out = audit_fn(
@@ -8383,10 +8719,10 @@ def run_all_variant_cnv_baf_audit_pipeline(
     germline_df_for_plot = None
 
     if apply_final_rules:
-        final_fn = (
-            DNA_Utils.apply_final_no_loss_cnv_marker_rules
-            if DNA_Utils is not None and hasattr(DNA_Utils, "apply_final_no_loss_cnv_marker_rules")
-            else apply_final_no_loss_cnv_marker_rules
+        final_fn = _resolve_impl(
+            DNA_Utils,
+            "apply_final_no_loss_cnv_marker_rules",
+            apply_final_no_loss_cnv_marker_rules,
         )
         cnv_out = final_fn(
             all_variant_germline_df,
@@ -8428,26 +8764,38 @@ def run_all_variant_cnv_baf_audit_pipeline(
         "column_resolution": column_resolution,
     }
 
+
 def run_step2_barcode_cnv_audit_pipeline(
     *,
-    step2,
-    Sample,
-    all_variant_germline_df,
-    CNV_Utils,
-    DNA_Utils=None,
-    Sample_backup=None,
-    wd: str = None,
-    experiment: str = None,
-    patient_id: str = None,
-    **kwargs,
-):
+    step2: dict[str, Any],
+    Sample: Any,
+    all_variant_germline_df: pd.DataFrame,
+    CNV_Utils: Any,
+    DNA_Utils: Any = None,
+    Sample_backup: Any = None,
+    wd: str | None = None,
+    experiment: str | None = None,
+    patient_id: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
     """Convenience wrapper combining the two post-step2 workflow steps.
 
     First builds all-variant matrices from ``step2['cell_clone_labels']`` (per
-    clone by default), then runs the all-variant CNV/BAF audit pipeline.
-
-    Extra keyword arguments are forwarded to
+    clone by default) with
+    :func:`build_all_variant_matrices_from_step2_clone_labels`, then runs
     :func:`run_all_variant_cnv_baf_audit_pipeline`.
+
+    Keyword arguments ``wt_label``, ``collapse_non_wt``, ``min_wt_cells``,
+    ``min_non_wt_cells`` and ``min_clone_cells`` go to the matrix builder;
+    ``verbose`` goes to both; everything else is forwarded to
+    :func:`run_all_variant_cnv_baf_audit_pipeline` (so
+    ``show_clone_barcode_head`` is not accepted here).
+
+    Returns
+    -------
+    dict
+        The matrix outputs updated with the audit outputs, plus ``matrices``
+        and ``audit_pipeline`` holding each result separately.
     """
     matrix_kwargs = {}
     for key in [

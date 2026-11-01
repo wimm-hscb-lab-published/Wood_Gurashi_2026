@@ -1,35 +1,56 @@
 """
-LOH Pipeline – Phase 1: Per-arm LOH detection.
+LOH Pipeline – Phase 1: per-arm LOH detection and clone-level QC.
 
-Calls ``detect_loh_and_update_clones()`` for each chromosome arm with
-size-filtering and homogeneity checks DEFERRED to later phases.
+Entry point
+-----------
+``run_phase1(state, detect_loh_fn)``
+    Calls ``detect_loh_fn`` (normally
+    :func:`LOH_Pipeline.detect_loh.detect_loh_and_update_clones`) once per
+    chromosome arm with size filtering and homogeneity checks *deferred*
+    (``skip_size_filtering=True``, ``skip_homogeneity_check=True``), then runs
+    Phase-1 clone QC on the resulting ``LOH-C<n> <arm>`` labels:
 
-After this phase, ``state.results`` maps each arm that showed LOH to its
-raw (unfiltered) result tuple, and ``state`` mappings are refreshed.
+    1.  Pass 1 – detection on every arm; collects the extreme-AF dispersion
+        (``sd_med``) of every clone with a valid LOH block to derive a global
+        dynamic SD threshold.
+    2.  Pass 2 – per-arm clone QC (:func:`_show_clones_for_arm`): size gate,
+        arm-wide or localised (cytoband) extreme check, similarity and SD
+        gates, directional consistency, NGT/no-call exclusion.  Failing
+        clones have the arm's LOH token stripped.
+    3.  Pool-and-reinstate for arms whose clones all failed.
+    4.  Clone-level amplicon validation (if ``cfg.validate_segment_length``).
+    5.  Cytoband annotation of surviving labels and a summary table.
+
+After this phase ``state.results`` maps each arm that retained LOH to its
+``(df_segments, df_loh, df_corr, df_homog)`` tuple, ``state.Sample`` clone
+labels are updated in place, and ``state`` mappings are refreshed.
 """
 from __future__ import annotations
 
 import re
 import traceback
+from collections import defaultdict
+from typing import Callable
+
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-
+# ``ndimage_label`` and ``LOH_TAG`` are not used here but are kept as
+# module-level names for backward compatibility.
 from scipy.ndimage import label as ndimage_label
 
 from .loh_config import (
     LOH_TAG,
-    PipelineState,
     LOHConfig,
-    vprint,
+    PipelineState,
     arm_variants,
-    extract_chr_arms,
-    get_base_clone,
-    fmt_float,
     build_cytoband_maps,
     check_directional_consistency,
     edge_tolerant_extreme_runs,
+    extract_chr_arms,
+    fmt_float,
+    get_base_clone,
     is_loh_label,
+    vprint,
 )
 
 
@@ -450,25 +471,47 @@ def _amplicon_validation_for_arm(
 # ─────────────────────────────────────────────────────────────────────
 def run_phase1(
     state: PipelineState,
-    detect_loh_fn,       # callable: detect_loh_and_update_clones(...)
+    detect_loh_fn: Callable[..., tuple],
 ) -> dict:
     """
-    Phase 1: Per-arm LOH detection (no size / homogeneity filtering).
+    Phase 1: per-arm LOH detection followed by strict Phase-1 clone QC.
 
     Parameters
     ----------
     state : PipelineState
-        Shared mutable state.  ``state.Sample`` is modified in-place by
-        ``detect_loh_fn`` (Clone labels are updated per arm).
+        Shared mutable state.  ``state.Sample.dna.row_attrs["Clone"]`` is
+        modified in place, both by ``detect_loh_fn`` (adds
+        ``LOH-C<n> <arm>`` tokens) and by the QC steps here (strips tokens
+        from failing clones, reinstates pooled clones, appends cytoband
+        ranges).  ``state.config`` supplies all thresholds.
     detect_loh_fn : callable
-        Reference to ``detect_loh_and_update_clones``.
+        Normally ``detect_loh_and_update_clones``.  Called once per arm in
+        ``state.chr_arms`` with keyword arguments only and expected to return
+        ``(df_segments, df_loh, df_corr, df_homog)``.
 
     Returns
     -------
-    results : dict
-        ``{chr_arm: (df_segments, df_loh, df_corr, df_homog)}``
-        for every arm where LOH was detected.
-        Also stored on ``state.results``.
+    dict
+        ``{chr_arm: (df_segments, df_loh, df_corr, df_homog)}`` for every arm
+        that still carries LOH after QC.  The same object is stored on
+        ``state.results``.
+
+    Notes
+    -----
+    * Exceptions raised by ``detect_loh_fn`` for one arm are caught, printed
+      (with traceback when ``cfg.verbose``) and the arm is recorded as
+      ``ERROR``; processing continues with the next arm.
+    * Pass 1 computes, for every LOH clone with ≥
+      ``phase1_extreme_sd_qc_min_cells`` (default 5) cells, the median SD of
+      folded extreme AFs on its longest edge-tolerant extreme block (span ≥
+      ``min_contiguous_variants_initial``).  The global dynamic SD threshold
+      is ``max(sd_med) × phase1_sd_dynamic_factor`` (default 1.2), or ``None``
+      when no clone qualified.
+    * Side effects on ``state``: ``results``, ``clone_block_variants``
+      (accepted block variants per passing clone), ``phase1_ngt_exclusions``,
+      ``_phase1_ngt_matrix`` (cache) and ``loh_cytoband_ranges``.
+    * All progress is printed through ``vprint`` (silent when
+      ``cfg.verbose`` is False).
     """
     cfg = state.config
 
@@ -508,10 +551,8 @@ def run_phase1(
     local_min_mean_r = float(getattr(cfg, "phase1_localized_min_mean_r", 0.80))
     local_min_good_frac = float(getattr(cfg, "phase1_localized_min_good_frac", 0.80))
 
-    # NEW: hard minimum clone size for *all* Phase 1 calls (arm-wide + localised)
+    # Hard minimum clone size for all Phase 1 calls (arm-wide + localised).
     phase1_min_clone_cells_all = int(getattr(cfg, "phase1_min_clone_cells_all", 5))
-
-    # All clone-QC thresholds are clone-label agnostic.
 
     use_sd_qc = bool(getattr(cfg, "phase1_extreme_sd_qc_enabled", True))
     sd_min_cells = int(getattr(cfg, "phase1_extreme_sd_qc_min_cells", 5))
@@ -736,15 +777,13 @@ def run_phase1(
     # Sync df_loh label columns with final (post-strip) clone labels
     _sync_results_labels(state, results)
 
-    # ── Phase 1b-pre: Pool-and-reinstate (Fix 2) ──────────────────────
-    # After QC stripping, cells that genuinely share the same arm LOH may have
-    # been split across many tiny sub-clones (each n<5) due to co-occurring
-    # secondary LOH events labelling them differently.  For every arm that was
-    # DROPPED (all clones failed), collect all cells whose stripped clone name
-    # still carries that arm's LOH token, group them by base-genotype, and if
-    # the pool meets the minimum size gate, reinstate a consolidated LOH clone.
-    # This does not lower the n≥5 threshold — it simply allows cells that were
-    # fragmented by secondary-arm co-labelling to be counted jointly.
+    # ── Phase 1b-pre: Pool-and-reinstate ──────────────────────────────
+    # Cells sharing one real arm LOH can be fragmented into many tiny
+    # sub-clones by co-occurring secondary LOH tokens, so every clone on the
+    # arm fails the size gate.  For each DROPPED arm, pool the cells that are
+    # extreme on that arm by base genotype and reinstate a consolidated clone
+    # when the pool passes the size and extreme checks (the size threshold
+    # itself is not lowered).
     _pool_and_reinstate_dropped_arms(state, results, arm_summaries, cfg)
 
     # ── Phase 1b: Clone-level amplicon validation ──────────────────────
@@ -853,12 +892,46 @@ def _show_clones_for_arm(
     global_dynamic_sd: float | None = None,
 ) -> tuple[bool, int, int, list[str]]:
     """
-    After detect_loh_fn updates Sample, check clone-level QC for ALL LOH clones on this arm.
+    Run Phase-1 clone QC for every active LOH clone on *chr_arm*.
 
-    UPDATE (requested):
-      - min_block_len is hard-set to 4 in Phase 1 QC.
-      - If Pearson correlation is undefined because xi or mu has zero variance,
-        treat that as "perfect similarity" for the similarity gate (do NOT fail).
+    For each LOH clone mentioning the arm (largest first), the clone mean AF
+    profile over position-sorted arm variants is scanned for edge-tolerant
+    extreme runs (span ≥ 4, passing the somatic-flanking rule); the longest
+    span (ties: higher block extreme fraction) is the clone's LOH block.  A
+    clone then passes if, in order:
+
+    1. ``n ≥ phase1_min_clone_cells_all`` (default 5);
+    2. **arm-wide**: extreme fraction over all arm AFs ≥
+       ``min_extreme_fraction``, and (when SD QC applies) block
+       ``sd_median ≤ phase1_extreme_sd_qc_max_median_sd`` (12.0) and
+       ``sd_p90 ≤ phase1_extreme_sd_qc_max_p90_sd`` (18.0); **or**
+       **localised** (cytoband mode only): the best run of consecutive block
+       cytobands each with extreme fraction ≥ ``min_extreme_fraction`` holds ≥
+       ``phase1_localized_min_extreme_variants_passing_bands`` (default 5)
+       variants, cell-to-mean Pearson r on that block has mean ≥
+       ``phase1_localized_min_mean_r`` (0.80) and fraction of cells with
+       r ≥ ``phase1_localized_good_cell_r`` (0.80) ≥
+       ``phase1_localized_min_good_frac`` (0.80) — zero-variance pairs count
+       as r = 1.0 — and block ``sd_median`` ≤ the dynamic SD threshold;
+    3. directional consistency on the accepted block
+       (``check_directional_consistency``);
+    4. after stripping cells that are NGT/no-call in the block, the clone
+       still has ≥ ``phase1_min_clone_cells_all`` cells.
+
+    Passing clones have their block variants stored in
+    ``state.clone_block_variants[clone_label]``.  When
+    ``cfg.phase1_show_top_clones`` is set, one line per clone is printed.
+
+    Parameters
+    ----------
+    global_dynamic_sd : float or None
+        SD threshold for localised clones; falls back to
+        ``phase1_extreme_sd_qc_max_median_sd`` when None.
+
+    Returns
+    -------
+    tuple
+        ``(any_pass, n_clones, n_pass, failing_clone_labels)``.
     """
     state.refresh()
 
@@ -897,9 +970,7 @@ def _show_clones_for_arm(
         getattr(cfg, "phase1_min_clone_cells_all", local_min_cells)
     )
 
-    # All clone-QC thresholds are clone-label agnostic.
-
-    # ── requested: Phase 1 min block length is 4 ─────────────────────
+    # Phase 1 minimum LOH block span is fixed at 4 variants.
     min_block_len = 4
 
     use_extreme_sd_qc = bool(getattr(cfg, "phase1_extreme_sd_qc_enabled", True))
@@ -1196,7 +1267,7 @@ def _show_clones_for_arm(
                         high_thr=cfg.high_allele_threshold,
                     )
 
-            # ── Similarity gate (UPDATED): zero-variance => treat as perfect similarity ──
+            # ── Similarity gate: zero variance is treated as perfect similarity ──
             similarity_ok = False
             sim_mean_r = np.nan
             sim_good_frac = np.nan
@@ -1215,7 +1286,7 @@ def _show_clones_for_arm(
                     xi_use = xi[mask]
                     mu_use = mu[mask]
 
-                    # UPDATED: if correlation undefined due to zero variance, count as r=1.0
+                    # Correlation is undefined for zero variance; count as r = 1.0.
                     if np.nanstd(xi_use) == 0 or np.nanstd(mu_use) == 0:
                         r = 1.0
                     else:
@@ -1421,7 +1492,7 @@ def _show_clones_for_arm(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Strip a failing arm's LOH annotation from clone labels
+# Pool-and-reinstate dropped arms
 # ─────────────────────────────────────────────────────────────────────
 def _pool_and_reinstate_dropped_arms(
     state: PipelineState,
@@ -1430,26 +1501,32 @@ def _pool_and_reinstate_dropped_arms(
     cfg: LOHConfig,
 ) -> None:
     """
-    Fix 2 — Pool-and-reinstate for arms dropped due to sub-clone fragmentation.
+    Pool-and-reinstate arms dropped because their clones were fragmented.
 
-    When all Phase 1 sub-clones for an arm failed the n≥5 gate, it is often
-    because cells that share the same real LOH event were split into many tiny
-    sub-clones by *co-occurring* secondary LOH arm tokens in their labels
-    (e.g. the same chr4q signal appears in dozens of singleton combinations
-    like "TET2_... LOH-C0 chr4q LOH-C2 chr5q", "TET2_... LOH-C0 chr4q LOH-C3 chr6p", …).
+    When every Phase-1 clone on an arm fails QC, cells sharing one real LOH
+    event may have been split into many tiny sub-clones by co-occurring
+    secondary LOH tokens (e.g. ``"TET2_... LOH-C0 chr4q LOH-C2 chr5q"``,
+    ``"TET2_... LOH-C0 chr4q LOH-C3 chr6p"``, ...).
 
-    Strategy:
-      For each arm that was DROPPED, scan all cells currently in the df whose
-      original (pre-strip) AF profile shows a clear LOH signal on that arm.
-      We use the cells that WERE assigned LOH for that arm in Pass 1 — they
-      are now stripped back to their base clone label, so we look them up via
-      the df_loh record in ``results`` (before it was deleted for dropped arms).
-      We pool them by base-genotype name, and if a pool reaches ≥
-      phase1_min_clone_cells_all cells AND the pooled mean profile still passes
-      the arm-wide or localised extreme check, we reinstate a single consolidated
-      LOH clone label for that base-genotype × arm pair.
+    For each arm whose ``arm_summaries`` status is ``"DROPPED"`` (and that has
+    ≥ 4 variants):
 
-    The reinstated clone label uses the next available LOH-C index for that arm.
+    1. Every cell in ``state.df_numeric`` (not only previously-LOH cells) with
+       ≥ 50 % of its finite AFs on the arm extreme becomes a candidate.
+    2. Candidates are pooled by ``get_base_clone`` of their current label.
+    3. A pool with ≥ ``phase1_min_clone_cells_all`` (default 5) cells is
+       accepted if its pooled extreme fraction ≥ ``min_extreme_fraction``, or
+       otherwise if its mean profile has an edge-tolerant extreme run of
+       span ≥ 4 whose strict-support block (passing the somatic-flanking
+       rule) has extreme fraction ≥ ``min_extreme_fraction``.
+    4. Accepted cells are relabelled: cells already carrying the arm keep
+       their label, other LOH labels get `` LOH-C<k> <arm>`` appended, and
+       non-LOH cells become ``"<base> LOH-C<k> <arm>"``, where ``k`` is one
+       more than the highest LOH-C index among LOH labels on that arm.
+
+    Mutates ``state.Sample`` labels, ``arm_summaries`` (DROPPED → LOH) and
+    ``results`` (adds/extends a ``df_loh`` entry for the arm).  No similarity,
+    SD, directional or NGT checks are re-run on the pool.
     """
     phase1_min_n = int(getattr(cfg, "phase1_min_clone_cells_all", 5))
     thr = float(cfg.min_extreme_fraction)
@@ -1457,19 +1534,8 @@ def _pool_and_reinstate_dropped_arms(
     high = cfg.high_allele_threshold
     min_block = 4  # same as Phase 1 QC
 
-    # We need access to the original df_loh for dropped arms, which was already
-    # deleted from results.  Instead, we work directly from state.df_numeric —
-    # the AF data is always available per cell.  We identify which cells had LOH
-    # for a dropped arm by cross-referencing the original (pre-strip) detect_loh
-    # output stored in the Phase-1 pass-1 df_loh.  However, because those arms
-    # were deleted from results, we rebuild from the current clone label state:
-    # cells that lost their LOH token for arm X after stripping are recoverable
-    # if we know they used to carry it.  We cannot recover that directly from
-    # state alone — so instead we iterate over all cells in df_numeric and check
-    # their AF profile on the arm directly.
-
-    # Identify which arms were dropped (arm in arm_summaries with status DROPPED
-    # AND arm not in results anymore).
+    # The pre-strip df_loh of dropped arms has already been deleted from
+    # results, so candidates are found directly from each cell's AF profile.
     dropped_arms = [arm for arm, _, status in arm_summaries if status == "DROPPED"]
     if not dropped_arms:
         return
@@ -1582,14 +1648,10 @@ def _pool_and_reinstate_dropped_arms(
 
             new_loh_label = f"{base_name} LOH-C{next_c} {chr_arm}"
 
-            # Relabel cells in Sample.
-            # IMPORTANT: preserve any already-surviving LOH arm tokens.
-            # Older code overwrote every candidate cell with `new_loh_label`.
-            # That can erase a valid arm captured earlier in Phase 1, e.g.
-            # a cell labelled "... LOH-C2 chr5p" being overwritten by the
-            # chr7p pool-reinstate label "... LOH-C0 chr7p". Instead, append
-            # the reinstated arm to existing LOH labels and use the pooled label
-            # only for cells that have already been stripped back to base.
+            # Relabel cells in Sample, preserving any surviving LOH arm tokens
+            # (e.g. "... LOH-C2 chr5p" must not be overwritten by a chr7p
+            # reinstate label): append the arm to existing LOH labels and use
+            # the pooled label only for cells already stripped back to base.
             clone_arr = state.Sample.dna.row_attrs["Clone"]
             barcode_arr = pd.Series(state.Sample.dna.row_attrs["barcode"]).astype(str).values
 
@@ -1669,6 +1731,9 @@ def _pool_and_reinstate_dropped_arms(
         state.refresh()
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Strip a failing arm's LOH annotation from clone labels
+# ─────────────────────────────────────────────────────────────────────
 def _strip_arm_from_failing_clones(
     state: PipelineState,
     chr_arm: str,

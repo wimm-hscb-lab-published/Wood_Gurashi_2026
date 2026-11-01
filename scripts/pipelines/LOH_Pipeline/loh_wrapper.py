@@ -1,27 +1,58 @@
 """
-LOH Pipeline – Top-level wrapper.
+LOH Pipeline – top-level wrapper.
 
-Re-exports the phase entry points and provides ``build_config(...)`` so
-all notebook-facing parameters are defined in one place.
+Notebook-facing entry points:
+
+* ``build_config(...)`` – every user-tunable threshold in one keyword-only
+  place; returns an ``LOHConfig``.
+* ``run(...)`` – runs Phase 0 → 5 (plus the optional Phase 6 subclone scan and
+  Phase 7 summary), prints the final cell-assignment accounting and plots.
+
+The individual phase entry points (``run_phase0`` … ``run_phase5``,
+``run_post_phase5_subclone_scan``, ``detect_loh_and_update_clones``,
+``plot_loh_clones``) are re-exported here for convenience.
 """
 from __future__ import annotations
 
 import pandas as pd
 
-from .loh_config import (
+from .loh_config import (  # noqa: F401 re-export
+    ADO_LABEL,
     LOHConfig,
     PipelineState,
-)  # noqa: F401 re-export
+    clone_category,
+    is_fp_label,
+    is_small_label,
+    is_sub_label,
+)
 from .detect_loh import detect_loh_and_update_clones       # noqa: F401 re-export
 from .phase0_setup import run_phase0                       # noqa: F401 re-export
 from .phase1 import run_phase1                             # noqa: F401 re-export
-from .phase2 import run_phase2                             # noqa: F401 re-export
 from .phase3 import run_phase3                             # noqa: F401 re-export
 from .phase4 import run_phase4                             # noqa: F401 re-export
 from .phase5 import run_phase5                             # noqa: F401 re-export
 from .phase6_subclone_scan import run_post_phase5_subclone_scan
-from .ado_probability import run_ado_probability_qc            # noqa: F401 re-export
 from .plot_loh_clones import plot_loh_clones               # noqa: F401 re-export
+
+# Display order of the final-assignment categories and their section headings.
+_CATEGORY_ORDER = [
+    "LOH",
+    "subclonal_LOH",
+    "possible_LOH",
+    "non_LOH",
+    "ADO",
+    "small",
+    "unassigned",
+]
+_CATEGORY_HEADINGS = {
+    "LOH": "Active LOH assignments",
+    "subclonal_LOH": "Unresolved subclonal LOH assignments",
+    "possible_LOH": "Possible-LOH / retained FP assignments",
+    "non_LOH": "Non-LOH assignments",
+    "ADO": "ADO assignments",
+    "small": "Small / pruned assignments",
+    "unassigned": "Unassigned cells",
+}
 
 
 def _final_assignment_summary(
@@ -30,12 +61,20 @@ def _final_assignment_summary(
 ) -> pd.DataFrame:
     """Return and print the final initial-cell-to-assignment breakdown.
 
-    The summary reads labels directly from ``Sample.dna`` rather than only
-    ``state.clone_to_cells``. This deliberately retains ADO-labelled cells
-    that were removed from ``state.df`` for downstream AF calculations.
-    """
-    from .loh_config import ADO_LABEL, is_small_label, clone_category
+    Each initial cell is mapped to its barcode (``state.cell_to_barcode``) and
+    its current label is read from ``Sample.dna.row_attrs["Clone"]`` rather than
+    ``state.clone_to_cells``, so ADO-labelled cells removed from ``state.df``
+    are still counted. Labels are categorised as LOH / subclonal_LOH /
+    possible_LOH / non_LOH / ADO / small / unassigned (empty, "nan", "none"
+    or barcode not found).
 
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``category``, ``final_label``, ``n_cells`` and
+        ``percent_initial`` (percentage of the initial cell count), ordered by
+        category, then descending count, then label.
+    """
     initial_cell_ids = list(initial_cell_ids)
     current_labels = pd.Series(state.Sample.dna.row_attrs["Clone"]).astype(str)
 
@@ -93,18 +132,9 @@ def _final_assignment_summary(
             100.0 * summary["n_cells"] / max(initial_n_cells, 1)
         )
 
-    category_order = [
-        "LOH",
-        "subclonal_LOH",
-        "possible_LOH",
-        "non_LOH",
-        "ADO",
-        "small",
-        "unassigned",
-    ]
     summary["_category_order"] = pd.Categorical(
         summary.get("category"),
-        categories=category_order,
+        categories=_CATEGORY_ORDER,
         ordered=True,
     )
     summary = summary.sort_values(
@@ -127,25 +157,17 @@ def _final_assignment_summary(
         "  Category totals: "
         + " | ".join(
             f"{category}={int(category_counts.get(category, 0))}"
-            for category in category_order
+            for category in _CATEGORY_ORDER
             if int(category_counts.get(category, 0)) > 0
         )
     )
 
-    for category in category_order:
+    for category in _CATEGORY_ORDER:
         category_rows = summary.loc[summary["category"] == category]
         if category_rows.empty:
             continue
 
-        heading = {
-            "LOH": "Active LOH assignments",
-            "subclonal_LOH": "Unresolved subclonal LOH assignments",
-            "possible_LOH": "Possible-LOH / retained FP assignments",
-            "non_LOH": "Non-LOH assignments",
-            "ADO": "ADO assignments",
-            "small": "Small / pruned assignments",
-            "unassigned": "Unassigned cells",
-        }[category]
+        heading = _CATEGORY_HEADINGS[category]
 
         print(f"\n  ── {heading} ──")
         for _, row in category_rows.iterrows():
@@ -206,7 +228,7 @@ def build_config(
     phase1_extreme_sd_qc_max_p90_sd: float = 15.0,
     phase1_sd_dynamic_factor: float = 1.2,
 
-    # ── Phase 2 p/q merge ──
+    # ── LOH clone merge correlation (Phase 3 rescue merges, Phase 5 fallback) ──
     post_merge_correlation_threshold: float = 0.80,
 
     # ── Phase 3 LOH clone QC ──
@@ -401,7 +423,71 @@ def build_config(
     # ── Diagnostic ──
     plot_dropped_clusters: bool = False,
 ) -> LOHConfig:
-    """Build an ``LOHConfig`` from keyword arguments."""
+    """Build an ``LOHConfig`` from keyword arguments.
+
+    Every argument is forwarded unchanged to the ``LOHConfig`` field of the
+    same name; fields not exposed here keep their ``LOHConfig`` defaults. A few
+    defaults here intentionally differ from ``LOHConfig``'s own
+    (``phase3_direction_ado_min_block_variants``,
+    ``phase3_direction_ado_min_good_variants``,
+    ``phase4_arm_expansion_min_cells``,
+    ``phase5_qc_alert_ado_rate_per_amplicon``).
+
+    Parameters
+    ----------
+    low_allele_threshold, high_allele_threshold : float
+        AF (%) at or below / at or above which a variant call counts as
+        "extreme" (LOH-like LOW / HIGH). Defaults 10 and 90.
+    min_contiguous_variants_initial, min_extreme_fraction, min_shared_variants, \
+min_cluster_size, min_final_clone_size, correlation_threshold, \
+detect_loh_verbose, block_edge_tolerance
+        Phase 1 per-arm LOH detection thresholds; ``min_final_clone_size``
+        and ``correlation_threshold`` are also used by Phase 4.
+    phase6_*
+        Phase 6 primary-child expansion / nested-arm preservation.
+    phase1_*
+        Phase 1 display, localized/cytoband QC, clone-size gate and
+        extreme-AF standard-deviation QC.
+    post_merge_correlation_threshold : float
+        Minimum profile correlation to merge LOH clones: Phase 3 rescue merges, and the
+        fallback for the Phase 5 sibling merge. (Originally the Phase 2 p/q merge threshold.)
+    skip_homogeneity_check, min_homogeneity_fraction, phase3_*, \
+min_variants_per_arm_for_corr
+        Phase 3 clone QC, ADO-aware directional tolerance, multi-arm
+        decomposition (3a) and nested parent-child rescue (3b).
+    directional_*
+        Directional (LOW/HIGH) consistency check used by Phase 1 QC, Phase 3
+        homogeneity and the Phase 4f residual refinement.
+    merge_min_extreme_frac, phase4_*
+        Phase 4 clone-level merge, per-cell rescue, cross-LOH diagnostic, cell-level
+        reassignment (4d) and residual discovery. ``phase4_arm_rescue_*``,
+        ``phase4_arm_expansion_*`` and ``phase4_residual_base_loh_*`` are
+        stored but not used by the current Phase 4 code.
+    ado_check_enabled, ado_min_corr, ado_max_median_abs_diff, \
+ado_min_comparison_variants, ado_exclude_somatic_amplicon, \
+ado_include_hom_targets, ado_wt_compare_all_hemhom_loh_targets, ado_min_extreme_frac
+        Phase 4b WT/Het → Hem/Hom ADO check (``ado_min_extreme_frac`` is unused).
+    validate_segment_length, min_contiguous_variants_final, min_different_amplicons
+        Amplicon/segment validation of LOH blocks.
+    enforce_somatic_block_flanking, min_informative_variants_flanking_somatic, \
+require_informative_on_both_sides_of_somatic
+        Handling of somatic / non-informative variants inside LOH blocks.
+    ado_probability_qc_enabled, amplicon_ado_rates, ado_probability_*
+        ADO-combination probability model (per-amplicon ADO rate table,
+        column names, default rate, p-value threshold).
+    phase5_*
+        Phase 5 QC alerts for short (e.g. three-amplicon) LOH blocks.
+    informative_variants, cytobands, output_dir, save_pdf
+        Germline-informative variant list, cytoband table and figure output.
+    verbose : bool
+        Print phase progress (``vprint``).
+    plot_dropped_clusters : bool
+        Keep clusters failing intra-cluster coherence so they appear in plots.
+
+    Returns
+    -------
+    LOHConfig
+    """
     return LOHConfig(
         # Phase 1 core
         low_allele_threshold=low_allele_threshold,
@@ -644,18 +730,15 @@ def _print_state(
     results: dict | None = None,
     summary_df: pd.DataFrame | None = None,
 ) -> None:
+    """Print a short progress block after a phase (LOH/SUB/FP counts, result keys)."""
     print(f"\n✅ {label} complete.")
     if results is not None:
         print(f"   Result keys: {sorted(results.keys())}")
     print(f"   Active LOH cells:   {state.loh_cell_count()}")
     print(f"   Active LOH labels:  {state.loh_clone_labels()}")
-    from .loh_config import is_fp_label, is_sub_label
-    fp_counts = state.current_clones.astype(str).loc[
-        state.current_clones.astype(str).apply(is_fp_label)
-    ].value_counts()
-    sub_counts = state.current_clones.astype(str).loc[
-        state.current_clones.astype(str).apply(is_sub_label)
-    ].value_counts()
+    labels = state.current_clones.astype(str)
+    fp_counts = labels.loc[labels.apply(is_fp_label)].value_counts()
+    sub_counts = labels.loc[labels.apply(is_sub_label)].value_counts()
     print(f"   Unresolved SUB:      {len(sub_counts)} clone(s), {int(sub_counts.sum())} cell(s)")
     print(f"   Possible-LOH (FP):  {len(fp_counts)} clone(s), {int(fp_counts.sum())} cell(s)")
     if summary_df is not None:
@@ -727,20 +810,51 @@ def run(
     an additional arm: the nested arm is recorded in row metadata rather than
     splitting the primary family into separately pruned flat labels.
 
+    Parameters
+    ----------
+    Sample : missionbio.mosaic Sample
+        Sample whose ``dna.row_attrs["Clone"]`` labels are updated in place.
+    df : pandas.DataFrame
+        Cell × variant AF table (percent).
+    grouped_by_chr_arm : dict
+        ``{arm: [variant, ...]}``.
+    cfg : LOHConfig
+        Configuration, usually from ``build_config``.
+    df_dp : pandas.DataFrame, optional
+        Matching depth table for coverage-aware Phase 5 QC.
+    chr_arms : list of str, optional
+        Arms to process (Phase 0 decides when None).
+    detect_loh_fn : callable
+        Per-arm detector passed to Phase 1.
+    run_plotting : bool
+        Call ``plot_loh_clones`` at the end with the plotting arguments
+        (``informative_variants`` … ``visualise_fn``) passed through unchanged.
+    print_progress : bool
+        Print a short status block after each phase.
+    post_phase5_subclone_scan_* :
+        Optional Phase 6 scan, see above.
+
     Returns
     -------
     dict
         {
             "state": PipelineState,
             "phase1_results": dict,
-            "phase2_results": dict,
+            "phase2_results": dict,   # always {"status": "SKIPPED", ...}
             "phase3_results": dict,
             "phase4_results": dict,
-            "phase6_results": dict,
+            "phase6_results": dict,   # {} unless the Phase 6 scan ran
             "phase7_summary_df": pd.DataFrame | None,
+            "ado_probability_qc": pd.DataFrame,   # always empty
             "summary_df": pd.DataFrame,
+            "final_assignment_summary": pd.DataFrame,
             "df_plot_all": pd.DataFrame | None,
         }
+
+    Raises
+    ------
+    RuntimeError
+        If Phase 0 returns None (no arms to process).
     """
     # Phase 0 — pre-checks and state construction
     state = run_phase0(

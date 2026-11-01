@@ -1,18 +1,34 @@
 """
 Phase 5 plotting – plot active LOH, unresolved SUB, possible-LOH (FP), and non-LOH clones.
 
-The plot dataframe is built directly from ``PipelineState``.  Retained FP
-labels are deliberately a third category: they remain visible for review but
-are not active LOH sources, targets, or baseline clones in later pipeline
-phases.
+Main entry point: ``plot_loh_clones``. The plot dataframe is built directly
+from ``PipelineState`` and drawn with ``CNV_Utils.visualise_variants_by_clone``
+(or a caller-supplied function).  Retained FP labels are deliberately a
+separate category: they remain visible for review but are not active LOH
+sources, targets, or baseline clones in later pipeline phases.
 """
 from __future__ import annotations
+
+import os
 from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from .loh_config import clone_category
+
 if TYPE_CHECKING:
-    from .loh_config import PipelineState, LOHConfig
+    from .loh_config import LOHConfig, PipelineState
+
+# Category → tag used in the verbose plotting-order listing.
+_DISPLAY_TAG = {"LOH": "LOH", "subclonal_LOH": "SUB", "possible_LOH": "PLOH", "non_LOH": "BASE"}
+
+
+def _labels_in_category(labels_with_cells: dict, category: str, min_cells: int) -> list:
+    """Sorted labels of *category* with at least *min_cells* cells."""
+    return sorted(
+        lbl for lbl, n in labels_with_cells.items()
+        if clone_category(lbl) == category and n >= min_cells
+    )
 
 
 def plot_loh_clones(
@@ -39,10 +55,58 @@ def plot_loh_clones(
     are included by default, carry no minimum-size gate, and are ordered
     between active LOH and baseline non-LOH clones. Baseline
     non-LOH clones are included only when ``include_non_loh=True`` and still
-    use ``cfg.min_final_clone_size``.
-    """
-    from .loh_config import clone_category
+    use ``cfg.min_final_clone_size``.  ``small`` labels are never plotted.
 
+    Parameters
+    ----------
+    state : PipelineState
+        Supplies ``df`` and the current ``clone_to_cells`` mapping.
+    cfg : LOHConfig or None
+        Defaults to ``state.config``; also supplies defaults for
+        *informative_variants*, *cytobands*, *output_dir*, *save_pdf* and
+        *verbose* when those are None.
+    informative_variants : list or None
+        Variants to plot (those absent from ``state.df`` are skipped).
+    cytobands : pd.DataFrame or None
+        Forwarded to the visualiser.
+    output_dir : str or None
+        Output folder; required when *save_figures* is True.
+    output_prefix : str, default "LOH_clones_AF"
+        File-name prefix forwarded to the visualiser.
+    include_non_loh : bool, default False
+        Also plot baseline non-LOH clones with ≥ ``min_final_clone_size`` cells.
+    include_possible_loh : bool, default True
+        Also plot SUB and FP clones.
+    plot_separate_clones, split_by_cytobands, save_figures : bool
+        Forwarded to the visualiser.
+    save_pdf : bool or None
+        After plotting, also save every open matplotlib figure as PDF (next
+        to its PNG when the figure label is an existing file path, else as
+        ``<output_dir>/<output_prefix>_fig<N>.pdf``).
+    visualise_fn : callable or None
+        Defaults to ``CNV_Utils.visualise_variants_by_clone``.
+    verbose : bool or None
+        Print clone lists, plotting order and saved paths.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        The plotted dataframe (``state.df`` rows of selected clones plus a
+        ``label`` column), or None when there is nothing to plot.
+
+    Raises
+    ------
+    ValueError
+        If *informative_variants* is missing/empty or none are in the data,
+        or if *save_figures* is True without *output_dir*.
+    ImportError
+        If *visualise_fn* is None and ``CNV_Utils`` cannot be imported.
+
+    Notes
+    -----
+    Within each category clones are ordered by decreasing plotted cell count,
+    then by label; categories are ordered LOH, SUB, FP, non-LOH.
+    """
     if cfg is None:
         cfg = state.config
     if verbose is None:
@@ -73,22 +137,10 @@ def plot_loh_clones(
         for lbl, cells in state.clone_to_cells.items()
         if len(cells) > 0
     }
-    loh_labels = sorted(
-        lbl for lbl, n in labels_with_cells.items()
-        if clone_category(lbl) == "LOH" and n > 0
-    )
-    subclonal_labels = sorted(
-        lbl for lbl, n in labels_with_cells.items()
-        if clone_category(lbl) == "subclonal_LOH" and n > 0
-    )
-    possible_loh_labels = sorted(
-        lbl for lbl, n in labels_with_cells.items()
-        if clone_category(lbl) == "possible_LOH" and n > 0
-    )
-    non_loh_labels = sorted(
-        lbl for lbl, n in labels_with_cells.items()
-        if clone_category(lbl) == "non_LOH" and n >= min_size
-    )
+    loh_labels = _labels_in_category(labels_with_cells, "LOH", 1)
+    subclonal_labels = _labels_in_category(labels_with_cells, "subclonal_LOH", 1)
+    possible_loh_labels = _labels_in_category(labels_with_cells, "possible_LOH", 1)
+    non_loh_labels = _labels_in_category(labels_with_cells, "non_LOH", min_size)
 
     if verbose:
         for category, labels in (
@@ -134,6 +186,7 @@ def plot_loh_clones(
         print(f"  ℹ  {len(informative_variants) - len(vars_present)} informative variant(s) not in df (skipped)")
 
     counts = df_plot["label"].value_counts()
+
     def _order(labels):
         return sorted(labels, key=lambda x: (-counts.get(x, 0), x))
 
@@ -146,9 +199,8 @@ def plot_loh_clones(
     if verbose:
         print(f"\n  Cells after filtering: {len(df_plot)} (from {len(state.df)} total)")
         print(f"  Plotting order ({len(desired_order)} clones):")
-        display_tag = {"LOH": "LOH", "subclonal_LOH": "SUB", "possible_LOH": "PLOH", "non_LOH": "BASE"}
         for lbl in desired_order:
-            print(f"    [{display_tag[clone_category(lbl)]}] {lbl}  (n={counts.get(lbl, 0)})")
+            print(f"    [{_DISPLAY_TAG[clone_category(lbl)]}] {lbl}  (n={counts.get(lbl, 0)})")
 
     if visualise_fn is None:
         try:
@@ -172,7 +224,6 @@ def plot_loh_clones(
     )
 
     if save_figures and save_pdf and output_dir is not None:
-        import os
         import matplotlib.pyplot as plt
         for fig_num in plt.get_fignums():
             fig = plt.figure(fig_num)

@@ -9,16 +9,27 @@ This is NOT demultiplexing. A single tag carries no cross-tag information, so
 doublets cannot be identified from one hashtag, and multi-tag input is scored
 per-tag rather than by cross-tag argmax. For donor demultiplexing from
 competing tags use a dedicated demux method instead.
+
+Main entry points
+-----------------
+call_hto_present_absent
+    Score a list of hashtags on an assay; returns AnnData, summary, results.
+call_single_hashtag
+    Fit and call one hashtag (a ``pd.Series`` of raw counts).
+plot_hashtag_distribution
+    Histogram of log1p counts with the fitted mixture and threshold.
+HTOResult
+    Dataclass holding one tag's calls and fit.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import matplotlib.pyplot as plt
 from scipy.stats import norm
 from sklearn.mixture import GaussianMixture
 
@@ -27,7 +38,6 @@ __all__ = [
     "call_single_hashtag",
     "call_hto_present_absent",
     "plot_hashtag_distribution",
-    "filter_assay_to_hto_positive",
 ]
 
 
@@ -67,7 +77,13 @@ class HTOResult:
 
 
 def _extract_hto_counts(assay, hashtags: list[str]) -> pd.DataFrame:
-    """Pull raw read counts for the requested hashtag columns as a (cells x tags) DataFrame."""
+    """Return raw counts for ``hashtags`` as a (cells × tags) DataFrame copy.
+
+    Tries ``assay.get_attribute('read_counts', constraint='row+col')``; on any
+    exception falls back to ``assay.to_df()`` or, failing that attribute, an
+    AnnData-style ``X`` / ``obs_names`` / ``var_names`` frame. Raises
+    ``KeyError`` listing missing hashtags and the available columns.
+    """
     try:
         df = assay.get_attribute("read_counts", constraint="row+col")
     except Exception:
@@ -120,6 +136,18 @@ def call_single_hashtag(
     Returns
     -------
     HTOResult
+        ``call`` is an object array of "Positive" / "Negative" / "Uncertain";
+        ``p_pos`` is all zeros when the tag is unimodal.
+
+    Notes
+    -----
+    Bimodality requires both ``BIC(2 components) < BIC(1 component)`` and a
+    gap of at least ``min_mean_separation`` between the sorted component
+    means. Cells are Positive when ``p_pos >= posterior_cutoff``; cells with
+    ``lo < p_pos < hi`` (``uncertain_band``) are then overwritten as
+    "Uncertain". The reported ``threshold`` is ``expm1`` of the first point on
+    a 2000-step log1p grid where the posterior goes from below to at/above the
+    cutoff, or None if it never crosses upward.
     """
     name = counts.name
     vals = counts.to_numpy(dtype=float)
@@ -172,6 +200,9 @@ def call_hto_present_absent(
 ) -> tuple[sc.AnnData, pd.DataFrame, dict[str, HTOResult]]:
     """Score every hashtag in ``hashtags`` independently.
 
+    Each tag is called with :func:`call_single_hashtag`; no cross-tag
+    information is used, so this is a present/absent QC, not a demultiplexer.
+
     Parameters
     ----------
     assay
@@ -196,6 +227,17 @@ def call_hto_present_absent(
         One row per hashtag with positive fraction, threshold, means, flags.
     results : dict[str, HTOResult]
         Raw per-tag results.
+
+    Raises
+    ------
+    KeyError
+        If any hashtag is not a column of the assay's counts.
+
+    Notes
+    -----
+    ``adata.X`` is the raw counts as float32; raw counts per tag are also
+    copied into ``adata.obs[tag]``. The verbose line includes the threshold
+    only when it is truthy (a threshold of exactly 0.0 is not printed).
     """
     df_htos = _extract_hto_counts(assay, hashtags)
 
@@ -255,7 +297,26 @@ def call_hto_present_absent(
 
 
 def plot_hashtag_distribution(counts: pd.Series, result: HTOResult, ax=None):
-    """Plot the log1p count histogram with the fitted mixture and threshold for one tag."""
+    """Plot one tag's log1p count histogram with the fitted mixture and threshold.
+
+    Parameters
+    ----------
+    counts : pd.Series
+        Raw counts for the tag.
+    result : HTOResult
+        Result from :func:`call_single_hashtag` for the same tag.
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw on; a new 8 × 5 figure is created when None.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        Histogram (100 bins, density), mixture density and dotted weighted
+        components when ``result.gmm`` is set, and a dashed line at
+        ``log1p(threshold)`` when a threshold exists. Unimodal tags get
+        "[UNIMODAL — not thresholded]" in the title. ``plt.show`` is not
+        called.
+    """
     logv = np.log1p(counts.to_numpy(dtype=float))
     xs = np.linspace(logv.min(), logv.max(), 500)
 
@@ -284,25 +345,3 @@ def plot_hashtag_distribution(counts: pd.Series, result: HTOResult, ax=None):
     ax.set_ylabel("Density", fontsize=13)
     ax.legend()
     return ax
-
-
-def filter_assay_to_hto_positive(assay, adata, hashtag: str, call: str = "Positive"):
-    """Subset a protein assay to cells with a given call for ``hashtag``.
-
-    Applies the HTO call (computed on the scratch ``adata`` from
-    :func:`call_hto_present_absent`) to the *real* downstream assay, returning a
-    cell-subset copy. Subset any other per-cell assays (e.g. DNA) to the same
-    ``keep_bcs`` to preserve cross-assay cell alignment.
-
-    Returns
-    -------
-    assay_subset
-        ``assay[keep_bcs, :].copy()``.
-    keep_bcs : pd.Index
-        Barcodes retained.
-    """
-    col = f"{hashtag}_call"
-    if col not in adata.obs:
-        raise KeyError(f"{col!r} not in adata.obs; run call_hto_present_absent first.")
-    keep_bcs = adata.obs_names[adata.obs[col] == call]
-    return assay[keep_bcs, :].copy(), keep_bcs

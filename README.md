@@ -72,14 +72,16 @@ FU, follow-up.
 
 ```
 notebooks/
-  01_preprocessing/       # 1–2. preprocessing and demultiplexing
-  02_protein_filtering/   # 3. filtering
-  03_sample_analysis/     # 4. patient data analysis
-scripts/manuscript/       # 5. integration and figures (named by figure panel)
-metadata/                 # per-experiment configuration
-cohort_metadata/          # cohort-level summary tables
-envs/containers/          # Mosaic container (image not tracked; see Requirements)
-Sample_sheet.csv          # experiment → patient mapping
+  01_preprocessing/                   # 1–2. preprocessing and demultiplexing (method notes: 01_Preprocessing_Docs.md)
+  02_protein_filtering/               # 3. filtering
+  03_sample_analysis/                 # 4. patient data analysis
+scripts/
+  01_Run_preprocessing_notebooks.sh   # runs the preprocessing notebooks inside the container (SLURM)
+  pipelines/                          # Python packages used by the notebooks (DNA_Utils, CNV_Utils, LOH_Pipeline, PRO_Utils; each has a README)
+  manuscript/                         # 5. integration and figures (named by figure panel)
+metadata/                             # per-experiment configuration
+cohort_metadata/                      # cohort-level summary tables
+envs/containers/                      # Mosaic container (image not tracked; see Requirements)
 ```
 
 ## Data
@@ -97,6 +99,18 @@ Python with Mission Bio Mosaic (`missionbio.mosaic-base`) and R. Analysis can be
 The Python environment used in the analysis is provided as an Apptainer/Singularity container (`mosaic.sif`), available on Zenodo: [10.5281/zenodo.xxxxxxx](https://doi.org/10.5281/zenodo.xxxxxxx) *(pending)*.
 
 The R environment used in the analysis is provided as an Apptainer/Singularity container (`r_env.sif`), available on Zenodo: [10.5281/zenodo.xxxxxxx](https://doi.org/10.5281/zenodo.xxxxxxx) *(pending)*.
+
+## Computing environment
+
+Python notebooks were executed interactively with `scripts/01_Run_preprocessing_notebooks.sh` (papermill, inside `mosaic.sif`) on the <cluster name> high-performance computing cluster (SLURM, partition `long`), using 8 CPU cores and 160 GB RAM job session on AMD EPYC 7713 (64-core) nodes. Numerical libraries were limited to 8 threads (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMBA_NUM_THREADS`) and `PYTHONHASHSEED=42`. Random seeds are fixed in the notebooks (`random_state=1337` for PCA, UMAP and clustering). Each run writes its node, CPU model and thread settings to `notebooks/<step>/logs/<notebook>.log`.
+
+R scripts were run with `r_env.sif` on <machine / cluster>.
+
+### Reproducibility note
+
+Results can differ slightly between computers, even with the same code, software and settings. When re-running the analysis on different hardware, check that each cell cluster is still assigned to the correct patient before exporting.
+
+The demultiplexed per-patient H5 files deposited on GEO allow the downstream analyses (filtering, patient analysis and figures) to be reproduced exactly, without re-running demultiplexing.
 
 ## License
 

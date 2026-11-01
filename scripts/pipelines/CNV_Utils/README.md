@@ -111,7 +111,12 @@ CNV_Utils.plot_integrated_cnv_baf_with_significance(
 
 ## variant_grouping
 
-### group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytobands, verbose=True)
+<details>
+<summary><b><code>group_informative_variants_by_chr_arm</code></b> — Splits variant IDs (<code>chrN:pos:REF/ALT</code>) by chromosome (text before the first <code>:</code>) and then by chromosome arm.</summary>
+
+`group_informative_variants_by_chr_arm(filtered_germline_in_samples, cytobands, verbose=True)`
+
+Source: [variant_grouping.py:16](variant_grouping.py#L16 "group_informative_variants_by_chr_arm")
 
 Splits variant IDs (`chrN:pos:REF/ALT`) by chromosome (text before the first `:`) and then by chromosome arm. The
 `cytobands` table needs `chromosome` (without the `chr` prefix), `arm`, `start` and `end`; each arm spans
@@ -121,9 +126,16 @@ Splits variant IDs (`chrN:pos:REF/ALT`) by chromosome (text before the first `:`
 span are dropped (only counted in the printout). The arm dict is the per-arm input of `test_variant_informativeness`.
 No files; prints a step-by-step summary when `verbose`.
 
+</details>
+
 ## informativeness
 
-### test_variant_informativeness(df_AF, df_ALT, df_REF, grouped_by_chr_arm, output_dir, p_threshold=0.01, ..., wt_labels=None, variant_to_amplicon=None, germline_variants=None, verbose=True)
+<details>
+<summary><b><code>test_variant_informativeness</code></b> — This is a library function, not a pytest test, despite the <code>test_</code> prefix.</summary>
+
+`test_variant_informativeness(df_AF, df_ALT, df_REF, grouped_by_chr_arm, output_dir, p_threshold=0.01, ..., wt_labels=None, variant_to_amplicon=None, germline_variants=None, verbose=True)`
+
+Source: [informativeness.py:62](informativeness.py#L62 "test_variant_informativeness")
 
 This is a library function, not a pytest test, despite the `test_` prefix.
 
@@ -189,7 +201,14 @@ Stage 2 runs sequential passes over each arm's table:
 Passes (a) and (b) are skipped (with a message) when no `variant_to_amplicon` key matches a `df_AF` variant, because
 independent amplicons are required by default.
 
-### expand_informative_variants(H5_PATH, Sample, cytobands, output_dir, desired_plotting_order, *, whitelist, germline_whitelist, sample_raw_size, num_cores, p_threshold=0.01, baf_deviation_threshold=0.3, max_af_iqr=0.3, min_cells=5, quality_percentile=10, adaptive_qc_percentile=1, adaptive_median_dp_cap=10.0, adaptive_mean_gq_cap=50.0, require_wt_het=True, wt_het_band=None, wt_label="WT", blacklist_paths=None, exclude_pathogenic=True, annotate_final_variants=True, plot=True, verbose=True)
+</details>
+
+<details>
+<summary><b><code>expand_informative_variants</code></b> — Grows the informative germline panel by reloading the raw H5 with relaxed variant filtering and keeping additional</summary>
+
+`expand_informative_variants(H5_PATH, Sample, cytobands, output_dir, desired_plotting_order, *, whitelist, germline_whitelist, sample_raw_size, num_cores, p_threshold=0.01, baf_deviation_threshold=0.3, max_af_iqr=0.3, min_cells=5, quality_percentile=10, adaptive_qc_percentile=1, adaptive_median_dp_cap=10.0, adaptive_mean_gq_cap=50.0, require_wt_het=True, wt_het_band=None, wt_label="WT", blacklist_paths=None, exclude_pathogenic=True, annotate_final_variants=True, plot=True, verbose=True)`
+
+Source: [informativeness.py:1540](informativeness.py#L1540 "expand_informative_variants")
 
 Grows the informative germline panel by reloading the raw H5 with relaxed variant filtering and keeping additional
 variants that pass informativeness and quality gates. The input `Sample` is not modified; reassign
@@ -219,17 +238,27 @@ columns `wt_af`, `is_blacklisted`, `is_pathogenic`, `kept`), `new_kept`, `final_
 `thresholds`, `variant_annotations`, `transferred_row_attributes`, `skipped_row_attributes`. The relaxed
 informativeness CSVs go to `output_dir/informativeness_relaxed`.
 
-### Private helpers
+</details>
+
+<details>
+<summary><b>Private helpers</b> (3 entries)</summary>
 
 | Helper | Purpose |
 |---|---|
-| `_normalize_wt_labels` | WT labels as a list (`None` -> `['WT']`, str -> `[str]`) |
-| `_build_wt_mask` | Boolean mask of cells whose stripped label exactly matches a WT label |
-| `_is_wt_label` | True if one label exactly matches a WT label |
+| [`_normalize_wt_labels`](informativeness.py#L41 "_normalize_wt_labels") | WT labels as a list (`None` -> `['WT']`, str -> `[str]`) |
+| [`_build_wt_mask`](informativeness.py#L50 "_build_wt_mask") | Boolean mask of cells whose stripped label exactly matches a WT label |
+| [`_is_wt_label`](informativeness.py#L56 "_is_wt_label") | True if one label exactly matches a WT label |
+
+</details>
 
 ## cnv_extraction
 
-### extract_cnv_data(Sample, desired_plotting_order=None, wd=None, EXPERIMENT=None, PATIENT_ID=None, OUT_DIR=None, output_tag="", sample_filter_source=None, label_source_sample=None, label_col="label", compute_ploidy=True, ploidy_before_sync=True, diploid_label="WT", normalized_counts="Normalized_reads", subset_cnv_to_variant_amplicons=True, save_outputs=True, verbose=True)
+<details>
+<summary><b><code>extract_cnv_data</code></b> — End-to-end ploidy wrapper.</summary>
+
+`extract_cnv_data(Sample, desired_plotting_order=None, wd=None, EXPERIMENT=None, PATIENT_ID=None, OUT_DIR=None, output_tag="", sample_filter_source=None, label_source_sample=None, label_col="label", compute_ploidy=True, ploidy_before_sync=True, diploid_label="WT", normalized_counts="Normalized_reads", subset_cnv_to_variant_amplicons=True, save_outputs=True, verbose=True)`
+
+Source: [cnv_extraction.py:367](cnv_extraction.py#L367 "extract_cnv_data")
 
 End-to-end ploidy wrapper. It **mutates `Sample` in place**: `Sample.dna`/`Sample.cnv` are replaced by barcode-synced
 (and optionally amplicon-subset) assays, the CNV assay gains a `ploidy` layer and `row_attrs[label_col]` is
@@ -254,7 +283,14 @@ Returns a dict: `OUT_DIR`, `shared_barcodes`, `variant_amplicons`, `wt_cells`, `
 `df_mut_to_amplicon_dataframe`, `df_mut_to_amplicon`, `variant_to_amp_dict`, `df_cnv`, `df_cnv_grouped`,
 `df_cnv_vars`, `cnv_info`, `outputs` (`{filename: DataFrame}`).
 
-### get_cnv_info(Sample, df_mut_to_amplicon=None, desired_plotting_order=None, verbose=True)
+</details>
+
+<details>
+<summary><b><code>get_cnv_info</code></b> — Reads the <code>ploidy</code> layer of <code>Sample.cnv</code> (requires <code>row_attrs[&#x27;label&#x27;]</code> and col_attrs <code>CHROM</code>, <code>start_pos</code>, <code>id</code>;</summary>
+
+`get_cnv_info(Sample, df_mut_to_amplicon=None, desired_plotting_order=None, verbose=True)`
+
+Source: [cnv_extraction.py:61](cnv_extraction.py#L61 "get_cnv_info")
 
 Reads the `ploidy` layer of `Sample.cnv` (requires `row_attrs['label']` and col_attrs `CHROM`, `start_pos`, `id`;
 `KeyError` otherwise). Returns `(df_cnv, df_cnv_grouped, df_cnv_vars, cnv_info_sorted)`:
@@ -268,21 +304,31 @@ Reads the `ploidy` layer of `Sample.cnv` (requires `row_attrs['label']` and col_
   are kept as metadata. `None` otherwise.
 - `cnv_info_sorted`: the de-duplicated CNV column attributes in genomic order.
 
-### Private helpers
+</details>
+
+<details>
+<summary><b>Private helpers</b> (7 entries)</summary>
 
 | Helper | Purpose |
 |---|---|
-| `_make_vprint` | `print` + flush that is silent unless `verbose` |
-| `_chrom_to_int` | Chromosome name -> sortable integer (X 23, Y 24, M/MT 25, unknown 999) |
-| `_chrom_sort_key` | `sort_values` key applying `_chrom_to_int` to the `CHROM` column |
-| `_sync_dna_cnv_by_barcode` | Subset DNA/CNV in place to shared barcodes (DNA order), optional CNV amplicon subset |
-| `_transfer_labels_by_barcode` | Copy labels from one assay to another by barcode (NaN where unmatched) |
-| `_get_labeled_attribute` | Assay layer as a DataFrame with `label` as first column |
-| `_compute_ploidy_from_diploid_cells` | Select diploid reference cells and run `Sample.cnv.compute_ploidy` |
+| [`_make_vprint`](cnv_extraction.py#L27 "_make_vprint") | `print` + flush that is silent unless `verbose` |
+| [`_chrom_to_int`](cnv_extraction.py#L38 "_chrom_to_int") | Chromosome name -> sortable integer (X 23, Y 24, M/MT 25, unknown 999) |
+| [`_chrom_sort_key`](cnv_extraction.py#L54 "_chrom_sort_key") | `sort_values` key applying `_chrom_to_int` to the `CHROM` column |
+| [`_sync_dna_cnv_by_barcode`](cnv_extraction.py#L304 "_sync_dna_cnv_by_barcode") | Subset DNA/CNV in place to shared barcodes (DNA order), optional CNV amplicon subset |
+| [`_transfer_labels_by_barcode`](cnv_extraction.py#L324 "_transfer_labels_by_barcode") | Copy labels from one assay to another by barcode (NaN where unmatched) |
+| [`_get_labeled_attribute`](cnv_extraction.py#L338 "_get_labeled_attribute") | Assay layer as a DataFrame with `label` as first column |
+| [`_compute_ploidy_from_diploid_cells`](cnv_extraction.py#L346 "_compute_ploidy_from_diploid_cells") | Select diploid reference cells and run `Sample.cnv.compute_ploidy` |
+
+</details>
 
 ## explore_gene_cnv
 
-### prepare_ploidy_region_plot_inputs(sample_all_vars, df_ploidy_median, differential_variants, annotation_df=None, annotation_exon=None, desired_plotting_order=None, gtf_exons_refseq=None, verbose=True)
+<details>
+<summary><b><code>prepare_ploidy_region_plot_inputs</code></b> — Maps differential variants onto CNV amplicons and onto the exons/introns of one selected transcript per gene, to feed</summary>
+
+`prepare_ploidy_region_plot_inputs(sample_all_vars, df_ploidy_median, differential_variants, annotation_df=None, annotation_exon=None, desired_plotting_order=None, gtf_exons_refseq=None, verbose=True)`
+
+Source: [explore_gene_cnv.py:1496](explore_gene_cnv.py#L1496 "prepare_ploidy_region_plot_inputs")
 
 Maps differential variants onto CNV amplicons and onto the exons/introns of one selected transcript per gene, to feed
 a per-gene ploidy plot. Pass either `annotation_exon` (already exon-annotated, used as is) or `annotation_df` together
@@ -317,7 +363,14 @@ Returns a dict: `plot_df` (clones x selected amplicons), `amp_sel`, `diff`, `gen
 `transcript_regions`, `genes_of_interest`, `annotation_exon`. No files or plots; timestamped logs when `verbose`.
 Raises `ValueError` if no annotation is given, no gene can be inferred, or no amplicon of those genes is in the matrix.
 
-### load_refseq_gtf_exons(gtf_path)
+</details>
+
+<details>
+<summary><b><code>load_refseq_gtf_exons</code></b> — Reads a tab-separated GTF/GFF (lines starting with <code>#</code> skipped) and keeps <code>exon</code> features.</summary>
+
+`load_refseq_gtf_exons(gtf_path)`
+
+Source: [explore_gene_cnv.py:1690](explore_gene_cnv.py#L1690 "load_refseq_gtf_exons")
 
 Reads a tab-separated GTF/GFF (lines starting with `#` skipped) and keeps `exon` features. Gene is taken from
 `gene_name`/`gene`/`gene_id`/`Name`, transcript from `transcript_id`/`transcriptId`/`transcript`, plus `exon_id` and
@@ -327,38 +380,48 @@ gene/transcript/chromosome/strand by coordinate order (descending on the `-` str
 `gene_name_gtf`, `CHROM_norm`, `exon_start`, `exon_end`, `exon_number`, `transcript_id_gtf`,
 `transcript_id_gtf_noversion`, `exon_id`, `strand`.
 
-### Private helpers
+</details>
+
+<details>
+<summary><b>Private helpers</b> (22 entries)</summary>
 
 | Helper | Purpose |
 |---|---|
-| `_clean_label` | `str(x).strip()`, or `""` for NaN / 'nan' / 'none' / 'na' |
-| `_normalise_chrom` | Strip `chr` (any case), map M -> MT |
-| `_strip_tx_version` | Drop a trailing `.N` transcript version |
-| `_as_variant_vector` | Series/Index/array/list/set/scalar -> list of str (NaN dropped) |
-| `_first_existing_col` | First candidate column present in a DataFrame |
-| `_parse_gene_from_variant_name` | Gene from a `GENE_...` ID |
-| `_parse_chrom_pos_from_variant_name` | `(chrom, pos)` from a `[chr]N:pos...` ID |
-| `_pick_variant_id_col` | First known variant-ID column present |
-| `_sort_num_labels` | Clean, de-duplicate and numerically sort labels |
-| `_region_rank_from_label` | 'Exon N' -> N, 'Intron N' -> N + 0.5, else last |
-| `_exon_rank_value` | Backward-compatible rank helper |
-| `_format_region_label` | `("exon", ["2", "3"])` -> "Exon 2,3" |
-| `_fill_variant_id`, `_add_chrom_norm`, `_add_variant_pos` | Add standard ID / chromosome / position columns (stage 2) |
-| `_standardise_gtf_exons` | Standardise GTF exon table columns |
-| `_compute_annotation_exon_from_gtf` | Per-variant exon assignment (stage 1) |
-| `_transcript_ids_in` | Non-empty transcript IDs in a table |
-| `_choose_gene_transcripts_from_diff` | Transcript-selection ladder (stage 5) |
-| `_build_transcript_regions_from_gtf` | Exon and intron intervals (stage 8) |
-| `_select_best_region_hits` | Prefer exon hits over intron hits |
-| `_empty_region_assignment`, `_lookup_transcript_regions`, `_assign_region_to_amplicon` | Amplicon region labelling (stage 9) |
-| `_load_annotation_exon`, `_standardise_annotation_table`, `_build_variant_lookup`, `_build_differential_table`, `_build_amplicon_metadata`, `_restrict_amplicons_to_genes_of_interest`, `_build_selected_transcript_regions`, `_label_differential_variant_regions`, `_order_amplicons_and_build_plot_df`, `_assign_mutation_labels_to_amplicons` | Stages 1-2, 3, 4, 6, 7, 8, 10, 11, 12 of `prepare_ploidy_region_plot_inputs` |
-| `_gtf_attr` | First matching GTF/GFF attribute value |
+| [`_clean_label`](explore_gene_cnv.py#L132 "_clean_label") | `str(x).strip()`, or `""` for NaN / 'nan' / 'none' / 'na' |
+| [`_normalise_chrom`](explore_gene_cnv.py#L142 "_normalise_chrom") | Strip `chr` (any case), map M -> MT |
+| [`_strip_tx_version`](explore_gene_cnv.py#L155 "_strip_tx_version") | Drop a trailing `.N` transcript version |
+| [`_as_variant_vector`](explore_gene_cnv.py#L165 "_as_variant_vector") | Series/Index/array/list/set/scalar -> list of str (NaN dropped) |
+| [`_first_existing_col`](explore_gene_cnv.py#L178 "_first_existing_col") | First candidate column present in a DataFrame |
+| [`_parse_gene_from_variant_name`](explore_gene_cnv.py#L193 "_parse_gene_from_variant_name") | Gene from a `GENE_...` ID |
+| [`_parse_chrom_pos_from_variant_name`](explore_gene_cnv.py#L206 "_parse_chrom_pos_from_variant_name") | `(chrom, pos)` from a `[chr]N:pos...` ID |
+| [`_pick_variant_id_col`](explore_gene_cnv.py#L217 "_pick_variant_id_col") | First known variant-ID column present |
+| [`_sort_num_labels`](explore_gene_cnv.py#L230 "_sort_num_labels") | Clean, de-duplicate and numerically sort labels |
+| [`_region_rank_from_label`](explore_gene_cnv.py#L244 "_region_rank_from_label") | 'Exon N' -> N, 'Intron N' -> N + 0.5, else last |
+| [`_exon_rank_value`](explore_gene_cnv.py#L262 "_exon_rank_value") | Backward-compatible rank helper |
+| [`_format_region_label`](explore_gene_cnv.py#L293 "_format_region_label") | `("exon", ["2", "3"])` -> "Exon 2,3" |
+| [`_fill_variant_id`](explore_gene_cnv.py#L315 "_fill_variant_id"), `_add_chrom_norm`, `_add_variant_pos` | Add standard ID / chromosome / position columns (stage 2) |
+| [`_standardise_gtf_exons`](explore_gene_cnv.py#L365 "_standardise_gtf_exons") | Standardise GTF exon table columns |
+| [`_compute_annotation_exon_from_gtf`](explore_gene_cnv.py#L464 "_compute_annotation_exon_from_gtf") | Per-variant exon assignment (stage 1) |
+| [`_transcript_ids_in`](explore_gene_cnv.py#L620 "_transcript_ids_in") | Non-empty transcript IDs in a table |
+| [`_choose_gene_transcripts_from_diff`](explore_gene_cnv.py#L645 "_choose_gene_transcripts_from_diff") | Transcript-selection ladder (stage 5) |
+| [`_build_transcript_regions_from_gtf`](explore_gene_cnv.py#L703 "_build_transcript_regions_from_gtf") | Exon and intron intervals (stage 8) |
+| [`_select_best_region_hits`](explore_gene_cnv.py#L832 "_select_best_region_hits") | Prefer exon hits over intron hits |
+| [`_empty_region_assignment`](explore_gene_cnv.py#L851 "_empty_region_assignment"), `_lookup_transcript_regions`, `_assign_region_to_amplicon` | Amplicon region labelling (stage 9) |
+| [`_load_annotation_exon`](explore_gene_cnv.py#L950 "_load_annotation_exon"), `_standardise_annotation_table`, `_build_variant_lookup`, `_build_differential_table`, `_build_amplicon_metadata`, `_restrict_amplicons_to_genes_of_interest`, `_build_selected_transcript_regions`, `_label_differential_variant_regions`, `_order_amplicons_and_build_plot_df`, `_assign_mutation_labels_to_amplicons` | Stages 1-2, 3, 4, 6, 7, 8, 10, 11, 12 of `prepare_ploidy_region_plot_inputs` |
+| [`_gtf_attr`](explore_gene_cnv.py#L1674 "_gtf_attr") | First matching GTF/GFF attribute value |
+
+</details>
 
 ## visualization
 
 Both functions save PNG + PDF files and call `plt.show()` for each figure.
 
-### visualise_variants_by_clone(df, variants_to_plot, cytobands, output_dir, output_prefix="Single_cell_clones_Variable_AF_Germline_by_chr_arm", label_col="label", max_subplots_per_figure=25, dpi=150, save_figures=True, plot_categorical=False, split_by_cytobands=False, desired_clone_plotting_order=None, plot_separate_clones=False, verbose=True)
+<details>
+<summary><b><code>visualise_variants_by_clone</code></b> — One seaborn heatmap (cells x selected variants, AF in percent) per clone label.</summary>
+
+`visualise_variants_by_clone(df, variants_to_plot, cytobands, output_dir, output_prefix="Single_cell_clones_Variable_AF_Germline_by_chr_arm", label_col="label", max_subplots_per_figure=25, dpi=150, save_figures=True, plot_categorical=False, split_by_cytobands=False, desired_clone_plotting_order=None, plot_separate_clones=False, verbose=True)`
+
+Source: [visualization.py:169](visualization.py#L169 "visualise_variants_by_clone")
 
 One seaborn heatmap (cells x selected variants, AF in percent) per clone label. Within a clone, cells are ordered by
 average-linkage hierarchical clustering (left unordered if clustering fails). Variants are sorted by chromosome (X = 23),
@@ -369,7 +432,14 @@ continuous `RdYlBu_r` 0-100, or with `plot_categorical` <= 10 dark blue, 10-90 w
 `<prefix>_by_chr_arm.png/.pdf` (or `_by_cytoband`), split into `_partN` figures above `max_subplots_per_figure`
 clones, or one figure per clone `<prefix><suffix>_<clone>.png/.pdf` with `plot_separate_clones`.
 
-### plot_integrated_cnv_baf_with_significance(df_AF, df_cnv_vars, df_ALT, df_REF, cytobands, wilcoxon_results_var, df_mut_to_amplicon, differential_variants, desired_plotting_order, output_path, chr_arms_to_plot=None, max_jitter_cells=100, plot_separate_clones=False, plot_ploidy_median=False, plot_alt_ref=True, df_cnv_all=None, ploidy_line_stat="mean", ploidy_ci_method="percentile", ploidy_ci_percentiles=(25, 75), ...)
+</details>
+
+<details>
+<summary><b><code>plot_integrated_cnv_baf_with_significance</code></b> — Writes one figure per clone in <code>desired_plotting_order</code> (labels absent from <code>df_AF</code> skipped) with stacked panels on a</summary>
+
+`plot_integrated_cnv_baf_with_significance(df_AF, df_cnv_vars, df_ALT, df_REF, cytobands, wilcoxon_results_var, df_mut_to_amplicon, differential_variants, desired_plotting_order, output_path, chr_arms_to_plot=None, max_jitter_cells=100, plot_separate_clones=False, plot_ploidy_median=False, plot_alt_ref=True, df_cnv_all=None, ploidy_line_stat="mean", ploidy_ci_method="percentile", ploidy_ci_percentiles=(25, 75), ...)`
+
+Source: [visualization.py:1077](visualization.py#L1077 "plot_integrated_cnv_baf_with_significance")
 
 Writes one figure per clone in `desired_plotting_order` (labels absent from `df_AF` skipped) with stacked panels on a
 shared variant axis. Only the per-clone mode exists: pass `plot_separate_clones=True` (the default `False` raises
@@ -397,26 +467,31 @@ shared variant axis. Only the per-clone mode exists: pass `plot_separate_clones=
 Returns `None`; returns early with a message when no variants or labels are found. `df_mut_to_amplicon` and
 `height_spacer` are accepted but unused.
 
-### Private helpers
+</details>
+
+<details>
+<summary><b>Private helpers</b> (16 entries)</summary>
 
 | Helper | Purpose |
 |---|---|
-| `_make_vprint` | Silent-unless-verbose print |
-| `_subsample_cells` | Random subsample of jitter values (global NumPy RNG) |
-| `_categorize_af` | AF % -> 0 (<= 10), 1 (10-90), 2 (>= 90) |
-| `_build_arm_lookup`, `_assign_variants_to_arms`, `_heatmap_sort_key` | Arm/cytoband assignment and sort key for the heatmaps |
-| `_save_png_and_pdf` | Save PNG and the `.png -> .pdf` copy |
-| `_extract_chr_arm_pos`, `_chr_from_arm` | Sort key and chromosome from an arm name |
-| `_summarise_values`, `_summarise_interval` | Line statistic and CI (percentile / SD / SEM) for ploidy lines |
-| `_safe_label_for_filename` | Replace spaces, `/`, `\`, `:` with `_` |
-| `_baf_to_rgb` | BAF -> colour along the white-lilac-purple-pink-white ramp |
-| `_cytoband_blocks`, `_arm_blocks` | Runs of consecutive variants sharing cytoband / arm |
-| `_add_top_chr_arm_labels`, `_add_bottom_cytoband_labels` | Arm and cytoband axis labels |
-| `_style_panel_spines`, `_draw_alt_arm_background`, `_draw_ci_band_and_caps` | Panel styling, arm shading, CI band |
-| `_build_cytoband_lookups`, `_variant_to_chr_arm`, `_band_and_type` | Cytoband validation and lookups |
-| `_build_informative_lookup` | `{(label, variant): True}` from `wilcoxon_results_var` |
-| `_ploidy_cytoband_segments`, `_merge_ploidy_segments` | Per-cytoband ploidy segments and their merging |
-| `_plot_log_count_panel` | ALT / REF log-count panel |
+| [`_make_vprint`](visualization.py#L54 "_make_vprint") | Silent-unless-verbose print |
+| [`_subsample_cells`](visualization.py#L64 "_subsample_cells") | Random subsample of jitter values (global NumPy RNG) |
+| [`_categorize_af`](visualization.py#L81 "_categorize_af") | AF % -> 0 (<= 10), 1 (10-90), 2 (>= 90) |
+| [`_build_arm_lookup`](visualization.py#L90 "_build_arm_lookup"), `_assign_variants_to_arms`, `_heatmap_sort_key` | Arm/cytoband assignment and sort key for the heatmaps |
+| [`_save_png_and_pdf`](visualization.py#L163 "_save_png_and_pdf") | Save PNG and the `.png -> .pdf` copy |
+| [`_extract_chr_arm_pos`](visualization.py#L497 "_extract_chr_arm_pos"), `_chr_from_arm` | Sort key and chromosome from an arm name |
+| [`_summarise_values`](visualization.py#L522 "_summarise_values"), `_summarise_interval` | Line statistic and CI (percentile / SD / SEM) for ploidy lines |
+| [`_safe_label_for_filename`](visualization.py#L562 "_safe_label_for_filename") | Replace spaces, `/`, `\`, `:` with `_` |
+| [`_baf_to_rgb`](visualization.py#L573 "_baf_to_rgb") | BAF -> colour along the white-lilac-purple-pink-white ramp |
+| [`_cytoband_blocks`](visualization.py#L582 "_cytoband_blocks"), `_arm_blocks` | Runs of consecutive variants sharing cytoband / arm |
+| [`_add_top_chr_arm_labels`](visualization.py#L613 "_add_top_chr_arm_labels"), `_add_bottom_cytoband_labels` | Arm and cytoband axis labels |
+| [`_style_panel_spines`](visualization.py#L679 "_style_panel_spines"), `_draw_alt_arm_background`, `_draw_ci_band_and_caps` | Panel styling, arm shading, CI band |
+| [`_build_cytoband_lookups`](visualization.py#L764 "_build_cytoband_lookups"), `_variant_to_chr_arm`, `_band_and_type` | Cytoband validation and lookups |
+| [`_build_informative_lookup`](visualization.py#L851 "_build_informative_lookup") | `{(label, variant): True}` from `wilcoxon_results_var` |
+| [`_ploidy_cytoband_segments`](visualization.py#L877 "_ploidy_cytoband_segments"), `_merge_ploidy_segments` | Per-cytoband ploidy segments and their merging |
+| [`_plot_log_count_panel`](visualization.py#L995 "_plot_log_count_panel") | ALT / REF log-count panel |
+
+</details>
 
 ## Known quirks
 

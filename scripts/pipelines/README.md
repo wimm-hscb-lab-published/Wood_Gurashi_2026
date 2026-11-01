@@ -53,6 +53,14 @@ The schematics in each package's `docs/` folder are drawn by `docs/make_<package
 ~/miniconda3/envs/mosaic/bin/python docs/make_DNA_Utils_figures.py
 ```
 
+## Links from the READMEs to the code
+
+In each package README, every function is a collapsible block with a link to the line where it is defined (for example `cnv_extraction.py:309`). After editing the code, update those line numbers with:
+
+```bash
+~/miniconda3/envs/mosaic/bin/python docs/readme_toggles.py refresh DNA_Utils CNV_Utils LOH_Pipeline PRO_Utils
+```
+
 ## Note on allele frequencies
 
 Mosaic stores allele frequencies (the `AF` layer) in percent, 0–100. Most functions detect this and scale their thresholds; the exceptions are noted in the package READMEs (see the doublet scoring in `DNA_Utils`).

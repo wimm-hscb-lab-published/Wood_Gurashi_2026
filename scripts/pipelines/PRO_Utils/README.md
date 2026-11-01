@@ -59,7 +59,12 @@ fig = PRO_Utils.plot_protein_umap(
 
 ## update_labels
 
-### update_protein_labels_from_dataframe(Sample, anno_df, barcode_col=None, label_col='label', target_attr='label', verbose=True)
+<details>
+<summary><b><code>update_protein_labels_from_dataframe</code></b> — Writes labels from <code>anno_df</code> into <code>Sample.protein.row_attrs[target_attr]</code> (via <code>add_row_attr</code>, in place; returns</summary>
+
+`update_protein_labels_from_dataframe(Sample, anno_df, barcode_col=None, label_col='label', target_attr='label', verbose=True)`
+
+Source: [update_labels.py:17](update_labels.py#L17 "update_protein_labels_from_dataframe")
 
 Writes labels from `anno_df` into `Sample.protein.row_attrs[target_attr]` (via `add_row_attr`, in place; returns
 `None`). Cells are matched by barcode: the index of `anno_df` when `barcode_col` is `None`, otherwise that column.
@@ -72,25 +77,46 @@ Writes labels from `anno_df` into `Sample.protein.row_attrs[target_attr]` (via `
   percentages, and the resulting label distribution sorted by cell count.
 - Raises `ValueError` if `barcode_col` (when given) or `label_col` is not a column of `anno_df`.
 
+</details>
+
 ## colors
 
-### CELLTYPE_COLOR_MAP, DEFAULT_COLOR
+<details>
+<summary><b><code>CELLTYPE_COLOR_MAP / DEFAULT_COLOR</code></b> — <code>CELLTYPE_COLOR_MAP</code> maps 15 canonical cell-type names to hex colours: <code>Erythroid</code>, <code>Pro-Myeloid</code>, <code>HSC_MPP</code>,</summary>
+
+`CELLTYPE_COLOR_MAP, DEFAULT_COLOR`
+
+Source: [colors.py:12](colors.py#L12 "CELLTYPE_COLOR_MAP") · [colors.py:31](colors.py#L31 "DEFAULT_COLOR")
 
 `CELLTYPE_COLOR_MAP` maps 15 canonical cell-type names to hex colours: `Erythroid`, `Pro-Myeloid`, `HSC_MPP`,
 `Progenitor`, `CD14_monocyte`, `B`, `NK`, `Mast`, `CD16_monocyte`, `Other_T`, `CD8_T`, `CD4_T`, `Plasma`, `pDC`, `cDC`.
 `DEFAULT_COLOR = '#808080'` (grey) is returned for unknown names; note that `cDC` also uses `#808080`, so it is not
 visually distinguishable from unknown labels.
 
-### get_celltype_color(celltype_name)
+</details>
+
+<details>
+<summary><b><code>get_celltype_color</code></b> — Returns the hex colour for a cell-type name.</summary>
+
+`get_celltype_color(celltype_name)`
+
+Source: [colors.py:34](colors.py#L34 "get_celltype_color")
 
 Returns the hex colour for a cell-type name. It tries an exact key match first; otherwise it normalises both the query
 and every key (lower-case, spaces and hyphens replaced by underscores) and returns the first key that matches, in
 mapping order (so `'cd14 monocyte'` and `'pro_myeloid'` resolve). Falls back to `DEFAULT_COLOR`. The argument must be
 a string (it calls `.lower()`).
 
+</details>
+
 ## plot_umap
 
-### plot_protein_umap(Sample, celltype_column='label', outdir=None, output_filename='Protein_UMAP.png', umap_attribute='umap', point_size=5, width=800, height=1000, show_plot=True, verbose=True)
+<details>
+<summary><b><code>plot_protein_umap</code></b> — Reads UMAP coordinates with <code>Sample.protein.get_attribute(umap_attribute, constraint=&#x27;row&#x27;)</code> and labels from</summary>
+
+`plot_protein_umap(Sample, celltype_column='label', outdir=None, output_filename='Protein_UMAP.png', umap_attribute='umap', point_size=5, width=800, height=1000, show_plot=True, verbose=True)`
+
+Source: [plot_umap.py:22](plot_umap.py#L22 "plot_protein_umap")
 
 Reads UMAP coordinates with `Sample.protein.get_attribute(umap_attribute, constraint='row')` and labels from
 `Sample.protein.row_attrs[celltype_column]`, then builds a plotly figure with one `go.Scatter` trace per unique label
@@ -102,9 +128,16 @@ background is white and the legend is horizontal, centred under the plot (200 px
 - Calls `fig.show()` when `show_plot=True`; with `verbose=True` prints the label → colour mapping with cell counts.
 - Returns the `go.Figure`, or `None` (printing the error when verbose) if the coordinates or labels cannot be read.
 
+</details>
+
 ## homogeneity_silhouette
 
-### plot_protein_homogeneity_silhouette(df_PRO, *, label_col='label', scale=True, figsize=(7, 4), drop_duplicate_columns_after_str_cast=True, save_csv=False, csv_path=None, show_plot=True, verbose=True)
+<details>
+<summary><b><code>plot_protein_homogeneity_silhouette</code></b> — Measures how cleanly the protein features separate the labels, cell by cell, and summarises it per label.</summary>
+
+`plot_protein_homogeneity_silhouette(df_PRO, *, label_col='label', scale=True, figsize=(7, 4), drop_duplicate_columns_after_str_cast=True, save_csv=False, csv_path=None, show_plot=True, verbose=True)`
+
+Source: [homogeneity_silhouette.py:22](homogeneity_silhouette.py#L22 "plot_protein_homogeneity_silhouette")
 
 Measures how cleanly the protein features separate the labels, cell by cell, and summarises it per label.
 
@@ -130,12 +163,19 @@ is kept only so existing notebook code that unpacks two values keeps working. Ra
 missing and `ValueError` for fewer than 2 unique labels or `save_csv=True` without `csv_path`. Silhouette is
 O(n²) in the number of cells, so very large assays are slow.
 
+</details>
+
 ## hto_calling
 
 Each hashtag is scored independently as present/absent. This is a QC call, not demultiplexing: no cross-tag
 information is used, so doublets cannot be identified.
 
-### call_single_hashtag(counts, posterior_cutoff=0.5, uncertain_band=(0.05, 0.95), min_mean_separation=1.0, n_init=10, random_state=42)
+<details>
+<summary><b><code>call_single_hashtag</code></b> — Calls one hashtag.</summary>
+
+`call_single_hashtag(counts, posterior_cutoff=0.5, uncertain_band=(0.05, 0.95), min_mean_separation=1.0, n_init=10, random_state=42)`
+
+Source: [hto_calling.py:101](hto_calling.py#L101 "call_single_hashtag")
 
 Calls one hashtag. `counts` is a `pd.Series` of raw counts indexed by barcode; its `.name` becomes the tag name.
 Returns an `HTOResult`.
@@ -163,7 +203,14 @@ units apart, below the 1.0 minimum, so nothing is thresholded):
 
 ![HTO fit on simulated data](docs/hto_simulated_fit.png)
 
-### call_hto_present_absent(assay, hashtags, plot=True, verbose=True, **call_kwargs)
+</details>
+
+<details>
+<summary><b><code>call_hto_present_absent</code></b> — Runs <code>call_single_hashtag</code> on each tag in <code>hashtags</code> (extra keyword arguments are forwarded, e.g.</summary>
+
+`call_hto_present_absent(assay, hashtags, plot=True, verbose=True, **call_kwargs)`
+
+Source: [hto_calling.py:194](hto_calling.py#L194 "call_hto_present_absent")
 
 Runs `call_single_hashtag` on each tag in `hashtags` (extra keyword arguments are forwarded, e.g.
 `uncertain_band=None`). Counts come from `assay.get_attribute('read_counts', constraint='row+col')`; if that raises,
@@ -183,23 +230,42 @@ Returns `(adata, summary, results)`:
 With `verbose=True` prints one line per tag (bimodal flag, positive count and %, uncertain count, threshold, note);
 with `plot=True` draws `plot_hashtag_distribution` for each tag (no `plt.show()` is called).
 
-### plot_hashtag_distribution(counts, result, ax=None)
+</details>
+
+<details>
+<summary><b><code>plot_hashtag_distribution</code></b> — Histogram (100 bins, density) of <code>log1p(counts)</code> with the fitted mixture density, each weighted component (dotted) and</summary>
+
+`plot_hashtag_distribution(counts, result, ax=None)`
+
+Source: [hto_calling.py:299](hto_calling.py#L299 "plot_hashtag_distribution")
 
 Histogram (100 bins, density) of `log1p(counts)` with the fitted mixture density, each weighted component (dotted) and
 a dashed vertical line at `log1p(threshold)` when a threshold exists. Unimodal tags get `[UNIMODAL — not thresholded]`
 in the title. Creates an 8 × 5 inch figure when `ax` is `None`; returns the axes.
 
-### HTOResult
+</details>
+
+<details>
+<summary><b><code>HTOResult</code></b> — Dataclass for one tag: <code>hashtag</code>, <code>call</code> (object array of <code>&#x27;Positive&#x27;</code> / <code>&#x27;Negative&#x27;</code> / <code>&#x27;Uncertain&#x27;</code>), <code>p_pos</code>,</summary>
+
+`HTOResult`
+
+Source: [hto_calling.py:45](hto_calling.py#L45 "HTOResult")
 
 Dataclass for one tag: `hashtag`, `call` (object array of `'Positive'` / `'Negative'` / `'Uncertain'`), `p_pos`,
 `threshold` (raw count or `None`), `bimodal`, `means` (sorted log-space component means `[negative, positive]`),
 `note`, and `gmm` (the fitted 2-component `GaussianMixture`, hidden from the repr).
 
-### Private helpers
+</details>
+
+<details>
+<summary><b>Private helpers</b> (1 entries)</summary>
 
 | Name | Purpose |
 |---|---|
 | `_extract_hto_counts(assay, hashtags)` | Return raw counts for the tags as a cells × tags DataFrame copy, with the fallbacks described above; `KeyError` on missing tags. |
+
+</details>
 
 ## Known quirks
 

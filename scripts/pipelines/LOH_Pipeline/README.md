@@ -108,7 +108,12 @@ Two shared building blocks recur in every phase:
 
 ## loh_wrapper
 
-### build_config(**kwargs) -> LOHConfig
+<details>
+<summary><b><code>build_config</code></b> — Takes about 200 keyword thresholds, grouped by phase (Phase 1 detection, display, localised and SD QC; Phase 3 QC,</summary>
+
+`build_config(**kwargs) -> LOHConfig`
+
+Source: [loh_wrapper.py:187](loh_wrapper.py#L187 "build_config")
 
 Takes about 200 keyword thresholds, grouped by phase (Phase 1 detection, display, localised and SD QC; Phase 3 QC,
 directional consistency, multi-arm and nested rescue; Phase 4 merge, rescue, ADO, cross-LOH and cell merge; amplicon
@@ -125,7 +130,14 @@ and `phase6_residual_*` fields) keep their dataclass defaults. Four `build_confi
 
 All thresholds quoted in this README are the `build_config` defaults.
 
-### run(*, Sample, df, grouped_by_chr_arm, cfg, df_dp=None, chr_arms=None, run_plotting=True, ..., post_phase5_subclone_scan_labels=None, ...) -> dict
+</details>
+
+<details>
+<summary><b><code>run</code></b> — The main entry point.</summary>
+
+`run(*, Sample, df, grouped_by_chr_arm, cfg, df_dp=None, chr_arms=None, run_plotting=True, ..., post_phase5_subclone_scan_labels=None, ...) -> dict`
+
+Source: [loh_wrapper.py:750](loh_wrapper.py#L750 "run")
 
 The main entry point. Runs the phases in order on one `PipelineState` and rewrites `Sample.dna.row_attrs["Clone"]`
 in place:
@@ -156,11 +168,18 @@ Private helpers:
 | `_final_assignment_summary(state, initial_cell_ids)` | Maps every initial cell to its current label via the barcode and counts cells per category (LOH, subclonal_LOH, possible_LOH, non_LOH, ADO, small, unassigned) and label, with percentages; prints a sectioned report and warns if totals do not match |
 | `_print_state(label, state, ...)` | Per-phase progress block: active LOH cells and labels, SUB/FP clone counts |
 
+</details>
+
 ---
 
 ## loh_config
 
-### LOHConfig (dataclass)
+<details>
+<summary><b><code>LOHConfig</code></b> — Every tunable parameter, grouped by phase, with comments in the source.</summary>
+
+`LOHConfig (dataclass)`
+
+Source: [loh_config.py:256](loh_config.py#L256 "LOHConfig")
 
 Every tunable parameter, grouped by phase, with comments in the source. Key detection defaults:
 `low_allele_threshold=10`, `high_allele_threshold=90`, `min_contiguous_variants_initial=4`,
@@ -170,7 +189,14 @@ Every tunable parameter, grouped by phase, with comments in the source. Key dete
 band annotation; `informative_variants` (germline SNP list) drives the somatic-flanking rule and informative amplicon
 counts. Some fields are kept only so old configs still load (see Known quirks).
 
-### PipelineState(Sample, df, grouped_by_chr_arm, chr_arms, config, df_dp=None)
+</details>
+
+<details>
+<summary><b><code>PipelineState</code></b> — The mutable object passed between phases.</summary>
+
+`PipelineState(Sample, df, grouped_by_chr_arm, chr_arms, config, df_dp=None)`
+
+Source: [loh_config.py:747](loh_config.py#L747 "PipelineState")
 
 The mutable object passed between phases. On construction it finds the variant columns (names containing `:`),
 builds `df_numeric` (numeric AF), `df_dp_numeric` (from `df_dp` or `Sample.dna.get_attribute("DP")`, aligned by index
@@ -185,7 +211,10 @@ then calls `refresh()`.
 - Phases add `results`, `clone_block_variants` (label -> LOH block variants), `loh_cytoband_ranges`,
   `phase1_ngt_exclusions`, `nested_loh_lineages` and others as they run.
 
-### Label helpers
+</details>
+
+<details>
+<summary><b>Label helpers</b> (-2 entries)</summary>
 
 `is_small_label`, `is_fp_label`, `is_sub_label`, `is_uncertain_loh_label`, `is_loh_label`, `make_fp_label`,
 `make_sub_label`, `clone_category`, `fp_base_name`, `get_base_clone`, `extract_chr_arms` (all `chrN[pq]` tokens in a
@@ -193,7 +222,14 @@ label), `is_wt_clone(label, cfg)` (label starts with `WT`), `is_hem_like(label)`
 under Label conventions. Constants: `LOH_TAG="LOH"`, `HET_TAG="Het"`, `ADO_LABEL="ADO"`, `SMALL_LABEL="small"`,
 `FP_TAG="FP:"`, `SUB_TAG="SUB:"`.
 
-### edge_tolerant_extreme_runs(extreme_mask, max_edge_tolerance=0) -> list[dict]
+</details>
+
+<details>
+<summary><b><code>edge_tolerant_extreme_runs</code></b> — Finds contiguous runs of 1s (cores) in a boolean vector and pads each core with up to <code>max_edge_tolerance</code></summary>
+
+`edge_tolerant_extreme_runs(extreme_mask, max_edge_tolerance=0) -> list[dict]`
+
+Source: [loh_config.py:943](loh_config.py#L943 "edge_tolerant_extreme_runs")
 
 Finds contiguous runs of 1s (cores) in a boolean vector and pads each core with up to `max_edge_tolerance`
 non-extreme variants at its outer edges. An internal gap is never bridged, and a gap variant that two cores could both
@@ -202,7 +238,14 @@ passes `block_edge_tolerance` (1).
 
 ![edge_tolerant_extreme_runs on a simulated mask](docs/edge_tolerant_runs.png)
 
-### check_directional_consistency(af_block, low_thr, high_thr, min_per_var_agreement=0.85, min_block_pass_frac=0.80, min_extreme_cells_per_var=3) -> dict
+</details>
+
+<details>
+<summary><b><code>check_directional_consistency</code></b> — For each variant (column) of a cells x variants block, counts LOW and HIGH cells (mid-range values ignored).</summary>
+
+`check_directional_consistency(af_block, low_thr, high_thr, min_per_var_agreement=0.85, min_block_pass_frac=0.80, min_extreme_cells_per_var=3) -> dict`
+
+Source: [loh_config.py:1206](loh_config.py#L1206 "check_directional_consistency")
 
 For each variant (column) of a cells x variants block, counts LOW and HIGH cells (mid-range values ignored). Variants
 with at least `min_extreme_cells_per_var` extreme cells are evaluated; one passes when the majority direction holds
@@ -210,7 +253,10 @@ with at least `min_extreme_cells_per_var` extreme cells are evaluated; one passe
 variants is >= `min_block_pass_frac`. Also returns the dominant direction (LOW / HIGH / MIXED / NA) and the counts.
 The pipeline calls it with the config values: 0.95 agreement, 1.00 block pass fraction, >= 5 extreme cells.
 
-### Other helpers
+</details>
+
+<details>
+<summary><b>Other helpers</b> (7 entries)</summary>
 
 | Name | Purpose |
 |---|---|
@@ -222,11 +268,18 @@ The pipeline calls it with the config values: 0.95 agreement, 1.00 block pass fr
 | `fmt_float(x, nd=3)` | Fixed-decimal string, `"NA"` for None/NaN/Inf |
 | `build_cytoband_maps(variants_sorted, cytobands_df, target_chr)` | Variant index -> cytoband and cytoband -> variant indices for one arm; `(None, None)` when nothing maps |
 
+</details>
+
 ---
 
 ## detect_loh
 
-### detect_loh_and_update_clones(Sample, df, grouped_by_chr_arm, target_chr, low_allele_threshold=10, high_allele_threshold=90, min_segment_length=4, min_extreme_fraction=0.80, min_shared_variants=4, min_cluster_size=5, min_final_clone_size=5, correlation_threshold=0.60, restore_from_backup=None, skip_homogeneity_check=False, min_homogeneity_fraction=0.70, skip_size_filtering=False, cytobands_df=None, keep_incoherent_clusters=False, verbose=True, clone_reference_labels=None)
+<details>
+<summary><b><code>detect_loh_and_update_clones</code></b> — The per-arm detector.</summary>
+
+`detect_loh_and_update_clones(Sample, df, grouped_by_chr_arm, target_chr, low_allele_threshold=10, high_allele_threshold=90, min_segment_length=4, min_extreme_fraction=0.80, min_shared_variants=4, min_cluster_size=5, min_final_clone_size=5, correlation_threshold=0.60, restore_from_backup=None, skip_homogeneity_check=False, min_homogeneity_fraction=0.70, skip_size_filtering=False, cytobands_df=None, keep_incoherent_clusters=False, verbose=True, clone_reference_labels=None)`
+
+Source: [detect_loh.py:1216](detect_loh.py#L1216 "detect_loh_and_update_clones")
 
 The per-arm detector. Phase 1 calls it once per arm, and Phase 6 calls it on residual parent cells. It finds cells
 with contiguous extreme-AF runs on `target_chr`, groups them by shared direction-consistent extreme variants, merges
@@ -277,26 +330,47 @@ Private helpers:
 | `_homogeneity_check`, `_score_final_clones`, `_cells_with_final_label`, `_strip_removed_clones`, `_homogeneity_record` | Step 9 |
 | `_empty_result`, `_make_vprint`, `_print_configuration`, `_extract_pos`, `_get_base_clone`, `_loh_clone_label` | Small utilities |
 
+</details>
+
 ---
 
 ## phase0_setup
 
-### run_phase0(Sample, df, grouped_by_chr_arm, chr_arms, cfg, df_dp=None) -> PipelineState | None
+<details>
+<summary><b><code>run_phase0</code></b> — Uses all arms of <code>grouped_by_chr_arm</code> when <code>chr_arms</code> is None and sorts them naturally, runs</summary>
+
+`run_phase0(Sample, df, grouped_by_chr_arm, chr_arms, cfg, df_dp=None) -> PipelineState | None`
+
+Source: [phase0_setup.py:100](phase0_setup.py#L100 "run_phase0")
 
 Uses all arms of `grouped_by_chr_arm` when `chr_arms` is None and sorts them naturally, runs
 `precheck_variant_availability`, and builds a `PipelineState` over the available arms. Returns None when no arm is
 available or `df` has no variant columns.
 
-### precheck_variant_availability(grouped_by_chr_arm, df, chr_arms, cfg) -> (available, skipped)
+</details>
+
+<details>
+<summary><b><code>precheck_variant_availability</code></b> — Counts each arm&#x27;s variants that are columns of <code>df</code> and skips arms with fewer than <code>min_contiguous_variants_initial</code></summary>
+
+`precheck_variant_availability(grouped_by_chr_arm, df, chr_arms, cfg) -> (available, skipped)`
+
+Source: [phase0_setup.py:28](phase0_setup.py#L28 "precheck_variant_availability")
 
 Counts each arm's variants that are columns of `df` and skips arms with fewer than `min_contiguous_variants_initial`
 (4), logging the reason.
+
+</details>
 
 ---
 
 ## phase1
 
-### run_phase1(state, detect_loh_fn) -> dict
+<details>
+<summary><b><code>run_phase1</code></b> — Runs <code>detect_loh_fn</code> (normally <code>detect_loh_and_update_clones</code>) on every arm, then applies strict Phase-1 QC to the new</summary>
+
+`run_phase1(state, detect_loh_fn) -> dict`
+
+Source: [phase1.py:472](phase1.py#L472 "run_phase1")
 
 Runs `detect_loh_fn` (normally `detect_loh_and_update_clones`) on every arm, then applies strict Phase-1 QC to the new
 `<base> LOH-C<n> <arm>` labels. Returns `{arm: (df_segments, df_loh, df_corr, df_homog)}` for the arms that still carry
@@ -349,11 +423,18 @@ Private helpers:
 | `_print_phase1_summary` | Per-arm status table |
 | `_build_variant_to_amplicon`, `_variant_pos` | Variant -> amplicon map; position parser |
 
+</details>
+
 ---
 
 ## phase3
 
-### run_phase3(state, cfg=None) -> dict
+<details>
+<summary><b><code>run_phase3</code></b> — QC of the active LOH clones left by Phase 1.</summary>
+
+`run_phase3(state, cfg=None) -> dict`
+
+Source: [phase3.py:2169](phase3.py#L2169 "run_phase3")
 
 QC of the active LOH clones left by Phase 1. Rewrites labels in place, updates `state.clone_block_variants`, prints a
 summary of active LOH, SUB and FP clones, and returns `state.results`. With `skip_homogeneity_check=True` only the
@@ -398,11 +479,18 @@ Private helpers:
 | `_automatic_nested_candidates`, `_nested_child_block_for_arm`, `_nested_profile_metrics`, `_nested_profile_passes`, `_nested_arm_variants`, `_fp_parent_label_info`, `_active_loh_label_info` | Nested rescue |
 | `_loh_clone_map`, `_loh_arm_variants`, `_loh_block_variants`, `_variant_to_amplicon_map`, `_next_loh_clone_number`, `_directional_summary` | Lookups and log text |
 
+</details>
+
 ---
 
 ## phase4
 
-### run_phase4(state, cfg=None) -> dict
+<details>
+<summary><b><code>run_phase4</code></b> — Reconciles LOH clones with same-base non-LOH clones, flags ADO cells, and reassigns cells.</summary>
+
+`run_phase4(state, cfg=None) -> dict`
+
+Source: [phase4.py:2838](phase4.py#L2838 "run_phase4")
 
 Reconciles LOH clones with same-base non-LOH clones, flags ADO cells, and reassigns cells. Mutates labels,
 `state.df` / `state.df_numeric` (ADO cells removed), `state.clone_block_variants` and `state.results`, and returns
@@ -457,11 +545,18 @@ Private helpers:
 | `_direction`, `_directions_compatible`, `_profile_extreme_fraction`, `_safe_similarity_corr` | Profile comparisons (constant profiles count as r = 1 when |d| is small) |
 | `_build_variant_to_amplicon`, `_variant_pos`, `_is_active_loh`, `_is_active_non_loh` | Lookups |
 
+</details>
+
 ---
 
 ## phase5
 
-### run_phase5(state, cfg=None, *, loh_min_cells=None, heading="PHASE 5: LOH CLONE SUMMARY") -> DataFrame
+<details>
+<summary><b><code>run_phase5</code></b> — Final cleanup and summary.</summary>
+
+`run_phase5(state, cfg=None, *, loh_min_cells=None, heading="PHASE 5: LOH CLONE SUMMARY") -> DataFrame`
+
+Source: [phase5.py:945](phase5.py#L945 "run_phase5")
 
 Final cleanup and summary. Returns one row per non-empty clone (largest first, 28 columns: flags, LOH arms, best LOH
 block per arm, confidence tier, ADO plausibility fields) and stores it in `state.results["phase5_summary"]`. Phase 6
@@ -499,11 +594,18 @@ Private helpers:
 | `_loh_confidence_from_min_amplicons` | <= 3 low, 4 mid, >= 5 high |
 | `_is_active_loh`, `_is_active_non_loh`, `_is_subclonal_loh`, `_yes_flags` | Predicates and table formatting |
 
+</details>
+
 ---
 
 ## phase6_subclone_scan
 
-### run_post_phase5_subclone_scan(*, state, clone_labels, chr_arms=None, min_parent_cells=None, rerun_phase5_summary=True, merge_back_after_scan=True, auto_exclude_labels=None, auto_include_wt=False, verbose=True) -> dict
+<details>
+<summary><b><code>run_post_phase5_subclone_scan</code></b> — Rescans selected final non-LOH parent clones for nested LOH children that were masked inside a large parent.</summary>
+
+`run_post_phase5_subclone_scan(*, state, clone_labels, chr_arms=None, min_parent_cells=None, rerun_phase5_summary=True, merge_back_after_scan=True, auto_exclude_labels=None, auto_include_wt=False, verbose=True) -> dict`
+
+Source: [phase6_subclone_scan.py:1397](phase6_subclone_scan.py#L1397 "run_post_phase5_subclone_scan")
 
 Rescans selected final non-LOH parent clones for nested LOH children that were masked inside a large parent. Usually
 called from `run` (Phase 6). Existing LOH, SUB, FP, small and ADO labels are never reopened. Modifies `Clone` and the
@@ -551,13 +653,20 @@ Private helpers:
 | `_sample_row_attr_array`, `_write_sample_row_attr`, `_append_semicolon_token`, `_remove_arm_token`, `_skipped_parent_audit_row` | Row-attribute and label edits |
 | `_sample_idx_for_cell`, `_cells_with_label`, `_min_child_size`, `_to_float_array`, `_clone_label_series`, `_variant_position`, `_variant_to_amplicon`, `_contiguous_runs_from_mask`, `_contiguous_true_runs` | Utilities |
 
+</details>
+
 ---
 
 ## ado_probability
 
 Not part of the default Phase-5 QC any more; `score_ado_combination` is used by Phase 4f.
 
-### score_ado_combination(*, block_amplicons, amplicon_ado_rates, original_clone_size, observed_subclone_size, required_amplicons=None, rate_col="smooth_ado_any_rate", amplicon_col="amplicon_id", default_amplicon_ado_rate=0.01, pvalue_threshold=0.05) -> dict
+<details>
+<summary><b><code>score_ado_combination</code></b> — Asks whether an LOH block of <code>observed_subclone_size</code> cells in a lineage of <code>original_clone_size</code> could be chance</summary>
+
+`score_ado_combination(*, block_amplicons, amplicon_ado_rates, original_clone_size, observed_subclone_size, required_amplicons=None, rate_col="smooth_ado_any_rate", amplicon_col="amplicon_id", default_amplicon_ado_rate=0.01, pvalue_threshold=0.05) -> dict`
+
+Source: [ado_probability.py:222](ado_probability.py#L222 "score_ado_combination")
 
 Asks whether an LOH block of `observed_subclone_size` cells in a lineage of `original_clone_size` could be chance
 allelic dropout. The single-cell probability is the product of the block amplicons' ADO rates (missing rates use the
@@ -569,11 +678,18 @@ Other functions: `normalise_amplicon_ado_rates` (dict / Series / DataFrame -> `{
 converted, clipped to [0, 1]), `poisson_binomial_tail_at_least(probs, k)` (exact DP), `binomial_tail_at_least(n, k, p)`
 (SciPy or exact sum). Private: `_variant_pos`.
 
+</details>
+
 ---
 
 ## plot_loh_clones
 
-### plot_loh_clones(state, *, cfg=None, informative_variants=None, cytobands=None, output_dir=None, output_prefix="LOH_clones_AF", include_non_loh=False, include_possible_loh=True, plot_separate_clones=True, split_by_cytobands=False, save_figures=True, save_pdf=None, visualise_fn=None, verbose=None)
+<details>
+<summary><b><code>plot_loh_clones</code></b> — Builds a plotting DataFrame from <code>state.df</code> with a <code>label</code> column from <code>state.clone_to_cells</code>: active LOH clones, plus</summary>
+
+`plot_loh_clones(state, *, cfg=None, informative_variants=None, cytobands=None, output_dir=None, output_prefix="LOH_clones_AF", include_non_loh=False, include_possible_loh=True, plot_separate_clones=True, split_by_cytobands=False, save_figures=True, save_pdf=None, visualise_fn=None, verbose=None)`
+
+Source: [plot_loh_clones.py:34](plot_loh_clones.py#L34 "plot_loh_clones")
 
 Builds a plotting DataFrame from `state.df` with a `label` column from `state.clone_to_cells`: active LOH clones, plus
 SUB and FP clones (`include_possible_loh`), plus non-LOH clones with >= 5 cells if `include_non_loh`. `small` is never
@@ -582,6 +698,8 @@ plotted. Clones are ordered LOH, SUB, FP, non-LOH (each by size) and passed to `
 open matplotlib figure is also saved as PDF (`save_pdf` defaults to `cfg.save_pdf`). Returns the plotted DataFrame
 (this is `out["df_plot_all"]`), or None if nothing qualifies. Raises `ValueError` without informative variants or
 `output_dir`. Private: `_labels_in_category`.
+
+</details>
 
 ---
 

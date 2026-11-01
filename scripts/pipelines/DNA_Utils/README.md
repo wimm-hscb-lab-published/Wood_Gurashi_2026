@@ -117,33 +117,94 @@ Two failure modes result: torn lines from concurrent appends (`ParserError: Expe
 `Position` formatting (`'148386525.0'` vs `'148386525'`) that later makes `int()` fail. The cache can be re-pulled from
 the API, so dropping rows costs API calls, not information.
 
-### extract_chr_num(variant)
+<details>
+<summary><b><code>extract_chr_num</code></b> — Sortable chromosome number from an ID: <code>chrX</code> 23, <code>chrY</code> 24, <code>chrM</code>/<code>chrMT</code> 25, otherwise <code>int(token[3:])</code>, or 999 if</summary>
+
+`extract_chr_num(variant)`
+
+Source: [utils.py:64](utils.py#L64 "extract_chr_num")
+
 Sortable chromosome number from an ID: `chrX` 23, `chrY` 24, `chrM`/`chrMT` 25, otherwise `int(token[3:])`, or 999 if
 that is not an integer (used as a sort key, e.g. `sorted(v, key=DNA_Utils.extract_chr_num)`).
 
-### extract_chr(col) / extract_position(variant)
+</details>
+
+<details>
+<summary><b><code>extract_chr / extract_position</code></b> — Text before the first <code>:</code> (e.g.</summary>
+
+`extract_chr(col) / extract_position(variant)`
+
+Source: [utils.py:94](utils.py#L94 "extract_chr") · [utils.py:110](utils.py#L110 "extract_position")
+
 Text before the first `:` (e.g. `'chr17'`), and the integer second `:` field (-1 if missing or non-integer).
 
-### chrom_key(s)
+</details>
+
+<details>
+<summary><b><code>chrom_key</code></b> — Maps a Series of chromosome labels to sortable ints: strips lowercase <code>chr</code>, upper-cases, 1-22, X 23, Y 24, MT/M 25;</summary>
+
+`chrom_key(s)`
+
+Source: [utils.py:133](utils.py#L133 "chrom_key")
+
 Maps a Series of chromosome labels to sortable ints: strips lowercase `chr`, upper-cases, 1-22, X 23, Y 24, MT/M 25;
 other contigs get 1,000,000 + their order of first appearance.
 
-### sanitize_row_attrs(assay) / drop_scalar_row_attrs(assay)
+</details>
+
+<details>
+<summary><b><code>sanitize_row_attrs / drop_scalar_row_attrs</code></b> — Delete, in place, <code>row_attrs</code> that break Mosaic slicing: 0-D entries and 1-D entries of the wrong length (<code>sanitize</code>),</summary>
+
+`sanitize_row_attrs(assay) / drop_scalar_row_attrs(assay)`
+
+Source: [utils.py:168](utils.py#L168 "sanitize_row_attrs") · [utils.py:187](utils.py#L187 "drop_scalar_row_attrs")
+
 Delete, in place, `row_attrs` that break Mosaic slicing: 0-D entries and 1-D entries of the wrong length (`sanitize`),
 or only 0-D entries (`drop_scalar`; no-op for `None`).
 
-### VARSOME_DB_COLUMNS, VARSOME_N_FIELDS, VARSOME_VALID_GENOMES
+</details>
+
+<details>
+<summary><b><code>VARSOME_DB_COLUMNS / VARSOME_N_FIELDS / VARSOME_VALID_GENOMES</code></b> — The exact 18-column cache header, its length (18), and the accepted genome tags (<code>hg19, hg38, hg37, GRCh37, GRCh38</code>).</summary>
+
+`VARSOME_DB_COLUMNS, VARSOME_N_FIELDS, VARSOME_VALID_GENOMES`
+
+Source: [utils.py:206](utils.py#L206 "VARSOME_DB_COLUMNS") · [utils.py:228](utils.py#L228 "VARSOME_N_FIELDS") · [utils.py:235](utils.py#L235 "VARSOME_VALID_GENOMES")
+
 The exact 18-column cache header, its length (18), and the accepted genome tags (`hg19, hg38, hg37, GRCh37, GRCh38`).
 Importing the module raises `csv.field_size_limit` to 2^31 - 1.
 
-### varsome_db_path()
+</details>
+
+<details>
+<summary><b><code>varsome_db_path</code></b> — Returns the cache path from <code>missionbio.annotation.varsome.Varsome().db_path</code> (<code>AttributeError</code> if absent).</summary>
+
+`varsome_db_path()`
+
+Source: [utils.py:244](utils.py#L244 "varsome_db_path")
+
 Returns the cache path from `missionbio.annotation.varsome.Varsome().db_path` (`AttributeError` if absent).
 
-### varsome_db_lock(path=None, *, timeout=600.0, poll=0.5, verbose=False)
+</details>
+
+<details>
+<summary><b><code>varsome_db_lock</code></b> — Context manager: exclusive <code>fcntl.flock</code> on <code>&lt;cache&gt;.lock</code>, polling every 0.5 s for up to 600 s, then <code>TimeoutError</code>.</summary>
+
+`varsome_db_lock(path=None, *, timeout=600.0, poll=0.5, verbose=False)`
+
+Source: [utils.py:275](utils.py#L275 "varsome_db_lock")
+
 Context manager: exclusive `fcntl.flock` on `<cache>.lock`, polling every 0.5 s for up to 600 s, then `TimeoutError`.
 Yields the cache path. It only protects the cache when every annotating process uses it.
 
-### repair_varsome_db(path=None, *, backup=True, dry_run=False, dedupe=True, normalize_positions=True, verbose=True)
+</details>
+
+<details>
+<summary><b><code>repair_varsome_db</code></b> — header, has a valid genome tag and a variant ID containing <code>:</code> and <code>/</code>.</summary>
+
+`repair_varsome_db(path=None, *, backup=True, dry_run=False, dedupe=True, normalize_positions=True, verbose=True)`
+
+Source: [utils.py:432](utils.py#L432 "repair_varsome_db")
 
 ![Varsome cache repair](docs/varsome_repair.png)
 
@@ -163,12 +224,28 @@ Yields the cache path. It only protects the cache when every annotating process 
 Returns `{path, backup, n_before, n_kept, n_dropped, n_deduped, n_positions_fixed, reasons}`;
 `FileNotFoundError` if the cache does not exist.
 
-### annotate_with_repair(assay, *, max_attempts=2, lock=True, repair_on_parse_error=True, verbose=True)
+</details>
+
+<details>
+<summary><b><code>annotate_with_repair</code></b> — Calls <code>assay.get_annotations()</code> (inside <code>varsome_db_lock</code> when <code>lock</code>).</summary>
+
+`annotate_with_repair(assay, *, max_attempts=2, lock=True, repair_on_parse_error=True, verbose=True)`
+
+Source: [utils.py:628](utils.py#L628 "annotate_with_repair")
+
 Calls `assay.get_annotations()` (inside `varsome_db_lock` when `lock`). On a `ParserError`, or a `ValueError` whose
 message contains `invalid literal for int()` and a `.`, it runs `repair_varsome_db()` on the default cache (outside the
 lock) and retries, up to `max_attempts` calls in total. Other errors, and the cache error on the last attempt, propagate.
 
-### annotate_assay_in_chunks(assay, *, chunk_size=1000, max_retries=3, backoff_sec=5.0, add_col_attrs=True, id_key="id", use_cache_lock=True, repair_on_parse_error=True, verbose=True)
+</details>
+
+<details>
+<summary><b><code>annotate_assay_in_chunks</code></b> — Splits the variants into chunks of 1000 and annotates each with <code>annotate_with_repair</code>, up to 3 tries per chunk with a</summary>
+
+`annotate_assay_in_chunks(assay, *, chunk_size=1000, max_retries=3, backoff_sec=5.0, add_col_attrs=True, id_key="id", use_cache_lock=True, repair_on_parse_error=True, verbose=True)`
+
+Source: [utils.py:696](utils.py#L696 "annotate_assay_in_chunks")
+
 Splits the variants into chunks of 1000 and annotates each with `annotate_with_repair`, up to 3 tries per chunk with a
 `5 s x attempt` sleep between tries. A chunk that fails all tries is recorded as `(start, stop, repr(error))` instead
 of raising. If a chunk result has the right length but different ids, its index is re-keyed to the chunk ids by
@@ -176,23 +253,55 @@ position. Results are concatenated, duplicate ids dropped (first kept), reindexe
 unannotated variants) and, with `add_col_attrs`, every annotation column is written back as a `col_attr`. Returns
 `(merged, failed)`; `RuntimeError` if every chunk failed.
 
-### subset_assay_to_cells(assay, barcodes, *, preserve_assay_order=True, require_any=True, verbose=True)
+</details>
+
+<details>
+<summary><b><code>subset_assay_to_cells</code></b> — Takes an iterable of barcodes (or anything with <code>.index</code>), string-matches it to the assay, sanitises the input assay&#x27;s</summary>
+
+`subset_assay_to_cells(assay, barcodes, *, preserve_assay_order=True, require_any=True, verbose=True)`
+
+Source: [utils.py:824](utils.py#L824 "subset_assay_to_cells")
+
 Takes an iterable of barcodes (or anything with `.index`), string-matches it to the assay, sanitises the input assay's
 `row_attrs` and returns `copy.copy(assay)[barcodes, :]`. Prints matched / missing counts; `ValueError` if nothing
 overlaps and `require_any`.
 
-### variant_metadata_frame(assay, *, annotations=None, id_key="id", include_subset_stats=True, include_af_dp_stats=False, ngt_layer="NGT", sort_genomic=False, verbose=True)
+</details>
+
+<details>
+<summary><b><code>variant_metadata_frame</code></b> — One row per variant: every 1-D variant-length <code>col_attr</code>, parsed <code>chrom</code> / <code>position</code>, optional external annotations</summary>
+
+`variant_metadata_frame(assay, *, annotations=None, id_key="id", include_subset_stats=True, include_af_dp_stats=False, ngt_layer="NGT", sort_genomic=False, verbose=True)`
+
+Source: [utils.py:903](utils.py#L903 "variant_metadata_frame")
+
 One row per variant: every 1-D variant-length `col_attr`, parsed `chrom` / `position`, optional external annotations
 (clashing names get `_annot`), and NGT summaries over the assay's cells (`n_WT/HET/HOM/missing`, `genotype_rate`,
 `mutated_cell_frac` = (HET+HOM)/genotyped, `vaf_by_cell_count` = 100 (HET + 2 HOM) / (2 genotyped)); optionally mean AF /
 DP over genotyped cells, and a genomic sort.
 
-### export_assay_layers(assay, out_dir, *, layers=None, suffix="", label_key="label", parquet=False, formats=None, downcast=True, size_warn_gb=2.0, verbose=True)
+</details>
+
+<details>
+<summary><b><code>export_assay_layers</code></b> — Writes one cells x variants file per layer (<code>&lt;layer&gt;&lt;suffix&gt;.&lt;fmt&gt;</code>) with a leading <code>label</code> column (from</summary>
+
+`export_assay_layers(assay, out_dir, *, layers=None, suffix="", label_key="label", parquet=False, formats=None, downcast=True, size_warn_gb=2.0, verbose=True)`
+
+Source: [utils.py:1068](utils.py#L1068 "export_assay_layers")
+
 Writes one cells x variants file per layer (`<layer><suffix>.<fmt>`) with a leading `label` column (from
 `get_labels()`, else `'NA'`). Downcasts NGT to int8 and float layers to float32; warns above an estimated 2 GB CSV.
 Returns `{layer: path}` (or `{layer: {fmt: path}}` for several formats).
 
-### export_cell_subset_matrices(assay, barcodes, out_dir, *, annotate=False, annot_chunk_size=1000, layers=("NGT", "AF"), suffix="_all_variants", metadata_formats=("csv",), ...)
+</details>
+
+<details>
+<summary><b><code>export_cell_subset_matrices</code></b> — Orchestrator: optionally annotates the full assay with <code>annotate_assay_in_chunks</code>, subsets it to <code>barcodes</code>, exports the</summary>
+
+`export_cell_subset_matrices(assay, barcodes, out_dir, *, annotate=False, annot_chunk_size=1000, layers=("NGT", "AF"), suffix="_all_variants", metadata_formats=("csv",), ...)`
+
+Source: [utils.py:1191](utils.py#L1191 "export_cell_subset_matrices")
+
 Orchestrator: optionally annotates the full assay with `annotate_assay_in_chunks`, subsets it to `barcodes`, exports the
 layers and writes `variant_metadata<suffix>.<fmt>` from `variant_metadata_frame`. Returns
 `{assay, annotations, annot_failed, metadata, paths}`.
@@ -206,13 +315,20 @@ Private helpers:
 | `_varsome_normalize_position` | Rewrite `Position` to a bare integer string in place |
 | `_is_varsome_cache_dtype_error` | True only for the `invalid literal for int()` + `.` `ValueError` |
 
+</details>
+
 ---
 
 ## qc_filters
 
 Cell-level QC on per-cell AF matrices, either a DataFrame `[label] + variant columns` or a Mosaic Sample / dna assay.
 
-### flag_doublet_change_cells(df, label_col="label", af_change_cut=0.30, min_variant_af=0.10, max_variant_af=0.90, z_k=3.5, min_informative=30, return_scores=True, min_gain_frac=0.01, min_loss_frac=0.01, cross_donor_refs=None, donor_name=None, disc_af_diff=0.20, min_disc_variants=5)
+<details>
+<summary><b><code>flag_doublet_change_cells</code></b> — Scores the cells of one donor for doublet-like AF profiles. <b>No AF rescaling is done</b>: every cut-off is used on the</summary>
+
+`flag_doublet_change_cells(df, label_col="label", af_change_cut=0.30, min_variant_af=0.10, max_variant_af=0.90, z_k=3.5, min_informative=30, return_scores=True, min_gain_frac=0.01, min_loss_frac=0.01, cross_donor_refs=None, donor_name=None, disc_af_diff=0.20, min_disc_variants=5)`
+
+Source: [qc_filters.py:90](qc_filters.py#L90 "flag_doublet_change_cells")
 
 Scores the cells of one donor for doublet-like AF profiles. **No AF rescaling is done**: every cut-off is used on the
 scale of the input. `define_doublet_cutoff_per_donor` passes Mosaic AF (percent), so the 0-1 style defaults act as
@@ -239,13 +355,28 @@ percentage points.
 Returns `fail` or `(fail, qc)` with `qc` = `frac_changed, frac_gain, frac_loss, frac_changed_bidir, af_dilution,
 change_score, threshold, fail_bidir, n_disc_variants` (number of active variants) and `used_discriminating`.
 
-### piecewise_elbow_threshold(values, min_frac=0.02, max_frac=0.40, slope_ratio_min=3.0)
+</details>
+
+<details>
+<summary><b><code>piecewise_elbow_threshold</code></b> — Sorts the finite values high -&gt; low and, for every split k in <code>[max(5, int(min_frac n)), min(n - 5, int(max_frac n))]</code>,</summary>
+
+`piecewise_elbow_threshold(values, min_frac=0.02, max_frac=0.40, slope_ratio_min=3.0)`
+
+Source: [qc_filters.py:270](qc_filters.py#L270 "piecewise_elbow_threshold")
+
 Sorts the finite values high -> low and, for every split k in `[max(5, int(min_frac n)), min(n - 5, int(max_frac n))]`,
 fits one line to the first k points and one to the rest. Among splits where both slopes are negative and
 `|m1| / |m2| >= slope_ratio_min`, the lowest total squared error wins; if none qualifies, the lowest-SSE split overall.
 Returns `(y_sorted[k], k, info)`, or `(nan, -1, {})` with fewer than 20 finite values or an empty split range.
 
-### define_doublet_cutoff_per_donor(sample_qc, label_key="label", exclude_labels=("Mixed", "Low_quality"), min_frac=0.01, max_frac=0.55, slope_ratio_min=3.0, n_boot=200, ci=0.95, near_ci_mult=1.0, plot=True, figsize=(5.0, 2.6), plot_tiny_heatmap=False, heatmap_max_cells=250, use_bidirectional=True, min_gain_frac=0.01, min_loss_frac=0.01, disc_af_diff=0.20, min_disc_variants=5)
+</details>
+
+<details>
+<summary><b><code>define_doublet_cutoff_per_donor</code></b> — Per-donor doublet threshold on a Mosaic Sample.</summary>
+
+`define_doublet_cutoff_per_donor(sample_qc, label_key="label", exclude_labels=("Mixed", "Low_quality"), min_frac=0.01, max_frac=0.55, slope_ratio_min=3.0, n_boot=200, ci=0.95, near_ci_mult=1.0, plot=True, figsize=(5.0, 2.6), plot_tiny_heatmap=False, heatmap_max_cells=250, use_bidirectional=True, min_gain_frac=0.01, min_loss_frac=0.01, disc_af_diff=0.20, min_disc_variants=5)`
+
+Source: [qc_filters.py:431](qc_filters.py#L431 "define_doublet_cutoff_per_donor")
 
 Per-donor doublet threshold on a Mosaic Sample.
 
@@ -272,7 +403,15 @@ threshold, CI, `fail`, `borderline`, `class_label` and bootstrap thresholds. Bec
 the metric mostly counts small two-sided AF deviations from the donor median; cells with heavy allele dropout also
 score high (see Known quirks).
 
-### apply_doublet_calls_with_corr_reassign(sample_qc, donor_calls, donors=None, label_key="label", band=0.02, min_shared=40, delta_corr=0.00, mixed_label="Mixed", write_back=True)
+</details>
+
+<details>
+<summary><b><code>apply_doublet_calls_with_corr_reassign</code></b> — Final doublet calls from <code>donor_calls</code> (right panel of the figure above).</summary>
+
+`apply_doublet_calls_with_corr_reassign(sample_qc, donor_calls, donors=None, label_key="label", band=0.02, min_shared=40, delta_corr=0.00, mixed_label="Mixed", write_back=True)`
+
+Source: [qc_filters.py:714](qc_filters.py#L714 "apply_doublet_calls_with_corr_reassign")
+
 Final doublet calls from `donor_calls` (right panel of the figure above). Per donor: metric >= thr + 0.02 ->
 `HighChange` (doublet); metric < thr - 0.02 -> `LowChange` (kept); cells in between are correlated (Pearson, >= 40
 shared finite variants) with the donor's median profile and with the median profile of all `Mixed` cells. They become
@@ -283,7 +422,15 @@ sample_subsets)`: per-donor tables (metric, group, `fail_final`, correlations), 
 sub-assays. With `write_back`, the **sub-assays** get `label_original`, `label` (doublets -> `Mixed`) and
 `doublet_group`; `sample_qc` itself is not modified.
 
-### flag_amplicon_loss_cells(df, label_col="label", informative_range=(0.10, 0.90), stability_quantile=0.35, min_stable_loci=25, fallback_quantile=0.50, min_shared_corr=20, score_weights=(1.0, 1.0, 0.7), k_mad=5.0, q=0.995, min_cells=20, return_scores=True)
+</details>
+
+<details>
+<summary><b><code>flag_amplicon_loss_cells</code></b> — Flags noisy / amplicon-loss cells by their deviation from the donor consensus at germline-stable loci.</summary>
+
+`flag_amplicon_loss_cells(df, label_col="label", informative_range=(0.10, 0.90), stability_quantile=0.35, min_stable_loci=25, fallback_quantile=0.50, min_shared_corr=20, score_weights=(1.0, 1.0, 0.7), k_mad=5.0, q=0.995, min_cells=20, return_scores=True)`
+
+Source: [qc_filters.py:896](qc_filters.py#L896 "flag_amplicon_loss_cells")
+
 Flags noisy / amplicon-loss cells by their deviation from the donor consensus at germline-stable loci. Scale-aware: if
 the AF 99th percentile is > 1.5 the AF is divided by 100, so the ranges below are on a 0-1 scale.
 Per donor with >= 20 cells (`Mixed` and `Low_quality` skipped): consensus = per-variant median; stable loci =
@@ -295,13 +442,28 @@ flag `score >= max(median + 5 x 1.4826 x MAD, 99.5th percentile)` (or `median + 
 `q = 0.995` at most about 0.5 % of a donor's cells can be flagged. Returns `fail` and a score table
 (`noise_mad, one_minus_corr, nan_frac, composite_score, threshold, n_stable_loci`).
 
-### flag_spurious_gain_cells(df, label_col="label", silent_max=0.02, k_mad=5.0, high_floor=0.15, frac_spike_threshold=0.30, min_silent=10, return_scores=True)
+</details>
+
+<details>
+<summary><b><code>flag_spurious_gain_cells</code></b> — Flags cells with AF spikes at variants their label group should be silent at.</summary>
+
+`flag_spurious_gain_cells(df, label_col="label", silent_max=0.02, k_mad=5.0, high_floor=0.15, frac_spike_threshold=0.30, min_silent=10, return_scores=True)`
+
+Source: [qc_filters.py:1087](qc_filters.py#L1087 "flag_spurious_gain_cells")
+
 Flags cells with AF spikes at variants their label group should be silent at. AF is divided by 100 when its maximum is
 > 1.8. A variant is silent for a group when the group median AF < 0.02; a spike is AF above
 `clip(median + 5 x 1.4826 x MAD, 0.15, 1.0)`; a cell fails when >= 30 % of its silent variants spike and it has >= 10
 silent variants. Returns flags and `frac_spike_vs_silent, silent_count, flag_fail`. Not used by the notebooks.
 
-### apply_low_quality_qc(sample_qc, DNA_Utils, sample_subsets=None, IS_MULTIPLEXED=False, label_key="label", mixed_label="Mixed", lowq_label="Low_quality", k_mad=3.75, q=0.975, min_donor_cells=20, abs_global_dropout=0.50, abs_low_af_info=0.50, depth_adaptive=True, abs_floor_quantile=0.98, use_global_dropout_gate=True, use_low_af_gate=False, use_combined_gate=True, combined_quantile=0.95, min_effect_size=2, protect_localized_loh=False, loh_shift=0.35, ..., show_global_heatmap=True, show_subset_heatmaps=True, heatmap_save_dir=None)
+</details>
+
+<details>
+<summary><b><code>apply_low_quality_qc</code></b> — Relabels low-quality cells of a Sample to <code>Low_quality</code> with OR-ed gates.</summary>
+
+`apply_low_quality_qc(sample_qc, DNA_Utils, sample_subsets=None, IS_MULTIPLEXED=False, label_key="label", mixed_label="Mixed", lowq_label="Low_quality", k_mad=3.75, q=0.975, min_donor_cells=20, abs_global_dropout=0.50, abs_low_af_info=0.50, depth_adaptive=True, abs_floor_quantile=0.98, use_global_dropout_gate=True, use_low_af_gate=False, use_combined_gate=True, combined_quantile=0.95, min_effect_size=2, protect_localized_loh=False, loh_shift=0.35, ..., show_global_heatmap=True, show_subset_heatmaps=True, heatmap_save_dir=None)`
+
+Source: [qc_filters.py:2121](qc_filters.py#L2121 "apply_low_quality_qc")
 
 Relabels low-quality cells of a Sample to `Low_quality` with OR-ed gates. It detects percent AF (99th percentile
 > 1.5) and uses 1 % / 10 % / 5 % instead of 0.01 / 0.10 / 0.05 for its own AF cuts.
@@ -330,7 +492,15 @@ Relabels low-quality cells of a Sample to `Low_quality` with OR-ed gates. It det
 Returns `(summary_df, fail, scores, sample_subsets)`. The preprocessing notebooks pass `k_mad=3.5` and
 `abs_floor_quantile=0.95`, so there the gate-2 floor is `max(0.50, donor 95th pct)`.
 
-### fast_af_heatmap(sample_or_assay, label_key="label", attribute="AF", features=None, group_order=None, max_cells_per_group=2000, max_total_cells=20000, cluster_variants=True, cluster_groups=True, cluster_cells_within_group=True, sort_within_group_by=None, cmap=None, clip_percentiles=(1, 99), palette="auto", title=None, save_path=None, show=True, return_order=False, ...)
+</details>
+
+<details>
+<summary><b><code>fast_af_heatmap</code></b> — Rasterised matplotlib heatmap of an assay layer (default AF) with rows grouped by <code>label_key</code>.</summary>
+
+`fast_af_heatmap(sample_or_assay, label_key="label", attribute="AF", features=None, group_order=None, max_cells_per_group=2000, max_total_cells=20000, cluster_variants=True, cluster_groups=True, cluster_cells_within_group=True, sort_within_group_by=None, cmap=None, clip_percentiles=(1, 99), palette="auto", title=None, save_path=None, show=True, return_order=False, ...)`
+
+Source: [qc_filters.py:1669](qc_filters.py#L1669 "fast_af_heatmap")
+
 Rasterised matplotlib heatmap of an assay layer (default AF) with rows grouped by `label_key`. Columns are clustered
 (correlation, average linkage, on <= 2000 evenly spaced cells; constant columns last) unless `features` is given;
 groups are naturally sorted (or `group_order`) and optionally ordered by clustering their median profiles; each group is
@@ -340,7 +510,15 @@ thinned to `min(max_cells_per_group, max(50, max_total_cells // n_groups))` rows
 (else the Mission Bio colours). Figure size scales with cells and variants (8-18 x 8-55 in). Saves to `save_path`,
 shows, and returns the figure (or `(fig, rendered_cell_index, column_order)` with `return_order`).
 
-### palette_from_plotly_scatter(fig, label_values=None)
+</details>
+
+<details>
+<summary><b><code>palette_from_plotly_scatter</code></b> — <code>{trace name: marker colour}</code> from a Plotly scatterplot (e.g.</summary>
+
+`palette_from_plotly_scatter(fig, label_values=None)`
+
+Source: [qc_filters.py:1390](qc_filters.py#L1390 "palette_from_plotly_scatter")
+
 `{trace name: marker colour}` from a Plotly scatterplot (e.g. `sample.dna.scatterplot(colorby="label")`), to pass as
 `fast_af_heatmap(..., palette=...)`. Falls back to the Mission Bio colour cycle over `label_values`, else `{}`.
 
@@ -359,6 +537,8 @@ Private helpers:
 | `_donor_label_list`, `_mad_or_quantile_threshold`, `_binomial_se`, `_low_af_fraction` | Low-quality gate helpers |
 | `_extract_chrom`, `_localized_loh_mask` | Localized-LOH rescue rule |
 
+</details>
+
 ---
 
 ## germline
@@ -370,20 +550,41 @@ notebook flow is: `run_empirical_all_variant_germline_export` (step 1) -> `add_w
 
 ### 1. Legacy discovery and plotting
 
-#### get_real_somatic_variants(differential_variants, filtered_germline_in_samples, sample, use_consequence_if_available=True)
+<details>
+<summary><b><code>get_real_somatic_variants</code></b> — Flattens and strips the variant IDs, removes those in the germline list, keeps IDs present in</summary>
+
+`get_real_somatic_variants(differential_variants, filtered_germline_in_samples, sample, use_consequence_if_available=True)`
+
+Source: [germline.py:49](germline.py#L49 "get_real_somatic_variants")
+
 Flattens and strips the variant IDs, removes those in the germline list, keeps IDs present in
 `sample.dna.col_attrs["id"]` and drops intronic ones: `Consequence` contains "intron" when that column exists, otherwise
 `Protein` contains `p.?` or is blank. Returns a string array in input order; `KeyError` without an `id` column. Used by
 `find_somatic_variants`.
 
-#### visualize_found_germline_variants(Sample_T_subset, wd, MBio_batch, Patient_ID, variant_ids=None, variant_df=None, variant_class_col="germline_broad_class", variant_classes=None, seed_col=None, output_label=None, cytobands_path=None, save_plots=True, show_plots=True, min_variants_per_chr=2)
+</details>
+
+<details>
+<summary><b><code>visualize_found_germline_variants</code></b> — Picks variants (explicit IDs, a class / seed-column filter on an all-variant table, or every assay variant), computes</summary>
+
+`visualize_found_germline_variants(Sample_T_subset, wd, MBio_batch, Patient_ID, variant_ids=None, variant_df=None, variant_class_col="germline_broad_class", variant_classes=None, seed_col=None, output_label=None, cytobands_path=None, save_plots=True, show_plots=True, min_variants_per_chr=2)`
+
+Source: [germline.py:128](germline.py#L128 "visualize_found_germline_variants")
+
 Picks variants (explicit IDs, a class / seed-column filter on an all-variant table, or every assay variant), computes
 pseudobulk VAF (mean AF over cells) and draws a log-scale VAF histogram, a genome-wide stem plot
 (`chrov.plot_with_chroms`), per-chromosome stem plots (chromosomes with >= 2 variants) and a faceted VAF-vs-position
 scatter. Saves PNG + PDF under `{wd}/results/per_sample/{batch}/{patient}/dna_cnv/variants/germline_variants`; returns
 the per-variant table with VAF.
 
-#### find_germline_variants(Sample, keep_labels, annotation_df=None, af_min_common=25, af_max_common=75, af_min_novel=40, af_max_novel=60, max_hom_frac=0.25, max_ngt_frac=0.80, min_dp=5, min_valid_cells=20, min_call_rate_after_ngt_dp=0.20, min_het_to_hom_alt_ratio=3.0, min_het_frac_among_alt_valid=0.75, min_het_valid_cells=3, exclude_pathogenic=True, common_variant_paths=None, known_het_variants=None, blacklist_paths=None, common_requires="either", return_qc=False, verbose=True, ...)
+</details>
+
+<details>
+<summary><b><code>find_germline_variants</code></b> — The original AF-window germline filter.</summary>
+
+`find_germline_variants(Sample, keep_labels, annotation_df=None, af_min_common=25, af_max_common=75, af_min_novel=40, af_max_novel=60, max_hom_frac=0.25, max_ngt_frac=0.80, min_dp=5, min_valid_cells=20, min_call_rate_after_ngt_dp=0.20, min_het_to_hom_alt_ratio=3.0, min_het_frac_among_alt_valid=0.75, min_het_valid_cells=3, exclude_pathogenic=True, common_variant_paths=None, known_het_variants=None, blacklist_paths=None, common_requires="either", return_qc=False, verbose=True, ...)`
+
+Source: [germline.py:628](germline.py#L628 "find_germline_variants")
 
 The original AF-window germline filter. Its QC table is also the master table of the all-variant profile.
 
@@ -406,9 +607,17 @@ Returns `(filtered_germline_variants, Sample_T_subset)` or, with `return_qc`, al
 `Sample_T_subset.dna_subset` holds the passing variants (None if none) and `.germline_qc` the QC table. Default
 resource paths are hard-coded cluster paths under `/project/meadlab/shared/02__Projects/`.
 
+</details>
+
 ### 2. AF-shape validation
 
-#### validate_germline_by_af(Sample_T_subset, candidate_variants, common_variant_ids=None, known_het_ids=None, *, selection_mode="het_calls", af_band=(15.0, 95.0), min_dp_af=2, ref_min_cells=30, ref_min_total_dp=300, ref_af_lo=40.0, ref_af_hi=60.0, ref_min_n=10, min_ref_spread=3.0, k_tol=3.0, tol_cap=20.0, enable_dispersion=True, k_disp=2.5, min_eval_total_dp=100, min_eval_cells=5, keep_known_low_evidence=True, min_weak_cells=3, keep_indels=False, verbose=True)
+<details>
+<summary><b><code>validate_germline_by_af</code></b> — Checks that each candidate&#x27;s AF looks like a diploid HET.</summary>
+
+`validate_germline_by_af(Sample_T_subset, candidate_variants, common_variant_ids=None, known_het_ids=None, *, selection_mode="het_calls", af_band=(15.0, 95.0), min_dp_af=2, ref_min_cells=30, ref_min_total_dp=300, ref_af_lo=40.0, ref_af_hi=60.0, ref_min_n=10, min_ref_spread=3.0, k_tol=3.0, tol_cap=20.0, enable_dispersion=True, k_disp=2.5, min_eval_total_dp=100, min_eval_cells=5, keep_known_low_evidence=True, min_weak_cells=3, keep_indels=False, verbose=True)`
+
+Source: [germline.py:1415](germline.py#L1415 "validate_germline_by_af")
+
 Checks that each candidate's AF looks like a diploid HET. Cells: NGT == 1 and DP >= 2 (or NGT in {1, 2}, DP >= 2 and
 15 <= AF <= 95 in `af_band` mode). Per variant: depth-weighted `pooled_af = 100 sum(AF/100 x DP) / sum(DP)`,
 `se = 50 / sqrt(sum DP)`, and the robust SD of `z = 2 sqrt(DP) (AF/100 - 0.5)`. Reference: common / whitelisted SNVs
@@ -419,30 +628,70 @@ z-SD = median robust SD; else centre 50, spread 7, z-SD 1.5. Status ladder: inde
 -> `overdispersed`; else `validated`. Pass = validated (+ whitelist_low_evidence by default; + whitelisted indels with
 >= 3 cells if `keep_indels`). Returns `(passing list, per-variant profile, {n_reference, centre, spread, z_sd})`.
 
-#### review_failed_variants(prof, *, ref_z_sd, review_status=("af_skewed", "insufficient_evidence"), min_review_cells=30, consistency_mult=1.0, ref_like_below=15.0, hom_like_above=82.0, near_window=50000, verbose=True)
+</details>
+
+<details>
+<summary><b><code>review_failed_variants</code></b> — Second look at af_skewed / insufficient_evidence non-indel variants: AF zone (<code>ref_like</code> &lt; 15, <code>hom_like</code> &gt; 82, else</summary>
+
+`review_failed_variants(prof, *, ref_z_sd, review_status=("af_skewed", "insufficient_evidence"), min_review_cells=30, consistency_mult=1.0, ref_like_below=15.0, hom_like_above=82.0, near_window=50000, verbose=True)`
+
+Source: [germline.py:1712](germline.py#L1712 "review_failed_variants")
+
 Second look at af_skewed / insufficient_evidence non-indel variants: AF zone (`ref_like` < 15, `hom_like` > 82, else
 biased-HET low / high), consistency (robust SD <= reference z-SD and >= 30 cells), chrX non-PAR flag (hg19) and the
 number of other reviewed variants within 50 kb. Verdict: `review_hom_or_ref`, `inconclusive` or `likely_usable_het`.
 
-#### genotype_af_cutoffs(Sample_T_subset, *, min_dp=5, af_bin=2.0, min_bin_n=50, dp_bands=((5, 15), (15, 40), (40, inf)), evaluate_variants=None, plot=True, ax=None)
+</details>
+
+<details>
+<summary><b><code>genotype_af_cutoffs</code></b> — Pools every called (cell, variant) with DP &gt;= 5, bins by AF (2 % bins, &gt;= 50 per bin) and finds where the genotype</summary>
+
+`genotype_af_cutoffs(Sample_T_subset, *, min_dp=5, af_bin=2.0, min_bin_n=50, dp_bands=((5, 15), (15, 40), (40, inf)), evaluate_variants=None, plot=True, ax=None)`
+
+Source: [germline.py:1838](germline.py#L1838 "genotype_af_cutoffs")
+
 Pools every called (cell, variant) with DP >= 5, bins by AF (2 % bins, >= 50 per bin) and finds where the genotype
 caller switches: lower cutoff = lowest bin where HET > WT fraction, upper = highest bin where HET > HOM. Repeated per DP
 band. Optionally returns a placement table (`compute_genotype_structure`) and plots the call-fraction curves. Returns
 `(cutoffs, binned, bands, placement)`.
 
+</details>
+
 ### 3. All-variant profiling
 
-#### compute_genotype_structure(Sample_T_subset, variants, *, min_dp=5, lower=nan, upper=nan)
+<details>
+<summary><b><code>compute_genotype_structure</code></b> — Per variant over called cells with DP &gt;= 5: number of cells, WT / HET / HOM fractions, 10th / 50th / 90th percentile AF</summary>
+
+`compute_genotype_structure(Sample_T_subset, variants, *, min_dp=5, lower=nan, upper=nan)`
+
+Source: [germline.py:2070](germline.py#L2070 "compute_genotype_structure")
+
 Per variant over called cells with DP >= 5: number of cells, WT / HET / HOM fractions, 10th / 50th / 90th percentile AF
 of HET cells and the margins of that distribution to the caller cutoffs. This is the donor-genotype evidence used by the
 later steps.
 
-#### variant_level_ngt_af_dp_profile(Sample_T_subset, variants, *, min_dp=2)
+</details>
+
+<details>
+<summary><b><code>variant_level_ngt_af_dp_profile</code></b> — Descriptive per-variant table over valid cells (call, DP &gt;= 2, finite AF): WT / HET / HOM counts and fractions, DP</summary>
+
+`variant_level_ngt_af_dp_profile(Sample_T_subset, variants, *, min_dp=2)`
+
+Source: [germline.py:2169](germline.py#L2169 "variant_level_ngt_af_dp_profile")
+
 Descriptive per-variant table over valid cells (call, DP >= 2, finite AF): WT / HET / HOM counts and fractions, DP
 summaries, pooled AF and AF percentiles over all valid, HET and alt-like cells. Missing variants get
 `present_in_T_subset=False`.
 
-#### build_and_save_all_variant_germline_profile(Sample, DNA_Utils=None, *, patient_id, annotation_df, known_het_variants=None, keep_labels=("CD4_T", "CD8_T", "Other_T"), out_dir=GERMLINE_PATTERN_DIR, descriptive_min_dp=2, placement_min_dp=5, min_frac_het_for_het=0.55, max_frac_hom_for_het=0.20, max_frac_wt_for_het=0.90, min_called_cells_for_genotype=20, min_cells_for_run=50, verbose=True)
+</details>
+
+<details>
+<summary><b><code>build_and_save_all_variant_germline_profile</code></b> — One row per panel variant.</summary>
+
+`build_and_save_all_variant_germline_profile(Sample, DNA_Utils=None, *, patient_id, annotation_df, known_het_variants=None, keep_labels=("CD4_T", "CD8_T", "Other_T"), out_dir=GERMLINE_PATTERN_DIR, descriptive_min_dp=2, placement_min_dp=5, min_frac_het_for_het=0.55, max_frac_hom_for_het=0.20, max_frac_wt_for_het=0.90, min_called_cells_for_genotype=20, min_cells_for_run=50, verbose=True)`
+
+Source: [germline.py:2293](germline.py#L2293 "build_and_save_all_variant_germline_profile")
+
 One row per panel variant. Merges the `find_germline_variants(return_qc=True)` QC table with `validate_germline_by_af`
 (on all variants), `review_failed_variants`, `variant_level_ngt_af_dp_profile` (DP >= 2) and the caller placement
 (`placement_*`, DP >= 5). `donor_genotype` from the placement fractions (no data -> uncalled; < 20 cells ->
@@ -454,66 +703,154 @@ donor not het -> absent / low_coverage_review / likely_hom_alt / likely_hom_ref 
 usable = clean OR rescued. Writes `{out_dir}/{patient_id}_variants_germline_data.csv`; warns but continues when the
 subset has fewer than `min_cells_for_run` cells. Returns `(table, Sample_T_subset, meta)`.
 
-#### run_all_variant_germline_profile_export(Sample, *, experiment, patient_id, annotation_df, ...)
+</details>
+
+<details>
+<summary><b><code>run_all_variant_germline_profile_export</code></b> — Wrapper: builds a filesystem-safe <code>&lt;experiment&gt;_&lt;patient_id&gt;</code> ID, calls the builder and adds <code>germline</code>,</summary>
+
+`run_all_variant_germline_profile_export(Sample, *, experiment, patient_id, annotation_df, ...)`
+
+Source: [germline.py:2756](germline.py#L2756 "run_all_variant_germline_profile_export")
+
 Wrapper: builds a filesystem-safe `<experiment>_<patient_id>` ID, calls the builder and adds `germline`,
 `clean_germline`, `rescued_germline`, `ref` and the export ID to the metadata. `ValueError` if experiment or patient ID
 is missing. Its `min_cells_for_run` is not forwarded.
 
+</details>
+
 ### 4. WT population and concordance
 
-#### build_wt_cell_subset(Sample_for_clustering, whitelist, *, DNA_Utils=None, ms_module=None, max_ado_score=0.8, min_clone_cells=5, total_barcodes=None, drop_labels=("missing", "small", "ADO", "FP"), verbose=True)
+<details>
+<summary><b><code>build_wt_cell_subset</code></b> — Restricts a copy of the sample to the whitelist variants, runs Mosaic <code>VariantSubcloneTable</code> + <code>clones_to_dataframe</code></summary>
+
+`build_wt_cell_subset(Sample_for_clustering, whitelist, *, DNA_Utils=None, ms_module=None, max_ado_score=0.8, min_clone_cells=5, total_barcodes=None, drop_labels=("missing", "small", "ADO", "FP"), verbose=True)`
+
+Source: [germline.py:3000](germline.py#L3000 "build_wt_cell_subset")
+
 Restricts a copy of the sample to the whitelist variants, runs Mosaic `VariantSubcloneTable` + `clones_to_dataframe`
 (minimum clone size 5 cells as a percentage of all barcodes, max ADO 0.8), records barcode-level clone membership in
 `clone_df.attrs`, and removes cells labelled missing / small / ADO / FP from a full-panel copy. Returns
 `(Sample_wt, clone_df)`.
 
-#### population_structure_table(Sample_like, variants, *, label="wt", min_dp=5, min_het=0.55, max_hom=0.20, max_wt=0.90, min_cells=20)
+</details>
+
+<details>
+<summary><b><code>population_structure_table</code></b> — <code>compute_genotype_structure</code> + the donor-genotype call for any cell population, columns prefixed with <code>label</code>.</summary>
+
+`population_structure_table(Sample_like, variants, *, label="wt", min_dp=5, min_het=0.55, max_hom=0.20, max_wt=0.90, min_cells=20)`
+
+Source: [germline.py:3144](germline.py#L3144 "population_structure_table")
+
 `compute_genotype_structure` + the donor-genotype call for any cell population, columns prefixed with `label`.
 
-#### add_population_concordance(all_info, secondary_sample, *, label="wt", variants=None, min_dp=5, min_frac_het_for_het=0.55, max_frac_hom_for_het=0.20, max_frac_wt_for_het=0.90, min_called_cells_for_genotype=20, verbose=True)
+</details>
+
+<details>
+<summary><b><code>add_population_concordance</code></b> — Merges a second population&#x27;s structure into the germline table and adds <code>{label}_germline_het_seed</code> (HET in the second</summary>
+
+`add_population_concordance(all_info, secondary_sample, *, label="wt", variants=None, min_dp=5, min_frac_het_for_het=0.55, max_frac_hom_for_het=0.20, max_frac_wt_for_het=0.90, min_called_cells_for_genotype=20, verbose=True)`
+
+Source: [germline.py:3203](germline.py#L3203 "add_population_concordance")
+
 Merges a second population's structure into the germline table and adds `{label}_germline_het_seed` (HET in the second
 population) and `concordant_germline_het` (HET in both). Returns a new table.
 
+</details>
+
 ### 5. Cohort-calibrated rules
 
-#### resolve_calibration_columns(df)
+<details>
+<summary><b><code>resolve_calibration_columns</code></b> — Maps each logical feature of <code>COL_CANDIDATES</code> (e.g.</summary>
+
+`resolve_calibration_columns(df)`
+
+Source: [germline.py:3383](germline.py#L3383 "resolve_calibration_columns")
+
 Maps each logical feature of `COL_CANDIDATES` (e.g. `frac_het` -> `placement_frac_HET` or `frac_HET`) to the first
 column present in `df`.
 
-#### apply_calibrated_germline_rules(pooled, thresholds, colmap=None)
+</details>
+
+<details>
+<summary><b><code>apply_calibrated_germline_rules</code></b> — Adds calibrated seed tiers.</summary>
+
+`apply_calibrated_germline_rules(pooled, thresholds, colmap=None)`
+
+Source: [germline.py:3453](germline.py#L3453 "apply_calibrated_germline_rules")
+
 Adds calibrated seed tiers. All tiers need "allowed" (not pathogenic, not blacklisted, class not in
 `BAD_GERMLINE_CLASSES`) and donor HET. Clean: frac_HET >= 0.601, HOM <= 0.182, WT <= 0.239, HET-AF median 42.3-59.1
 (empirical defaults). Rescued: rescued seed, or af_skewed with verdict likely_usable_het, or a rescued class. Practical:
 clean OR rescued OR (usable seed AND (usable structure frac_HET >= 0.551, HOM <= 0.20, WT <= 0.43, or a clean / rescued
 seed)) OR concordant. Also writes rejection reasons. Returns a new table.
 
-#### get_empirical_cohort_germline_thresholds(include_audit_metrics=True)
+</details>
+
+<details>
+<summary><b><code>get_empirical_cohort_germline_thresholds</code></b> — Copy of <code>EMPIRICAL_COHORT_GERMLINE_THRESHOLDS</code> (clean tier 0.601 / 0.182 / 0.239 / 42.303-59.061, usable tier 0.551 /</summary>
+
+`get_empirical_cohort_germline_thresholds(include_audit_metrics=True)`
+
+Source: [germline.py:3710](germline.py#L3710 "get_empirical_cohort_germline_thresholds")
+
 Copy of `EMPIRICAL_COHORT_GERMLINE_THRESHOLDS` (clean tier 0.601 / 0.182 / 0.239 / 42.303-59.061, usable tier 0.551 /
 0.200 / 0.430, plus cohort audit metrics unless `include_audit_metrics=False`).
 
+</details>
+
 ### 6. Notebook workflow wrappers
 
-#### run_empirical_all_variant_germline_export(Sample, *, experiment, patient_id, annotation_df, known_het_variants=None, DNA_Utils=None, keep_labels=("CD4_T", "CD8_T", "Other_T", "B", "Plasma"), out_dir=GERMLINE_PATTERN_DIR, thresholds=None, descriptive_min_dp=2, placement_min_dp=5, max_frac_wt_for_het_export=0.90, verbose=True, show_head=False)
+<details>
+<summary><b><code>run_empirical_all_variant_germline_export</code></b> — Step 1: runs the all-variant export with the empirical usable thresholds (frac_HET &gt;= 0.551, HOM &lt; 0.20, WT &lt; 0.90) on</summary>
+
+`run_empirical_all_variant_germline_export(Sample, *, experiment, patient_id, annotation_df, known_het_variants=None, DNA_Utils=None, keep_labels=("CD4_T", "CD8_T", "Other_T", "B", "Plasma"), out_dir=GERMLINE_PATTERN_DIR, thresholds=None, descriptive_min_dp=2, placement_min_dp=5, max_frac_wt_for_het_export=0.90, verbose=True, show_head=False)`
+
+Source: [germline.py:3841](germline.py#L3841 "run_empirical_all_variant_germline_export")
+
 Step 1: runs the all-variant export with the empirical usable thresholds (frac_HET >= 0.551, HOM < 0.20, WT < 0.90) on
 the lymphoid labels and applies the calibrated rules. Functions found on a passed `DNA_Utils` override the module's own.
 Returns a dict with `all_variant_germline_df`, `Sample_T_subset`, `germline_profile_meta`, the `germline` / `clean_germline` /
 `rescued_germline` lists and `ref`.
 
-#### add_wt_concordance_and_finalize_germline(Sample, all_variant_germline_df, whitelist, *, DNA_Utils=None, label="wt", thresholds=None, max_ado_score=0.8, min_clone_cells=5, total_barcodes=None, max_frac_wt_for_het_export=0.90, recipe="calibrated_practical_or_confirmed", verbose=True)
+</details>
+
+<details>
+<summary><b><code>add_wt_concordance_and_finalize_germline</code></b> — Step 2: drops stale WT / seed / calibrated columns, builds the genotype-defined WT population (<code>build_wt_cell_subset</code>),</summary>
+
+`add_wt_concordance_and_finalize_germline(Sample, all_variant_germline_df, whitelist, *, DNA_Utils=None, label="wt", thresholds=None, max_ado_score=0.8, min_clone_cells=5, total_barcodes=None, max_frac_wt_for_het_export=0.90, recipe="calibrated_practical_or_confirmed", verbose=True)`
+
+Source: [germline.py:3974](germline.py#L3974 "add_wt_concordance_and_finalize_germline")
+
 Step 2: drops stale WT / seed / calibrated columns, builds the genotype-defined WT population (`build_wt_cell_subset`),
 adds WT concordance (HET >= 0.551, HOM < 0.20, WT < 0.90), re-applies the calibrated rules and sets the final
 `germline_het_seed` by `recipe`: `calibrated_practical_or_confirmed` (default), `calibrated_practical_and_confirmed` or
 `calibrated_practical_or_wt_structure`. Also returns `Sample_wt`, `clone_df`, the clone barcode table and the barcode
 -> clone labels used by the CNV audit.
 
-#### check_significant_variants_against_all_variant_germline_df(*, all_variant_germline_df, df_AF_all, df_DP_all=None, significant_variant_summary=None, sig_res=None, wt_labels=("WT",), min_wt_valid_cells=5, min_wt_dp=5, wt_het_af_lower=25, wt_het_af_upper=75, min_wt_frac_het_like=0.40, max_wt_af_iqr=35, save_outputs=True, ...)
+</details>
+
+<details>
+<summary><b><code>check_significant_variants_against_all_variant_germline_df</code></b> — For CNV/BAF-significant variants: present in the germline table? already kept by the downstream seed</summary>
+
+`check_significant_variants_against_all_variant_germline_df(*, all_variant_germline_df, df_AF_all, df_DP_all=None, significant_variant_summary=None, sig_res=None, wt_labels=("WT",), min_wt_valid_cells=5, min_wt_dp=5, wt_het_af_lower=25, wt_het_af_upper=75, min_wt_frac_het_like=0.40, max_wt_af_iqr=35, save_outputs=True, ...)`
+
+Source: [germline.py:4303](germline.py#L4303 "check_significant_variants_against_all_variant_germline_df")
+
 For CNV/BAF-significant variants: present in the germline table? already kept by the downstream seed
 (`germline_het_seed` -> `calibrated_usable_het_seed` -> `usable_germline_het_seed`)? Do WT cells support a HET (>= 5
 valid cells with DP >= 5, median AF 25-75, IQR <= 35, >= 40 % HET-like cells)? Produces `audit_real` with a
 `miss_reason` ladder and `cnv_informative_het_seed` / `_rescue` flags, the missed subset and the WT-HET-supported rescue
 subset; optionally writes three CSVs.
 
-#### apply_final_no_loss_cnv_marker_rules(all_variant_germline_df, audit_real, *, parameters=None, verbose=True)
+</details>
+
+<details>
+<summary><b><code>apply_final_no_loss_cnv_marker_rules</code></b> — Uses <code>FINAL_NO_LOSS_CNV_MARKER_PARAMETERS</code>.</summary>
+
+`apply_final_no_loss_cnv_marker_rules(all_variant_germline_df, audit_real, *, parameters=None, verbose=True)`
+
+Source: [germline.py:4714](germline.py#L4714 "apply_final_no_loss_cnv_marker_rules")
+
 Uses `FINAL_NO_LOSS_CNV_MARKER_PARAMETERS`. A CNV event needs min p <= 0.01, max |BAF deviation| >= 0.30 and max
 IQR <= 0.20. Three marker classes: HET-centred WT with an LOH-like event (LOH / cnLOH / DELETION; >= 5 WT valid cells,
 WT median 25-75, WT HET-like >= 0.15); fixed-like WT with an LOH-like event (WT median <= 5 or >= 95, HET-like <= 0.05);
@@ -521,8 +858,23 @@ amplification (max depth ratio >= 1.30, AMPLIFICATION event). Pathogenic / black
 rescue flags into `final_cnv_informative_marker_no_loss`, merged back, and `germline_tier` set to clean_het (germline
 seed, takes priority), cnv_informative or none. Returns the updated tables and `filtered_germline_variants`.
 
-#### run_af_clustering_only(*, df_AF_all, filtered_germline_variants, original_other_vars_for_cluster=None, other_vars=None, patient_id=None, params=None, plot=True, show_tables=True)
-#### rename_af_clusters_and_update_filtered_germline(*, variant_af_cluster_df, af_mat, df_AF_all, filtered_germline_variants, af_cluster_rename_map=None, all_variant_germline_df=None, df=None, df_review=None, labels=None, patient_id=None, df_mut_to_amplicon_dataframe=None, loh_cluster_ids=None, preserve_baseline_germline_evidence=True, require_baseline_germline_evidence=True, allow_input_filtered_germline_as_baseline_evidence=False, allow_input_filtered_germline_as_loh_evidence=True, allow_non_snv_germline_markers=False, exclude_systematically_skewed_baseline_markers=True, exclude_local_linked_artifact_blocks=True, plot=True, verbose=True, ...)
+</details>
+
+<details>
+<summary><b><code>run_af_clustering_only</code></b></summary>
+
+`run_af_clustering_only(*, df_AF_all, filtered_germline_variants, original_other_vars_for_cluster=None, other_vars=None, patient_id=None, params=None, plot=True, show_tables=True)`
+
+Source: [germline.py:4865](germline.py#L4865 "run_af_clustering_only")
+
+</details>
+
+<details>
+<summary><b><code>rename_af_clusters_and_update_filtered_germline</code></b> — <code>run_af_clustering_only</code> (parameters <code>AF_CLUSTER_ONLY_DEFAULT_PARAMS</code>):</summary>
+
+`rename_af_clusters_and_update_filtered_germline(*, variant_af_cluster_df, af_mat, df_AF_all, filtered_germline_variants, af_cluster_rename_map=None, all_variant_germline_df=None, df=None, df_review=None, labels=None, patient_id=None, df_mut_to_amplicon_dataframe=None, loh_cluster_ids=None, preserve_baseline_germline_evidence=True, require_baseline_germline_evidence=True, allow_input_filtered_germline_as_baseline_evidence=False, allow_input_filtered_germline_as_loh_evidence=True, allow_non_snv_germline_markers=False, exclude_systematically_skewed_baseline_markers=True, exclude_local_linked_artifact_blocks=True, plot=True, verbose=True, ...)`
+
+Source: [germline.py:5361](germline.py#L5361 "rename_af_clusters_and_update_filtered_germline")
 
 ![AF clustering and cluster renaming](docs/af_cluster_rename.png)
 
@@ -568,14 +920,30 @@ Returns a dict with `renamed_cluster_variant_df` (all flags), `renamed_cluster_s
 `local_linked_artifact_blocks_df`, `loh_variants`, `loh_variant_df` and more; with `plot=True` one heatmap per renamed
 class (and `renamed_cluster_tables`).
 
+</details>
+
 ### 7. Step-2 barcode-level CNV/BAF audit
 
-#### build_all_variant_matrices_from_step2_clone_labels(step2, Sample, *, Sample_backup=None, wt_label="WT", collapse_non_wt=False, min_wt_cells=5, min_non_wt_cells=5, min_clone_cells=5, verbose=True, show_clone_barcode_head=True)
+<details>
+<summary><b><code>build_all_variant_matrices_from_step2_clone_labels</code></b> — Takes the barcode -&gt; clone labels of step 2, keeps shared barcodes and builds AF, DP, ALT (= DP x AF / 100) and REF</summary>
+
+`build_all_variant_matrices_from_step2_clone_labels(step2, Sample, *, Sample_backup=None, wt_label="WT", collapse_non_wt=False, min_wt_cells=5, min_non_wt_cells=5, min_clone_cells=5, verbose=True, show_clone_barcode_head=True)`
+
+Source: [germline.py:8063](germline.py#L8063 "build_all_variant_matrices_from_step2_clone_labels")
+
 Takes the barcode -> clone labels of step 2, keeps shared barcodes and builds AF, DP, ALT (= DP x AF / 100) and REF
 (= DP - ALT, >= 0) matrices over all variants of `Sample_backup` (or `Sample`). The AF matrix gets a `label` column (WT
 or the clone label, or `Non_WT` when collapsing). Requires >= 5 WT, >= 5 non-WT cells and one clone with >= 5 cells.
 
-#### run_all_variant_cnv_baf_audit_pipeline(*, df_AF_all, df_DP_all, df_ALT_all, df_REF_all, all_variant_germline_df, CNV_Utils, DNA_Utils=None, wd=None, experiment=None, patient_id=None, cytobands=None, cytobands_path=None, p_threshold=0.01, baf_deviation_threshold=0.3, depth_ratio_deletion=0.7, depth_ratio_amplification=1.3, max_af_iqr=0.3, min_cells=5, apply_final_rules=True, error_on_empty=False, ...)
+</details>
+
+<details>
+<summary><b><code>run_all_variant_cnv_baf_audit_pipeline</code></b> — Groups all variants by chromosome arm (cytobands from the argument, path or <code>{wd}/resources/references/cytobands.tsv</code>),</summary>
+
+`run_all_variant_cnv_baf_audit_pipeline(*, df_AF_all, df_DP_all, df_ALT_all, df_REF_all, all_variant_germline_df, CNV_Utils, DNA_Utils=None, wd=None, experiment=None, patient_id=None, cytobands=None, cytobands_path=None, p_threshold=0.01, baf_deviation_threshold=0.3, depth_ratio_deletion=0.7, depth_ratio_amplification=1.3, max_af_iqr=0.3, min_cells=5, apply_final_rules=True, error_on_empty=False, ...)`
+
+Source: [germline.py:8418](germline.py#L8418 "run_all_variant_cnv_baf_audit_pipeline")
+
 Groups all variants by chromosome arm (cytobands from the argument, path or `{wd}/resources/references/cytobands.tsv`),
 runs `CNV_Utils.test_variant_informativeness` with the thresholds above, resolves the significant variants, audits them
 with `check_significant_variants_against_all_variant_germline_df` and applies `apply_final_no_loss_cnv_marker_rules`.
@@ -583,12 +951,24 @@ Without significant variants it returns empty audit frames and a germline-seed-o
 `error_on_empty`). Returns a dict of all intermediate and final objects (`wilcoxon_results_var`,
 `significant_variant_summary`, `audit_real`, `all_variant_germline_df`, `filtered_germline_variants`, ...).
 
-#### run_step2_barcode_cnv_audit_pipeline(*, step2, Sample, all_variant_germline_df, CNV_Utils, DNA_Utils=None, Sample_backup=None, wd=None, experiment=None, patient_id=None, **kwargs)
+</details>
+
+<details>
+<summary><b><code>run_step2_barcode_cnv_audit_pipeline</code></b> — Calls <code>build_all_variant_matrices_from_step2_clone_labels</code> (gets <code>wt_label</code>, <code>collapse_non_wt</code>, <code>min_*_cells</code>,</summary>
+
+`run_step2_barcode_cnv_audit_pipeline(*, step2, Sample, all_variant_germline_df, CNV_Utils, DNA_Utils=None, Sample_backup=None, wd=None, experiment=None, patient_id=None, **kwargs)`
+
+Source: [germline.py:8768](germline.py#L8768 "run_step2_barcode_cnv_audit_pipeline")
+
 Calls `build_all_variant_matrices_from_step2_clone_labels` (gets `wt_label`, `collapse_non_wt`, `min_*_cells`,
 `verbose`) then `run_all_variant_cnv_baf_audit_pipeline` (all other kwargs). Returns the merged dict plus `matrices` and
 `audit_pipeline`.
 
-#### Constants
+</details>
+
+<details>
+<summary><b>Constants</b> (7 entries)</summary>
+
 `FINAL_NO_LOSS_CNV_MARKER_PARAMETERS`, `AF_CLUSTER_ONLY_DEFAULT_PARAMS`, `DEFAULT_AF_CLUSTER_RENAME_MAP` (exported);
 `EMPIRICAL_COHORT_GERMLINE_THRESHOLDS`, `COL_CANDIDATES`, `BAD_GERMLINE_CLASSES`, `GERMLINE_PATTERN_DIR` (module level).
 `CSV_GLOB`, `NOT_PRESENT` and `CURRENT_MIN_FRAC_HET / MAX_FRAC_HOM / MAX_FRAC_WT` are reference values no function uses.
@@ -597,19 +977,26 @@ Private helpers:
 
 | Helper | Purpose |
 |---|---|
-| `_is_indel`, `_cell_by_variant`, `_full_layer_df`, `_layer_df_from_sample` | Indel test and cells x variants layer frames |
-| `_donor_genotype_call` | Ordered donor-genotype rules (uncalled / low_coverage / hom_alt / hom_ref / het / low_occupancy) |
-| `_dedupe_keep_order`, `_normalise_variant_list`, `_extract_variant_list`, `_variant_key_series`, `_chr_pos_key` | Variant list / key normalisation and genomic sort key |
-| `_coerce_bool_series`, `_coerce_bool_like`, `_first_existing_col`, `_cal_col`, `_numeric_cal_col`, `_bool_cal_col`, `_string_cal_col`, `_het_mask`, `_not_excluded_mask` | Column lookup and boolean coercion for the calibrated rules |
-| `_safe_patient_export_id`, `_resolve_impl`, `_display` | Export ID, `DNA_Utils` override lookup, notebook display |
-| `_get_clone_columns_from_clone_df`, `_clone_barcode_table_from_labeled_sample`, `_normalise_cell_clone_labels` | Clone barcode tables for step 2 / the CNV audit |
-| `_build_significant_variant_summary`, `_build_significant_summary_from_wilcoxon_results` | One row per significant variant from CNV_Utils results |
+| [`_is_indel`](germline.py#L1387 "_is_indel"), `_cell_by_variant`, `_full_layer_df`, `_layer_df_from_sample` | Indel test and cells x variants layer frames |
+| [`_donor_genotype_call`](germline.py#L2141 "_donor_genotype_call") | Ordered donor-genotype rules (uncalled / low_coverage / hom_alt / hom_ref / het / low_occupancy) |
+| [`_dedupe_keep_order`](germline.py#L1990 "_dedupe_keep_order"), `_normalise_variant_list`, `_extract_variant_list`, `_variant_key_series`, `_chr_pos_key` | Variant list / key normalisation and genomic sort key |
+| [`_coerce_bool_series`](germline.py#L2030 "_coerce_bool_series"), `_coerce_bool_like`, `_first_existing_col`, `_cal_col`, `_numeric_cal_col`, `_bool_cal_col`, `_string_cal_col`, `_het_mask`, `_not_excluded_mask` | Column lookup and boolean coercion for the calibrated rules |
+| [`_safe_patient_export_id`](germline.py#L2746 "_safe_patient_export_id"), `_resolve_impl`, `_display` | Export ID, `DNA_Utils` override lookup, notebook display |
+| [`_get_clone_columns_from_clone_df`](germline.py#L2928 "_get_clone_columns_from_clone_df"), `_clone_barcode_table_from_labeled_sample`, `_normalise_cell_clone_labels` | Clone barcode tables for step 2 / the CNV audit |
+| [`_build_significant_variant_summary`](germline.py#L4215 "_build_significant_variant_summary"), `_build_significant_summary_from_wilcoxon_results` | One row per significant variant from CNV_Utils results |
+
+</details>
 
 ---
 
 ## somatic
 
-### find_somatic_variants(df, whitelist, filtered_germline_in_samples, Sample, annotation_df=None, always_keep_pathogenic=True, pathogenic_bypass_germline_filter=False, whitelist_bypass_germline_filter=True, pathogenicity_cols=None, wt_label="WT", significance_threshold=0.05, correction_method="fdr_bh", min_samples=3, min_carrier_frac=0.10, min_het_hom_frac=0.15, min_wt_subclone_carrier_frac=0.01, max_wt_subclone_carrier_frac=0.50, max_nonwt_carrier_frac=0.05, min_wt_subclone_carrier_count=5, min_zero_mutant_carrier_af=30.0, trace_variants=None, verbose=True)
+<details>
+<summary><b><code>find_somatic_variants</code></b> — Selects somatic candidates from a cells x variants AF table (percent) whose first column is the cell label.</summary>
+
+`find_somatic_variants(df, whitelist, filtered_germline_in_samples, Sample, annotation_df=None, always_keep_pathogenic=True, pathogenic_bypass_germline_filter=False, whitelist_bypass_germline_filter=True, pathogenicity_cols=None, wt_label="WT", significance_threshold=0.05, correction_method="fdr_bh", min_samples=3, min_carrier_frac=0.10, min_het_hom_frac=0.15, min_wt_subclone_carrier_frac=0.01, max_wt_subclone_carrier_frac=0.50, max_nonwt_carrier_frac=0.05, min_wt_subclone_carrier_count=5, min_zero_mutant_carrier_af=30.0, trace_variants=None, verbose=True)`
+
+Source: [somatic.py:32](somatic.py#L32 "find_somatic_variants")
 
 Selects somatic candidates from a cells x variants AF table (percent) whose first column is the cell label. A cell is a
 carrier when AF > 10.
@@ -631,16 +1018,40 @@ carrier when AF > 10.
 Returns `(differential_variants, significant_corr_results, significant_wilcox_results)`. Prints a detailed log;
 `trace_variants` prints the fate of chosen variants at each checkpoint.
 
-### visualize_found_differential_variants(df, differential_variants, Sample_subset, wd, MBio_batch, Patient_ID, Sample=None, experiment=None, variant_metadata=None, resolution="Final_annotation", umap_attribute="umap", plot_heatmap=True, plot_protein_umap=True, plot_variant_grid=True, ncols=4, grid_kwargs=None, show_plot=True, **kwargs)
+</details>
+
+<details>
+<summary><b><code>visualize_found_differential_variants</code></b> — Prints a banner, draws the per-label clustered heatmap (<code>Differential_significant_variants.png</code> under</summary>
+
+`visualize_found_differential_variants(df, differential_variants, Sample_subset, wd, MBio_batch, Patient_ID, Sample=None, experiment=None, variant_metadata=None, resolution="Final_annotation", umap_attribute="umap", plot_heatmap=True, plot_protein_umap=True, plot_variant_grid=True, ncols=4, grid_kwargs=None, show_plot=True, **kwargs)`
+
+Source: [somatic.py:1173](somatic.py#L1173 "visualize_found_differential_variants")
+
 Prints a banner, draws the per-label clustered heatmap (`Differential_significant_variants.png` under
 `{wd}/results/per_sample/{MBio_batch}/{Patient_ID}/dna_cnv/variants/somatic_variants`), builds a protein UMAP figure
 (not shown or saved) and the variant UMAP grid (`plot_somatic_variant_umap_grid`, saved under `.../dna_cnv/clonotypes`
 with prefix `Variant_UMAP`). Returns the figures and the heatmap's `df_filtered`.
 
-### visualize_found_informative_variants(df, combined_useful_variants_sorted, Sample_subset, wd, MBio_batch, Patient_ID, **kwargs)
+</details>
+
+<details>
+<summary><b><code>visualize_found_informative_variants</code></b> — Same heatmap with title &quot;Informative&quot;, saved as <code>Informative_significant_variants.png</code>.</summary>
+
+`visualize_found_informative_variants(df, combined_useful_variants_sorted, Sample_subset, wd, MBio_batch, Patient_ID, **kwargs)`
+
+Source: [somatic.py:1305](somatic.py#L1305 "visualize_found_informative_variants")
+
 Same heatmap with title "Informative", saved as `Informative_significant_variants.png`.
 
-### plot_somatic_variant_umap_grid(Sample, df, differential_variants, variant_metadata=None, resolution="Final_annotation", ncols=4, carrier_af_threshold=10.0, color_by_af=False, outdir=None, output_prefix="Variant_UMAP", ...)
+</details>
+
+<details>
+<summary><b><code>plot_somatic_variant_umap_grid</code></b> — Plotly grid: panel 1 = protein UMAP coloured by annotation; one panel per variant with carriers (AF &gt; 10; black, or</summary>
+
+`plot_somatic_variant_umap_grid(Sample, df, differential_variants, variant_metadata=None, resolution="Final_annotation", ncols=4, carrier_af_threshold=10.0, color_by_af=False, outdir=None, output_prefix="Variant_UMAP", ...)`
+
+Source: [somatic.py:1379](somatic.py#L1379 "plot_somatic_variant_umap_grid")
+
 Plotly grid: panel 1 = protein UMAP coloured by annotation; one panel per variant with carriers (AF > 10; black, or
 Viridis by AF) over grey non-carriers; gene / protein names in titles when `variant_metadata` is given. Saves
 `<prefix>_grid.html` (and PNG if kaleido works) when `outdir` is set.
@@ -649,11 +1060,18 @@ Private helpers: `_variant_heatmap` (per-label seaborn `mako` heatmap, average-l
 percentile colour limits, chromosome boundary lines, PNG + PDF at 300 dpi) and `_protein_umap_frame` (barcode-indexed
 protein UMAP x / y + annotation).
 
+</details>
+
 ---
 
 ## filter_outliers
 
-### filter_somatic_variant_outliers(Sample, df_AF, differential_variants, outdir, clone_variant_calls=None, variant_column="Variant name", eligible_genotypes=("het", "hom"), label_col="label", dp_threshold=5, sd_k=1.25, sd_min_n=3, ..., save_audit=True, save_kept_barcodes=True, show_plots=True, verbose=True, random_seed=0)
+<details>
+<summary><b><code>filter_somatic_variant_outliers</code></b> — Per somatic variant, cleans the AF of cells in the clones that carry it.</summary>
+
+`filter_somatic_variant_outliers(Sample, df_AF, differential_variants, outdir, clone_variant_calls=None, variant_column="Variant name", eligible_genotypes=("het", "hom"), label_col="label", dp_threshold=5, sd_k=1.25, sd_min_n=3, ..., save_audit=True, save_kept_barcodes=True, show_plots=True, verbose=True, random_seed=0)`
+
+Source: [filter_outliers.py:547](filter_outliers.py#L547 "filter_somatic_variant_outliers")
 
 Per somatic variant, cleans the AF of cells in the clones that carry it.
 
@@ -685,44 +1103,86 @@ Private helpers:
 | `_sd_filter_per_label` | Inclusive mean +/- k SD filter per label with audit |
 | `_jitter_plot_by_label`, `_safe_filename` | Jitter plot (PNG + PDF) and safe file names |
 
+</details>
+
 ---
 
 ## clones
 
-### clones_to_dataframe(wf, variants, max_ado_score=0.8, min_clone_size=1)
+<details>
+<summary><b><code>clones_to_dataframe</code></b> — Normalises <code>variants</code> (string, array, Series or list; one nesting level flattened, stripped, empties removed,</summary>
+
+`clones_to_dataframe(wf, variants, max_ado_score=0.8, min_clone_size=1)`
+
+Source: [clones.py:76](clones.py#L76 "clones_to_dataframe")
+
 Normalises `variants` (string, array, Series or list; one nesting level flattened, stripped, empties removed,
 de-duplicated) and calls `wf.get_clones(...)` on a Mosaic `VariantSubcloneTable`. Returns the clone table with columns
 renamed from metadata `id` to `name`, rows with a blank `Variant\nname` removed. `min_clone_size` is a percentage of
 cells (the notebooks pass 5 cells as a percentage).
 
-### get_VAF(Sample, label_col="label", clone_order=None, output_path=None, verbose=True)
+</details>
+
+<details>
+<summary><b><code>get_VAF</code></b> — &quot;VAF by cell count&quot; (Mosaic <code>get_variant_bulk_metrics</code>) of every variant within each clone.</summary>
+
+`get_VAF(Sample, label_col="label", clone_order=None, output_path=None, verbose=True)`
+
+Source: [clones.py:131](clones.py#L131 "get_VAF")
+
 "VAF by cell count" (Mosaic `get_variant_bulk_metrics`) of every variant within each clone. Creates `NGT_FILTERED` from
 `NGT` if missing (side effect), orders columns by `clone_order` (others appended sorted) and optionally writes a CSV.
 Returns variants x clones (VAF %).
 
-### get_clones_size(Sample, label_col="label", desired_order=None, exclude_celltypes=None, return_percentage=False, verbose=True)
+</details>
+
+<details>
+<summary><b><code>get_clones_size</code></b> — Cells per clone label, optionally after removing cells whose protein label is in <code>exclude_celltypes</code> (builds a new</summary>
+
+`get_clones_size(Sample, label_col="label", desired_order=None, exclude_celltypes=None, return_percentage=False, verbose=True)`
+
+Source: [clones.py:210](clones.py#L210 "get_clones_size")
+
 Cells per clone label, optionally after removing cells whose protein label is in `exclude_celltypes` (builds a new
 Sample from the kept barcodes). Adds `Percentage` on request and orders rows by `desired_order`. Returns a
 `Clone, Count[, Percentage]` DataFrame; `ValueError` if exclusion removes every cell.
 
 Private helpers: `_make_vprint`, `_flatten_variants`, `_unique_stripped`.
 
+</details>
+
 ---
 
 ## plot_clones
 
-### plot_individual_clone_umaps(Sample, clone_column="Clone", outdir=None, output_prefix="Clone_UMAP", umap_attribute="umap", background_color="#D3D3D3", clone_size=10, background_size=3, width=800, height=800, show_plots=True, verbose=True)
+<details>
+<summary><b><code>plot_individual_clone_umaps</code></b> — One Plotly DNA UMAP per clone label (sorted): the clone&#x27;s cells coloured, all others grey.</summary>
+
+`plot_individual_clone_umaps(Sample, clone_column="Clone", outdir=None, output_prefix="Clone_UMAP", umap_attribute="umap", background_color="#D3D3D3", clone_size=10, background_size=3, width=800, height=800, show_plots=True, verbose=True)`
+
+Source: [plot_clones.py:110](plot_clones.py#L110 "plot_individual_clone_umaps")
+
 One Plotly DNA UMAP per clone label (sorted): the clone's cells coloured, all others grey. Colour by name (lower-cased):
 `wt` -> #007da5; TP53 with a `hem` / `hom` token or two TP53 mentions -> #a50000; TP53 with `het` -> #f3b900; other
 `het` -> #00A77F; other `hom` -> #4B0DD2; else #6f00a5. Optionally writes `<prefix>_<clone>.png` + `.pdf` and shows each
 figure. Returns `{clone: figure}` (`{}` if the UMAP or labels cannot be read).
 
-### plot_somatic_variants(Sample, differential_variants, variant_metadata=None, outdir=None, output_prefix="Variant_UMAP", umap_attribute="umap", variant_color="#a50000", background_color="#D3D3D3", variant_size=10, background_size=3, width=800, height=800, show_plots=True, verbose=True)
+</details>
+
+<details>
+<summary><b><code>plot_somatic_variants</code></b> — One UMAP per requested variant that is an NGT column, highlighting cells with NGT != 0 (NGT 3 / missing included).</summary>
+
+`plot_somatic_variants(Sample, differential_variants, variant_metadata=None, outdir=None, output_prefix="Variant_UMAP", umap_attribute="umap", variant_color="#a50000", background_color="#D3D3D3", variant_size=10, background_size=3, width=800, height=800, show_plots=True, verbose=True)`
+
+Source: [plot_clones.py:210](plot_clones.py#L210 "plot_somatic_variants")
+
 One UMAP per requested variant that is an NGT column, highlighting cells with NGT != 0 (NGT 3 / missing included).
 `variant_metadata["Protein"]` is added to the progress line and file name. Optionally saves PNG + PDF. Returns
 `{variant: figure}`.
 
 Private helpers: `_get_clone_color` (rule above), `_highlight_umap_figure`, `_write_png_and_pdf`, `_make_vprint`.
+
+</details>
 
 ---
 

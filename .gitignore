@@ -12,6 +12,8 @@
 *.sra
 *.png
 *.pdf
+*.sif
+*.so
 
 # ── Entire directories ──
 raw_data/
@@ -20,18 +22,20 @@ logs/
 omnipathr-log/
 processed_data/submission/
 processed_data/h5/External/
-results/huntress/
-results/general/
-results/summaries/
-results/per_sample/
-results/demultiplexing/
-results/figures/
+/results/
+/variants_patterns_tapestri/
 scripts/general/
 scripts/templates/
 notebooks/01_preprocessing/.ipynb_checkpoints/
 notebooks/02_protein_filtering/.ipynb_checkpoints/
 notebooks/03_sample_analysis/.ipynb_checkpoints/
 resources/
+/Panel_QC_scripts/
+/envs/installation/
+
+# ── Keep envs/containers/ as an empty folder ──
+/envs/containers/*
+!/envs/containers/.gitkeep
 
 # ── Python ──
 __pycache__/
@@ -49,21 +53,19 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# ── Logs ──
-logs/
-
 # ── Editors ──
 .vscode/
 .idea/
 *.swp
 *~
 
-# - Files -
-Initialise_project.sh
-Jupyter_Launcher.sh
-Clear_donors_result_folders.sh
-Create_project_directories.sh
-project.conf
+# ── Files ──
+/Initialise_project.sh
+/Jupyter_Launcher.sh
+/Clear_donors_result_folders.sh
+/Create_project_directories.sh
+/project.conf
+/known_common_NFE_het_germline_vars.txt
 notebooks/01_preprocessing/01_Preprocessing_External.ipynb
 notebooks/01_preprocessing/01_Preprocessing_MDS012.ipynb
 notebooks/03_sample_analysis/03_Sample_Analysis_MDS007_PT686_AKW.ipynb

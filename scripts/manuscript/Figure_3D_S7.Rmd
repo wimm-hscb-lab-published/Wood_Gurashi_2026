@@ -248,3 +248,655 @@ ggsave(file.path(save_dir, "Fig_S7.png"),
 # 77% CD8+ T cell
 ```
 
+
+# 5. Additional figures: every clone / mutation / CNV for every patient
+
+Highlighted cells coloured by cell type, with a proportion barplot underneath. UMAP panel fixed to the Fig_3D / Fig_S7 size.
+
+```{r}
+library(ggplot2)
+library(colorspace)
+library(dplyr)
+library(patchwork)
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+celltype_col <- "Celltype_revised_refined"   # <-- cell type annotation column
+donor_col    <- "Donor"
+clone_col    <- "Clone"
+min_cells    <- 5                             # skip groups with fewer highlighted cells
+
+base_dir <- "/project/meadlab/shared/02__Projects/02b__Tapestri/results/figures/Additional"
+dirs <- list(
+    Clone    = file.path(base_dir, "Clones"),
+    Mutation = file.path(base_dir, "Mutations"),
+    CNV      = file.path(base_dir, "CNVs")
+)
+invisible(lapply(dirs, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+# Values treated as "not altered" (never highlighted). Check the tables printed
+# below and edit these if your encoding differs.
+mut_ref <- c("WT", "0", "Missing", "3", "Unknown", "")   # covers text calls and Mosaic NGT (0=WT, 3=missing)
+cnv_ref <- c("Neutral", "Normal", "Diploid", "WT", "None", "No", "Missing", "")
+
+# Fixed panel geometry: UMAP panel = exactly the panel of Fig_3D / Fig_S7
+# (5.5 x 5 in page minus 10 pt margins), fixed in inches so titles/legends
+# can never shrink it. Page size is computed from the assembled plot.
+umap_panel_w <- 5.5 - 20 / 72.27
+umap_panel_h <- 5.0 - 20 / 72.27
+bar_h_in     <- 0.4
+
+save_fixed <- function(p, fname, pad = 0.1) {
+    g <- patchwork::patchworkGrob(p)
+    grDevices::pdf(NULL)
+    w <- grid::convertWidth (sum(g$widths),  "in", valueOnly = TRUE) + pad
+    h <- grid::convertHeight(sum(g$heights), "in", valueOnly = TRUE) + pad
+    grDevices::dev.off()
+    ggsave(paste0(fname, ".pdf"), plot = p, width = w, height = h, limitsize = FALSE)
+    ggsave(paste0(fname, ".png"), plot = p, width = w, height = h, dpi = 300, limitsize = FALSE)
+}
+
+color_map <- c(
+    "B cell"          = "#B07AA1",
+    "Plasma cell"     = "#8CD17D",
+    "CD14+ monocyte"  = "#F28E2B",
+    "CD16+ monocyte"  = "#FFBE7D",
+    "Mono/Macrophage" = "#5A5A5A",
+    "CD4+ T cell"     = "#9D7660",
+    "CD8+ T cell"     = "#514DAD",
+    "cDC"             = "#F1CE63",
+    "pDC"             = "#86BCB6",
+    "NK cell"         = "#FABFD2",
+    "Erythroblast"    = "#E15759",
+    "HSPC"            = "#4E79A7",
+    "Other T cell"    = "#BAB0AC"
+)
+outline_map <- setNames(darken(color_map, amount = 0.5), names(color_map))
+
+meta <- combined_dna_pro@meta.data
+stopifnot(all(c(celltype_col, donor_col, clone_col) %in% colnames(meta)))
+
+missing_ct <- setdiff(unique(as.character(meta[[celltype_col]])), names(color_map))
+if (length(missing_ct)) warning("Cell types without a colour: ", paste(missing_ct, collapse = ", "))
+
+# ── Feature columns ──────────────────────────────────────────────────────────
+mut_cols <- grep("^[A-Za-z0-9]+_c\\.", colnames(meta), value = TRUE)    # e.g. TP53_c.524G>A_R175H_...
+cnv_cols <- grep("^chr[0-9XY]+[pq]?$", colnames(meta), value = TRUE)    # chr3, chr5q, chr17p, ...
+cat("Mutation columns:", length(mut_cols), " | CNV columns:", length(cnv_cols), "\n")
+
+cat("\nMutation call values (all columns pooled):\n")
+print(table(unlist(lapply(meta[mut_cols], as.character)), useNA = "ifany"))
+cat("\nCNV call values (all columns pooled):\n")
+print(table(unlist(lapply(meta[cnv_cols], as.character)), useNA = "ifany"))
+
+# "TP53_c.524G>A_R175H_7578406_C_T" -> "TP53_R175H" (falls back to cDNA if protein is NA)
+short_mut <- function(x) {
+    p <- strsplit(x, "_", fixed = TRUE)[[1]]
+    paste(p[1], ifelse(p[3] == "NA", p[2], p[3]), sep = "_")
+}
+safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+# ── Shared UMAP data ─────────────────────────────────────────────────────────
+umap_df <- as.data.frame(Embeddings(combined_dna_pro, "umap"))
+umap_df$barcode  <- rownames(umap_df)
+umap_df$CellType <- as.character(meta[umap_df$barcode, celltype_col])
+umap_df$Donor    <- as.character(meta[umap_df$barcode, donor_col])
+umap_df$Clone    <- as.character(meta[umap_df$barcode, clone_col])
+
+donors <- sort(unique(na.omit(umap_df$Donor)))
+
+# ── Plot helper: UMAP highlight + proportion bar ─────────────────────────────
+plot_highlight <- function(is_hl, title, out_base) {
+    is_hl[is.na(is_hl)] <- FALSE
+    df_bg <- umap_df[!is_hl, , drop = FALSE]
+    df_fg <- umap_df[ is_hl, , drop = FALSE]
+
+    comp <- df_fg %>%
+        count(CellType, name = "n") %>%
+        mutate(pct = 100 * n / sum(n), total = sum(n)) %>%   # exact, so stacks sum to 100
+        arrange(desc(n))
+    top <- comp[1, ]
+
+    df_fg   <- df_fg[sample(nrow(df_fg)), , drop = FALSE]
+    present <- intersect(names(color_map), unique(df_fg$CellType))
+
+    p_umap <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2)) +
+        geom_point(
+            data = df_bg, shape = 21, size = 2, stroke = 0, alpha = 0.6,
+            fill = "grey85", color = "grey85"
+        ) +
+        geom_point(
+            data = df_fg, aes(fill = CellType, color = CellType),
+            shape = 21, size = 4, stroke = 0.6, alpha = 0.95
+        ) +
+        scale_fill_manual(values = color_map, breaks = present, name = NULL, na.value = "grey50") +
+        scale_color_manual(values = outline_map, breaks = present, name = NULL, na.value = "grey30") +
+        guides(color = "none",
+               fill = guide_legend(override.aes = list(size = 4))) +
+        labs(
+            title    = title,
+            subtitle = sprintf("n = %d cells; %.0f%% %s", top$total, top$pct, top$CellType)
+        ) +
+        theme_void(base_size = 12) +
+        theme(
+            plot.title    = element_text(face = "bold", hjust = 0.5),
+            plot.subtitle = element_text(hjust = 0.5),
+            legend.position = "right",
+            plot.margin = margin(10, 10, 10, 10)
+        )
+
+    bar_df <- comp %>%
+        mutate(CellType = factor(CellType, levels = rev(comp$CellType)),
+               label = ifelse(pct >= 5, paste0(round(pct), "%"), ""))
+
+    p_bar <- ggplot(bar_df, aes(x = pct, y = "", fill = CellType)) +
+        geom_col(width = 0.8, color = "white", linewidth = 0.4) +
+        geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 3) +
+        scale_fill_manual(values = color_map, na.value = "grey50", guide = "none") +
+        scale_x_continuous(breaks = seq(0, 100, 25),
+                           labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+        coord_cartesian(xlim = c(0, 100), clip = "off") +   # zoom, never drop segments
+        labs(x = NULL, y = NULL) +
+        theme_minimal(base_size = 10) +
+        theme(
+            panel.grid   = element_blank(),
+            axis.text.y  = element_blank(),
+            axis.ticks.x = element_line(linewidth = 0.3),
+            plot.margin  = margin(0, 10, 10, 10)
+        )
+
+    p <- p_umap / p_bar +
+        plot_layout(
+            widths  = unit(umap_panel_w, "in"),
+            heights = unit(c(umap_panel_h, bar_h_in), "in")
+        )
+
+    save_fixed(p, out_base)
+
+    comp
+}
+
+# Loop driver for per-donor categorical features (mutations / CNVs)
+run_feature <- function(cols, ref_vals, label_fun, type, out_dir) {
+    res <- list()
+    for (fc in cols) {
+        vals  <- as.character(meta[umap_df$barcode, fc])
+        fname <- label_fun(fc)
+        for (d in donors) {
+            in_d   <- umap_df$Donor == d & !is.na(umap_df$Donor)
+            states <- setdiff(unique(vals[in_d]), c(ref_vals, NA))
+            for (s in states) {
+                is_hl <- in_d & vals == s
+                if (sum(is_hl, na.rm = TRUE) < min_cells) next
+                title <- paste0(d, " — ", fname, " (", s, ")")
+                comp  <- plot_highlight(
+                    is_hl, title,
+                    file.path(out_dir, paste0(safe_name(d), "__", safe_name(fname), "__", safe_name(s)))
+                )
+                res[[length(res) + 1]] <- mutate(comp, Type = type, Donor = d,
+                                                 Feature = fname, State = s)
+                cat(sprintf("%s | %s | %s (%s): n=%d\n", type, d, fname, s, comp$total[1]))
+            }
+        }
+    }
+    bind_rows(res)
+}
+```
+
+## - Clones
+
+```{r}
+combos <- umap_df %>%
+    filter(!is.na(Donor), !is.na(Clone), Clone != "") %>%
+    distinct(Donor, Clone) %>%
+    arrange(Donor, Clone)
+
+clone_res <- list()
+for (i in seq_len(nrow(combos))) {
+    d <- combos$Donor[i]; cl <- combos$Clone[i]
+    is_hl <- umap_df$Donor == d & umap_df$Clone == cl
+    if (sum(is_hl, na.rm = TRUE) < min_cells) next
+    comp <- plot_highlight(
+        is_hl, paste0(d, " — ", cl),
+        file.path(dirs$Clone, paste0(safe_name(d), "__", safe_name(cl)))
+    )
+    clone_res[[length(clone_res) + 1]] <- mutate(comp, Type = "Clone", Donor = d,
+                                                 Feature = cl, State = NA_character_)
+    cat(sprintf("[%d/%d] Clone | %s | %s : n=%d\n", i, nrow(combos), d, cl, comp$total[1]))
+}
+clone_res <- bind_rows(clone_res)
+```
+
+## - Mutations
+
+```{r}
+mut_res <- run_feature(mut_cols, mut_ref, short_mut, "Mutation", dirs$Mutation)
+```
+
+## - CNVs
+
+```{r}
+cnv_res <- run_feature(cnv_cols, cnv_ref, identity, "CNV", dirs$CNV)
+```
+
+## - Composition table
+
+```{r}
+composition_df <- bind_rows(clone_res, mut_res, cnv_res) %>%
+    mutate(pct = round(pct, 1)) %>%
+    select(Type, Donor, Feature, State, total, CellType, n, pct)
+write.csv(composition_df, file.path(base_dir, "celltype_composition_all.csv"), row.names = FALSE)
+```
+
+
+# 6. Reviewer Q13 — lineage distribution of non-TP53 vs TP53 mutant cells
+
+Per patient: UMAP highlighting WT / non-TP53 mutant / TP53 mutant cells, with stacked cell-type proportions for each group underneath. Run twice: (a) non-TP53 mutant pooled; (b) non-TP53 mutant split into DTA (DNMT3A/TET2/ASXL1) vs other non-TP53.
+
+```{r}
+library(ggplot2)
+library(colorspace)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+celltype_col <- "Celltype_revised_refined"   # <-- cell type annotation column
+donor_col    <- "Donor"
+min_cells    <- 5          # a mutation counts for a donor only if >= this many mutant cells;
+                           # groups below this are not tested / donors not plotted
+mut_vals     <- c("1", "2")   # Mosaic NGT: 1 = Het, 2 = Hom
+wt_val       <- "0"           # Mosaic NGT: 0 = WT (3 = missing)
+dta_genes    <- c("DNMT3A", "TET2", "ASXL1")
+
+base_out <- "/project/meadlab/shared/02__Projects/02b__Tapestri/results/figures/Additional/Q13_TP53_vs_nonTP53"
+
+# ── Fixed panel geometry ─────────────────────────────────────────────────────
+# UMAP panel = exactly the panel of Fig_3D / Fig_S7 (5.5 x 5 in page minus
+# 10 pt margins each side), fixed in inches so titles, legends and bars can
+# never shrink it. The page size is computed from the assembled plot.
+umap_panel_w <- 5.5 - 20 / 72.27
+umap_panel_h <- 5.0 - 20 / 72.27
+bar_h_per    <- 0.4            # inches per bar row
+
+color_map <- c(
+    "B cell"          = "#B07AA1",
+    "Plasma cell"     = "#8CD17D",
+    "CD14+ monocyte"  = "#F28E2B",
+    "CD16+ monocyte"  = "#FFBE7D",
+    "Mono/Macrophage" = "#5A5A5A",
+    "CD4+ T cell"     = "#9D7660",
+    "CD8+ T cell"     = "#514DAD",
+    "cDC"             = "#F1CE63",
+    "pDC"             = "#86BCB6",
+    "NK cell"         = "#FABFD2",
+    "Erythroblast"    = "#E15759",
+    "HSPC"            = "#4E79A7",
+    "Other T cell"    = "#BAB0AC"
+)
+
+grp_fill_all <- c(
+    "WT"                    = "#4D4D4D",
+    "Non-TP53 mutant"       = "#E69F00",
+    "DTA mutant"            = "#E69F00",
+    "Other non-TP53 mutant" = "#0072B2",
+    "TP53 mutant"           = "#C2185B"
+)
+grp_short <- c(
+    "WT" = "WT", "Non-TP53 mutant" = "Non-TP53", "DTA mutant" = "DTA",
+    "Other non-TP53 mutant" = "Other", "TP53 mutant" = "TP53"
+)
+
+meta <- combined_dna_pro@meta.data
+stopifnot(all(c(celltype_col, donor_col) %in% colnames(meta)))
+
+missing_ct <- setdiff(unique(as.character(meta[[celltype_col]])), names(color_map))
+if (length(missing_ct)) warning("Cell types without a colour: ", paste(missing_ct, collapse = ", "))
+
+# ── Genotype matrix ──────────────────────────────────────────────────────────
+mut_cols    <- grep("^[A-Za-z0-9]+_c\\.", colnames(meta), value = TRUE)
+gene_of     <- sub("_.*", "", mut_cols)
+tp53_cols   <- mut_cols[gene_of == "TP53"]
+dta_cols    <- mut_cols[gene_of %in% dta_genes]
+nondta_cols <- mut_cols[!(gene_of %in% c("TP53", dta_genes))]
+
+G <- sapply(meta[mut_cols], as.character)
+rownames(G) <- rownames(meta)
+
+short_mut <- function(x) {
+    p <- strsplit(x, "_", fixed = TRUE)[[1]]
+    paste(p[1], ifelse(p[3] == "NA", p[2], p[3]), sep = "_")
+}
+safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+# Row-wise helpers that also work with zero columns
+any_mut <- function(M) rowSums(array(M %in% mut_vals, dim = dim(M))) > 0
+all_wt  <- function(M) rowSums(array(M == wt_val,     dim = dim(M))) == ncol(M)
+
+# Save with the page sized to the content (panels are fixed in inches)
+save_fixed <- function(p, fname, pad = 0.1) {
+    g <- patchwork::patchworkGrob(p)
+    grDevices::pdf(NULL)
+    w <- grid::convertWidth (sum(g$widths),  "in", valueOnly = TRUE) + pad
+    h <- grid::convertHeight(sum(g$heights), "in", valueOnly = TRUE) + pad
+    grDevices::dev.off()
+    ggsave(paste0(fname, ".pdf"), plot = p, width = w, height = h, limitsize = FALSE)
+    ggsave(paste0(fname, ".png"), plot = p, width = w, height = h, dpi = 300, limitsize = FALSE)
+}
+
+umap_base <- as.data.frame(Embeddings(combined_dna_pro, "umap"))
+umap_base$barcode  <- rownames(umap_base)
+umap_base$CellType <- as.character(meta[umap_base$barcode, celltype_col])
+umap_base$Donor    <- as.character(meta[umap_base$barcode, donor_col])
+```
+
+## - Main function
+
+```{r}
+# Group definitions (per donor, using only variants with >= min_cells mutant cells in that donor):
+#   TP53 mutant           : Het/Hom for any TP53 variant
+#   Non-TP53 mutant       : WT at all TP53 variants AND mutant for >= 1 non-TP53 variant      (split_dta = FALSE)
+#   Other non-TP53 mutant : WT at all TP53 variants AND mutant for >= 1 non-DTA, non-TP53 var (split_dta = TRUE)
+#   DTA mutant            : WT at all TP53 variants, mutant for >= 1 DTA variant, no other    (split_dta = TRUE)
+#                           (cells carrying DTA + another non-TP53 variant go to "Other",
+#                            as DTA is usually the ancestral hit)
+#   WT                    : WT at every variant
+#   Missing calls otherwise -> unassigned, drawn as background.
+run_q13 <- function(split_dta) {
+
+    out_dir <- file.path(base_out, ifelse(split_dta, "split_DTA", "pooled"))
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+    grp_levels <- if (split_dta) {
+        c("WT", "DTA mutant", "Other non-TP53 mutant", "TP53 mutant")
+    } else {
+        c("WT", "Non-TP53 mutant", "TP53 mutant")
+    }
+    non_tp53_grps <- setdiff(grp_levels, c("WT", "TP53 mutant"))
+    grp_fill <- grp_fill_all[grp_levels]
+    grp_line <- setNames(darken(grp_fill, amount = 0.5), names(grp_fill))
+
+    bar_h_in <- bar_h_per * length(grp_levels)
+
+    # ── Assign groups ────────────────────────────────────────────────────────
+    group_vec  <- setNames(rep(NA_character_, nrow(meta)), rownames(meta))
+    donor_info <- list()
+
+    for (d in sort(unique(na.omit(meta[[donor_col]])))) {
+        cells <- rownames(meta)[meta[[donor_col]] == d & !is.na(meta[[donor_col]])]
+        Gd    <- G[cells, , drop = FALSE]
+
+        n_mut    <- colSums(array(Gd %in% mut_vals, dim = dim(Gd)))
+        relevant <- mut_cols[n_mut >= min_cells]
+        rel_tp53 <- intersect(relevant, tp53_cols)
+        rel_dta  <- intersect(relevant, dta_cols)
+        rel_nd   <- intersect(relevant, nondta_cols)
+        if (length(c(rel_dta, rel_nd)) == 0) next
+
+        tp53_mut <- any_mut(Gd[, rel_tp53, drop = FALSE])
+        tp53_wt  <- all_wt (Gd[, rel_tp53, drop = FALSE])
+        dta_mut  <- any_mut(Gd[, rel_dta,  drop = FALSE])
+        nd_mut   <- any_mut(Gd[, rel_nd,   drop = FALSE])
+        all_ok   <- all_wt (Gd[, relevant, drop = FALSE])
+
+        grp <- rep(NA_character_, length(cells))
+        grp[all_ok] <- "WT"
+        if (split_dta) {
+            grp[tp53_wt & dta_mut & !nd_mut] <- "DTA mutant"
+            grp[tp53_wt & nd_mut]            <- "Other non-TP53 mutant"
+        } else {
+            grp[tp53_wt & (dta_mut | nd_mut)] <- "Non-TP53 mutant"
+        }
+        grp[tp53_mut] <- "TP53 mutant"
+        group_vec[cells] <- grp
+
+        donor_info[[d]] <- list(
+            tp53  = sapply(rel_tp53, short_mut, USE.NAMES = FALSE),
+            dta   = sapply(rel_dta,  short_mut, USE.NAMES = FALSE),
+            other = sapply(rel_nd,   short_mut, USE.NAMES = FALSE)
+        )
+    }
+
+    umap_df <- umap_base
+    umap_df$Group <- factor(group_vec[umap_df$barcode], levels = grp_levels)
+
+    donors_plot <- umap_df %>%
+        filter(Group %in% non_tp53_grps) %>%
+        count(Donor) %>%
+        filter(n >= min_cells) %>%
+        pull(Donor)
+    cat(ifelse(split_dta, "[split DTA]", "[pooled]"),
+        "Donors with non-TP53 mutant cells outside TP53 clones:",
+        paste(donors_plot, collapse = ", "), "\n")
+
+    comp_all  <- list()
+    stats_all <- list()
+
+    # ── Per-patient figures + one figure pooling all plotted patients ────────
+    pooled_lab <- "All patients"
+    for (d in c(donors_plot, pooled_lab)) {
+        is_pooled <- d == pooled_lab
+        df_d <- if (is_pooled) {
+            umap_df %>% filter(Donor %in% donors_plot, !is.na(Group))
+        } else {
+            umap_df %>% filter(Donor == d, !is.na(Group))
+        }
+        df_bg <- umap_df %>% filter(!(barcode %in% df_d$barcode))
+        df_fg <- df_d %>% arrange(Group)          # WT first, TP53 mutant drawn on top
+
+        # Exact (unrounded) percentages so stacks sum to exactly 100
+        comp <- df_d %>%
+            count(Group, CellType, name = "n") %>%
+            group_by(Group) %>%
+            mutate(total = sum(n), pct = 100 * n / total) %>%
+            ungroup() %>%
+            mutate(Donor = d)
+        comp_all[[d]] <- comp
+
+        n_by <- table(df_d$Group)
+
+        # Each non-TP53 group vs TP53 mutant: lineage distribution test
+        p_vals <- sapply(non_tp53_grps, function(g) {
+            if (n_by[[g]] < min_cells || n_by[["TP53 mutant"]] < min_cells) return(NA_real_)
+            sub <- df_d %>% filter(Group %in% c(g, "TP53 mutant"))
+            tab <- table(droplevels(sub$Group), sub$CellType)
+            suppressWarnings(chisq.test(tab, simulate.p.value = TRUE, B = 1e4)$p.value)
+        })
+
+        stats_all[[d]] <- data.frame(
+            Donor            = d,
+            TP53_variants    = paste(donor_info[[d]]$tp53,  collapse = "; "),
+            DTA_variants     = paste(donor_info[[d]]$dta,   collapse = "; "),
+            other_variants   = paste(donor_info[[d]]$other, collapse = "; "),
+            t(setNames(as.integer(n_by[grp_levels]), paste0("n_", grp_short[grp_levels]))),
+            t(setNames(p_vals, paste0("p_", grp_short[non_tp53_grps], "_vs_TP53"))),
+            check.names = FALSE
+        )
+
+        grp_lab <- setNames(sprintf("%s (n=%d)", grp_levels, as.integer(n_by[grp_levels])), grp_levels)
+
+        p_txt <- paste(
+            sprintf("%s vs TP53: %s", grp_short[non_tp53_grps],
+                    ifelse(is.na(p_vals), "n.t.", sprintf("p = %.3g", p_vals))),
+            collapse = "; "
+        )
+        var_txt <- if (is_pooled) {
+            sprintf("Cells pooled across %d patients: %s", length(donors_plot), paste(donors_plot, collapse = ", "))
+        } else if (split_dta) {
+            sprintf("DTA: %s | Other: %s",
+                    ifelse(length(donor_info[[d]]$dta),   paste(donor_info[[d]]$dta,   collapse = ", "), "none"),
+                    ifelse(length(donor_info[[d]]$other), paste(donor_info[[d]]$other, collapse = ", "), "none"))
+        } else {
+            paste("Non-TP53:", paste(c(donor_info[[d]]$dta, donor_info[[d]]$other), collapse = ", "))
+        }
+
+        # UMAP
+        p_umap <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2)) +
+            geom_point(data = df_bg, shape = 21, size = 2, stroke = 0, alpha = 0.6,
+                       fill = "grey85", color = "grey85") +
+            geom_point(data = df_fg, aes(fill = Group, color = Group),
+                       shape = 21, size = 4, stroke = 0.6, alpha = 0.95) +
+            scale_fill_manual(values = grp_fill, labels = grp_lab, name = NULL, drop = FALSE) +
+            scale_color_manual(values = grp_line, guide = "none") +
+            guides(fill = guide_legend(override.aes = list(size = 4))) +
+            labs(title = d, subtitle = paste0(var_txt, "\nLineage \u03c7\u00b2 — ", p_txt)) +
+            theme_void(base_size = 12) +
+            theme(
+                plot.title    = element_text(face = "bold", hjust = 0.5),
+                plot.subtitle = element_text(hjust = 0.5, size = 9),
+                legend.position = "right",
+                plot.margin = margin(10, 10, 10, 10)
+            )
+
+        # Stacked proportion bars (one per group)
+        bar_df <- comp %>%
+            mutate(Group    = factor(Group, levels = rev(grp_levels)),
+                   CellType = factor(CellType, levels = names(color_map)),
+                   label    = ifelse(pct >= 8, paste0(round(pct), "%"), ""))
+        present <- intersect(names(color_map), unique(as.character(bar_df$CellType)))
+
+        p_bar <- ggplot(bar_df, aes(x = pct, y = Group, fill = CellType)) +
+            geom_col(width = 0.8, color = "white", linewidth = 0.3) +
+            geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 2.6) +
+            scale_fill_manual(values = color_map, breaks = present, name = NULL, na.value = "grey50") +
+            scale_y_discrete(labels = grp_lab, drop = FALSE) +
+            scale_x_continuous(breaks = seq(0, 100, 25),
+                               labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+            coord_cartesian(xlim = c(0, 100), clip = "off") +   # zoom, never drop segments
+            labs(x = NULL, y = NULL) +
+            guides(fill = guide_legend(nrow = 3, byrow = TRUE)) +
+            theme_minimal(base_size = 10) +
+            theme(
+                panel.grid   = element_blank(),
+                axis.ticks.x = element_line(linewidth = 0.3),
+                legend.position = "bottom",
+                legend.key.size = unit(0.35, "cm"),
+                legend.text  = element_text(size = 8),
+                plot.margin  = margin(0, 10, 10, 10)
+            )
+
+        p <- p_umap / p_bar +
+            plot_layout(
+                widths  = unit(umap_panel_w, "in"),
+                heights = unit(c(umap_panel_h, bar_h_in), "in")
+            )
+
+        # Pooled figure: one UMAP per group side by side (no overplotting
+        # between groups), each with its own proportion bar underneath.
+        if (is_pooled) {
+            grps_here <- grp_levels[as.integer(n_by[grp_levels]) > 0]
+
+            umaps <- lapply(grps_here, function(g) {
+                fg <- df_d %>% filter(Group == g)
+                fg <- fg[sample(nrow(fg)), , drop = FALSE]
+                bg <- umap_df %>% filter(!(barcode %in% fg$barcode))
+                ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2)) +
+                    geom_point(data = bg, shape = 21, size = 2, stroke = 0, alpha = 0.6,
+                               fill = "grey85", color = "grey85") +
+                    geom_point(data = fg, shape = 21, size = 4, stroke = 0.6, alpha = 0.95,
+                               fill = grp_fill[[g]], color = grp_line[[g]]) +
+                    labs(title = grp_lab[[g]]) +
+                    theme_void(base_size = 12) +
+                    theme(
+                        plot.title  = element_text(face = "bold", hjust = 0.5),
+                        plot.margin = margin(10, 10, 10, 10)
+                    )
+            })
+
+            bars <- lapply(grps_here, function(g) {
+                bd <- bar_df %>% filter(Group == g)
+                ggplot(bd, aes(x = pct, y = "", fill = CellType)) +
+                    geom_col(width = 0.8, color = "white", linewidth = 0.3) +
+                    geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 2.6) +
+                    scale_fill_manual(values = color_map, breaks = present, name = NULL,
+                                      na.value = "grey50", drop = FALSE) +
+                    scale_x_continuous(breaks = seq(0, 100, 25),
+                                       labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+                    coord_cartesian(xlim = c(0, 100), clip = "off") +
+                    labs(x = NULL, y = NULL) +
+                    guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+                    theme_minimal(base_size = 10) +
+                    theme(
+                        panel.grid   = element_blank(),
+                        axis.text.y  = element_blank(),
+                        axis.ticks.x = element_line(linewidth = 0.3),
+                        legend.key.size = unit(0.35, "cm"),
+                        legend.text  = element_text(size = 8),
+                        plot.margin  = margin(0, 10, 10, 10)
+                    )
+            })
+
+            k <- length(grps_here)
+            p <- wrap_plots(c(umaps, bars), nrow = 2, byrow = TRUE) +
+                plot_layout(
+                    widths  = unit(rep(umap_panel_w, k), "in"),
+                    heights = unit(c(umap_panel_h, bar_h_per), "in"),
+                    guides  = "collect"
+                ) +
+                plot_annotation(
+                    title    = d,
+                    subtitle = paste0(var_txt, "\nLineage \u03c7\u00b2 — ", p_txt),
+                    theme    = theme(
+                        plot.title    = element_text(face = "bold", hjust = 0.5, size = 16),
+                        plot.subtitle = element_text(hjust = 0.5, size = 10)
+                    )
+                ) &
+                theme(legend.position = "bottom")
+        }
+
+        fname <- file.path(out_dir, paste0(safe_name(d), ifelse(split_dta, "__WT_DTA_Other_TP53", "__WT_nonTP53_TP53")))
+        save_fixed(p, fname)
+
+        cat(sprintf("  %s: %s | %s\n", d,
+                    paste(sprintf("%s=%d", grp_short[grp_levels], as.integer(n_by[grp_levels])), collapse = ", "),
+                    p_txt))
+    }
+
+    # ── Cohort summary + tables ──────────────────────────────────────────────
+    comp_df  <- bind_rows(comp_all)
+    stats_df <- bind_rows(stats_all)
+
+    write.csv(comp_df %>% mutate(pct = round(pct, 1)) %>% select(Donor, Group, total, CellType, n, pct),
+              file.path(out_dir, "Q13_composition.csv"), row.names = FALSE)
+    write.csv(stats_df, file.path(out_dir, "Q13_stats.csv"), row.names = FALSE)
+
+    sum_df <- comp_df %>%
+        mutate(Donor    = factor(Donor, levels = c(donors_plot, pooled_lab)),
+               Group    = factor(Group, levels = grp_levels),
+               CellType = factor(CellType, levels = names(color_map)))
+
+    p_sum <- ggplot(sum_df, aes(x = Group, y = pct, fill = CellType)) +
+        geom_col(width = 0.8, color = "white", linewidth = 0.2) +
+        facet_wrap(~ Donor, nrow = 1) +
+        scale_fill_manual(values = color_map, name = NULL, na.value = "grey50") +
+        scale_x_discrete(labels = grp_short, drop = FALSE) +
+        scale_y_continuous(labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+        coord_cartesian(ylim = c(0, 100)) +
+        labs(x = NULL, y = "Cells (%)") +
+        theme_minimal(base_size = 10) +
+        theme(
+            panel.grid.major.x = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            strip.text  = element_text(face = "bold")
+        )
+
+    w_sum <- 2 + (0.45 * length(grp_levels) + 0.2) * (length(donors_plot) + 1)
+    ggsave(file.path(out_dir, "Q13_summary.pdf"), p_sum, width = w_sum, height = 4.5)
+    ggsave(file.path(out_dir, "Q13_summary.png"), p_sum, width = w_sum, height = 4.5, dpi = 300)
+
+    stats_df
+}
+```
+
+## - (a) Pooled non-TP53
+
+```{r}
+stats_pooled <- run_q13(split_dta = FALSE)
+stats_pooled
+```
+
+## - (b) Non-TP53 split: DTA vs other
+
+```{r}
+stats_split <- run_q13(split_dta = TRUE)
+stats_split
+```

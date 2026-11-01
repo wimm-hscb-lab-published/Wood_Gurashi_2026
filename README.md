@@ -1,51 +1,103 @@
 # Single-cell multiomic profiling reveals distinct clonal architectures in TP53-mutated myeloid neoplasms
 
-Project information:
-Coded in/requires:
-Python (conda env `mosaic`, mission bio missionbio.mosaic-base), R, Bash, SLURM
+![Python](https://img.shields.io/badge/Python-mosaic-blue?style=flat&logo=python)
+![R](https://img.shields.io/badge/R-4.x-blue?style=flat&logo=R)
+[![GEO](https://img.shields.io/badge/GEO-GSE344978-lightgrey?style=flat)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE344978)
 
-General Description:
-First Author: Kristian Gurashi ([kristian.gurashi@ndcls.ox.ac.uk](mailto:kristian.gurashi@ndcls.ox.ac.uk))
-Correspondance:
-TBD
-Disease: Myelodysplastic Syndrome (MDS)
-Graphical Abstract:
-TBD
-Publication link:
-TBD
-Content:
-This is the code repository for the TP53 MDS single-cell multi-omics manuscript (Wood, Gurashi et al., 2026). It contains the pipeline used to process Tapestri single-cell DNA + protein data, from raw demultiplexing through variant calling, clonotype/phylogeny inference, and protein annotation.
+Analysis code for the single-cell DNA and protein (Tapestri) profiling of clonal architecture in TP53-mutated myelodysplastic syndrome (MDS).
 
-Instructions on reproducibility:
+## Summary
 
-1. Clone the GitHub repository as follows:
+Biallelic TP53 mutation is associated with progression to AML, lack of response to chemotherapy, and a devastating overall survival of less than 6 months. Early detection of biallelic TP53 clones, and understanding how they evolve, is vital for refining diagnostic classification, improving patient outcomes, and advancing scientific understanding of this disease. This project uses single-cell DNA sequencing to accurately identify mono- and biallelic TP53 clones and their associated copy number alterations, and to decipher their clonal architecture and evolution.
+
+## Contributors
+
+- **Amy Wood** (first author) · TBD
+- **Kristian Gurashi** (co-first author, computational analysis) · kristian.gurashi@ndcls.ox.ac.uk
+- **Adam J. Mead** (senior and corresponding author)
+- **Onima Chowdhury** (senior and corresponding author)
+
+## Citation
+
+> Wood, A.\*, Gurashi, K.\*, ..., Mead, A. J.†, Chowdhury, O.† *Single-cell multiomic profiling reveals distinct clonal architectures in TP53-mutated myeloid neoplasms.* (in preparation)
+>
+> \*These authors contributed equally. †These authors contributed equally as senior authors.
+
+## Graphical Abstract
+
+<!-- TODO: add image -->
+
+---
+
+## Study design
+
+Patients were profiled across Tapestri runs (experiments). Where several patients share a run, cells were assigned back to each patient by genotype before downstream analysis. Donor labels (A, B, C) are local to each experiment; the Patient ID is the identifier used in the manuscript. Patients sampled more than once appear under several experiments.
+
+| Experiment | Donor | Patient ID | Timepoint |
+|------------|-------|------------|-----------|
+| MDS001 | Donor A | Patient 03 | Baseline |
+| MDS001 | Donor B | Patient 02 | Baseline |
+| MDS001 | Donor C | Patient 01 | Baseline |
+| MDS002 | Donor A | Patient 06 | Baseline |
+| MDS002 | Donor B | Patient 08 | Baseline |
+| MDS002 | Donor C | Patient 07 | Baseline |
+| MDS003 | Donor A | Patient 05 | Baseline |
+| MDS003 | Donor B | Patient 04 | Baseline |
+| MDS005 | Donor A | Patient 10 | Baseline |
+| MDS005 | Donor B | Patient 09 | Baseline |
+| MDS006 | Donor A | Patient 11 | Baseline |
+| MDS006 | Donor B | Patient 12 | Baseline |
+| MDS007 | Donor A | Patient 13 | Baseline |
+| MDS008 | Donor A | Patient 14 | Baseline |
+| MDS009 | Donor A | Patient 16 | Baseline |
+| MDS009 | Donor B | Patient 15 | Baseline |
+| MDS010 | Donor A | Patient 17 | Baseline |
+| MDS010 | Donor B | Patient 18 | Baseline |
+| MDS011 | Donor A | Patient 15 | FU |
+| MDS011 | Donor B | Patient 19 | Baseline |
+| pMDS001 | Donor A | Patient 20 | Baseline |
+| pMDS002 | Donor A | Patient 20 | FU |
+
+FU, follow-up.
+
+## Analyses
+
+1. **Preprocessing**: alignment, barcode calling and genotyping (Tapestri Pipeline, run online).
+2. **Demultiplexing**: assignment of cells in pooled runs back to each patient by germline genotype.
+3. **Filtering**: cell, variant and protein QC.
+4. **Patient data analysis**: per-patient TP53 allelic state, copy number, clonotypes and phylogeny.
+5. **Integration and visualisation**: cohort-level integration and manuscript figures.
+
+## Repository
 
 ```
-git clone https://github.com/wimm-hscb-lab-published/Wood_Gurashi_2026.git
+notebooks/
+  01_preprocessing/       # 1–2. preprocessing and demultiplexing
+  02_protein_filtering/   # 3. filtering
+  03_sample_analysis/     # 4. patient data analysis
+scripts/manuscript/       # 5. integration and figures (named by figure panel)
+metadata/                 # per-experiment configuration
+cohort_metadata/          # cohort-level summary tables
+envs/containers/          # Mosaic container (image not tracked; see Requirements)
+Sample_sheet.csv          # experiment → patient mapping
 ```
 
-2. Access the cloned directory, initialise the project structure and populate the sample sheet:
+## Data
 
-```
-cd Wood_Gurashi_2026/
-bash Initialise_project.sh          # once
-# edit Sample_sheet.csv
-bash Create_project_directories.sh  # as many times as needed
-```
+- **GEO:** [GSE344978](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE344978)
+  - Raw: FASTQs per Tapestri library (pooled runs contain several patients).
+  - Processed: one multiplexed H5 file per Tapestri run (DNA + protein), plus demultiplexed H5 files per patient.
 
-3. Download and decompress the processed input data deposited on GEO/NCBI:
-[Link to repository](TBD)
+All coordinates reference **hg19**.
 
-4. To ensure reproducibility run as follows:
+## Requirements
 
-* Please verify that your Python and R package versions match those used to generate figures in the manuscript - [Check environment specification](envs/)
-* Bash/SLURM scripts are only needed if processing raw sequencing files deposited on GEO
+Python with Mission Bio Mosaic (`missionbio.mosaic-base`) and R. Analysis can be reproduced starting from the multiplexed H5 files.
 
-Notes on multiplexed vs single-sample experiments: experiment folders are automatically split into `multiplexed/` + `demultiplexed/{patient}/` when multiple patients share an experiment in `Sample_sheet.csv` (GEO-ready), or left as a flat `{patient}/` directory for single-patient experiments. Sorting methods (FACS, MACS) are part of the experiment name, not separate subdirectories. All coordinates reference **hg19**.
+The Python environment used in the analysis is provided as an Apptainer/Singularity container (`mosaic.sif`), available on Zenodo: [10.5281/zenodo.xxxxxxx](https://doi.org/10.5281/zenodo.xxxxxxx) *(pending)*.
 
-Citation:
-If using any code here published and/or data from this publication please remember to cite us:
+The R environment used in the analysis is provided as an Apptainer/Singularity container (`r_env.sif`), available on Zenodo: [10.5281/zenodo.xxxxxxx](https://doi.org/10.5281/zenodo.xxxxxxx) *(pending)*.
 
-* APA Style:
+## License
 
-* Vancouver Style:
+CC BY 4.0. See `LICENSE`.

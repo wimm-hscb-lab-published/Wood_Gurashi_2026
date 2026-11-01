@@ -17,7 +17,7 @@
 
 # ── Entire directories ──
 raw_data/
-docs/
+/docs/
 logs/
 omnipathr-log/
 processed_data/submission/
@@ -36,6 +36,10 @@ resources/
 # ── Keep envs/containers/ as an empty folder ──
 /envs/containers/*
 !/envs/containers/.gitkeep
+
+# ── Documentation figures (README schematics) ──
+!scripts/pipelines/*/docs/*.png
+!notebooks/*/docs_figures/*.png
 
 # ── Python ──
 __pycache__/

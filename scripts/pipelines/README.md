@@ -35,6 +35,10 @@ import DNA_Utils, PRO_Utils, CNV_Utils, LOH_Pipeline
 
 Functions are then called as `DNA_Utils.find_germline_variants(...)`, `LOH_Pipeline.run(...)` and so on.
 
+## Resource files
+
+Functions that read shared reference files (common variants, blacklists) or write cohort tables (germline patterns) use the project's `resources/` folder. The project folder is found from the package location (`<project>/scripts/pipelines/`); set the environment variable `TAPESTRI_PROJECT_ROOT` to point elsewhere.
+
 ## Tests
 
 From this folder, with the `mosaic` conda environment:

@@ -555,7 +555,7 @@ notebook flow is: `run_empirical_all_variant_germline_export` (step 1) -> `add_w
 
 `get_real_somatic_variants(differential_variants, filtered_germline_in_samples, sample, use_consequence_if_available=True)`
 
-Source: [germline.py:49](germline.py#L49 "get_real_somatic_variants")
+Source: [germline.py:57](germline.py#L57 "get_real_somatic_variants")
 
 Flattens and strips the variant IDs, removes those in the germline list, keeps IDs present in
 `sample.dna.col_attrs["id"]` and drops intronic ones: `Consequence` contains "intron" when that column exists, otherwise
@@ -569,7 +569,7 @@ Flattens and strips the variant IDs, removes those in the germline list, keeps I
 
 `visualize_found_germline_variants(Sample_T_subset, wd, MBio_batch, Patient_ID, variant_ids=None, variant_df=None, variant_class_col="germline_broad_class", variant_classes=None, seed_col=None, output_label=None, cytobands_path=None, save_plots=True, show_plots=True, min_variants_per_chr=2)`
 
-Source: [germline.py:128](germline.py#L128 "visualize_found_germline_variants")
+Source: [germline.py:136](germline.py#L136 "visualize_found_germline_variants")
 
 Picks variants (explicit IDs, a class / seed-column filter on an all-variant table, or every assay variant), computes
 pseudobulk VAF (mean AF over cells) and draws a log-scale VAF histogram, a genome-wide stem plot
@@ -584,7 +584,7 @@ the per-variant table with VAF.
 
 `find_germline_variants(Sample, keep_labels, annotation_df=None, af_min_common=25, af_max_common=75, af_min_novel=40, af_max_novel=60, max_hom_frac=0.25, max_ngt_frac=0.80, min_dp=5, min_valid_cells=20, min_call_rate_after_ngt_dp=0.20, min_het_to_hom_alt_ratio=3.0, min_het_frac_among_alt_valid=0.75, min_het_valid_cells=3, exclude_pathogenic=True, common_variant_paths=None, known_het_variants=None, blacklist_paths=None, common_requires="either", return_qc=False, verbose=True, ...)`
 
-Source: [germline.py:628](germline.py#L628 "find_germline_variants")
+Source: [germline.py:636](germline.py#L636 "find_germline_variants")
 
 The original AF-window germline filter. Its QC table is also the master table of the all-variant profile.
 
@@ -616,7 +616,7 @@ resource paths are hard-coded cluster paths under `/project/meadlab/shared/02__P
 
 `validate_germline_by_af(Sample_T_subset, candidate_variants, common_variant_ids=None, known_het_ids=None, *, selection_mode="het_calls", af_band=(15.0, 95.0), min_dp_af=2, ref_min_cells=30, ref_min_total_dp=300, ref_af_lo=40.0, ref_af_hi=60.0, ref_min_n=10, min_ref_spread=3.0, k_tol=3.0, tol_cap=20.0, enable_dispersion=True, k_disp=2.5, min_eval_total_dp=100, min_eval_cells=5, keep_known_low_evidence=True, min_weak_cells=3, keep_indels=False, verbose=True)`
 
-Source: [germline.py:1415](germline.py#L1415 "validate_germline_by_af")
+Source: [germline.py:1418](germline.py#L1418 "validate_germline_by_af")
 
 Checks that each candidate's AF looks like a diploid HET. Cells: NGT == 1 and DP >= 2 (or NGT in {1, 2}, DP >= 2 and
 15 <= AF <= 95 in `af_band` mode). Per variant: depth-weighted `pooled_af = 100 sum(AF/100 x DP) / sum(DP)`,
@@ -635,7 +635,7 @@ z-SD = median robust SD; else centre 50, spread 7, z-SD 1.5. Status ladder: inde
 
 `review_failed_variants(prof, *, ref_z_sd, review_status=("af_skewed", "insufficient_evidence"), min_review_cells=30, consistency_mult=1.0, ref_like_below=15.0, hom_like_above=82.0, near_window=50000, verbose=True)`
 
-Source: [germline.py:1712](germline.py#L1712 "review_failed_variants")
+Source: [germline.py:1715](germline.py#L1715 "review_failed_variants")
 
 Second look at af_skewed / insufficient_evidence non-indel variants: AF zone (`ref_like` < 15, `hom_like` > 82, else
 biased-HET low / high), consistency (robust SD <= reference z-SD and >= 30 cells), chrX non-PAR flag (hg19) and the
@@ -648,7 +648,7 @@ number of other reviewed variants within 50 kb. Verdict: `review_hom_or_ref`, `i
 
 `genotype_af_cutoffs(Sample_T_subset, *, min_dp=5, af_bin=2.0, min_bin_n=50, dp_bands=((5, 15), (15, 40), (40, inf)), evaluate_variants=None, plot=True, ax=None)`
 
-Source: [germline.py:1838](germline.py#L1838 "genotype_af_cutoffs")
+Source: [germline.py:1841](germline.py#L1841 "genotype_af_cutoffs")
 
 Pools every called (cell, variant) with DP >= 5, bins by AF (2 % bins, >= 50 per bin) and finds where the genotype
 caller switches: lower cutoff = lowest bin where HET > WT fraction, upper = highest bin where HET > HOM. Repeated per DP
@@ -977,7 +977,7 @@ Private helpers:
 
 | Helper | Purpose |
 |---|---|
-| [`_is_indel`](germline.py#L1387 "_is_indel"), `_cell_by_variant`, `_full_layer_df`, `_layer_df_from_sample` | Indel test and cells x variants layer frames |
+| [`_is_indel`](germline.py#L1390 "_is_indel"), `_cell_by_variant`, `_full_layer_df`, `_layer_df_from_sample` | Indel test and cells x variants layer frames |
 | [`_donor_genotype_call`](germline.py#L2141 "_donor_genotype_call") | Ordered donor-genotype rules (uncalled / low_coverage / hom_alt / hom_ref / het / low_occupancy) |
 | [`_dedupe_keep_order`](germline.py#L1990 "_dedupe_keep_order"), `_normalise_variant_list`, `_extract_variant_list`, `_variant_key_series`, `_chr_pos_key` | Variant list / key normalisation and genomic sort key |
 | [`_coerce_bool_series`](germline.py#L2030 "_coerce_bool_series"), `_coerce_bool_like`, `_first_existing_col`, `_cal_col`, `_numeric_cal_col`, `_bool_cal_col`, `_string_cal_col`, `_het_mask`, `_not_excluded_mask` | Column lookup and boolean coercion for the calibrated rules |

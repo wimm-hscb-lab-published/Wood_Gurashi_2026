@@ -45,6 +45,14 @@ import pandas as pd
 
 from .utils import drop_scalar_row_attrs
 
+# Project folder: this file lives in <project>/scripts/pipelines/DNA_Utils/. Set the environment
+# variable TAPESTRI_PROJECT_ROOT to use the package from somewhere else.
+PROJECT_ROOT = os.environ.get(
+    "TAPESTRI_PROJECT_ROOT",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")),
+)
+RESOURCES_DIR = os.path.join(PROJECT_ROOT, "resources")
+
 
 def get_real_somatic_variants(
     differential_variants: Iterable[Any] | np.ndarray,
@@ -905,19 +913,14 @@ def find_germline_variants(
 
     if blacklist_paths is None:
         blacklist_paths = [
-            "/project/meadlab/shared/02__Projects/"
-            "resources/blacklists/hg19-blacklist.v2.bed",
-            "/project/meadlab/shared/02__Projects/"
-            "resources/blacklists/"
-            "hg19_blacklist_MergedList_Anshul Kundaje_Stanford.csv",
+            os.path.join(RESOURCES_DIR, "blacklists", "hg19-blacklist.v2.bed"),
+            os.path.join(RESOURCES_DIR, "blacklists", "hg19_blacklist_MergedList_Anshul Kundaje_Stanford.csv"),
         ]
 
     if common_variant_paths is None:
         common_variant_paths = [
-            "/project/meadlab/shared/02__Projects/02b__Tapestri/resources/"
-            "common_mutations/dbsnp_v155_hg19_common_vars.txt",
-            "/project/meadlab/shared/02__Projects/02b__Tapestri/resources/"
-            "common_mutations/gnomad_genomes_r2.1.1_hg19_common_vars.txt",
+            os.path.join(RESOURCES_DIR, "common_mutations", "dbsnp_v155_hg19_common_vars.txt"),
+            os.path.join(RESOURCES_DIR, "common_mutations", "gnomad_genomes_r2.1.1_hg19_common_vars.txt"),
         ]
 
     if common_requires not in {"either", "both"}:
@@ -1981,10 +1984,7 @@ def genotype_af_cutoffs(
 # All-variant germline profiling helpers
 # -----------------------------------------------------------------------------
 
-GERMLINE_PATTERN_DIR = (
-    "/project/meadlab/shared/02__Projects/02b__Tapestri/"
-    "resources/variants_patterns_tapestri"
-)
+GERMLINE_PATTERN_DIR = os.path.join(RESOURCES_DIR, "variants_patterns_tapestri")
 
 
 def _dedupe_keep_order(items: Iterable[Any]) -> list[str]:
